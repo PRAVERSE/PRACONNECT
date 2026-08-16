@@ -33,9 +33,29 @@ import {
 import type { MediaInput, RoomPayload, RoomError } from '../rooms/service';
 import { emit, emitEphemeral, openEventStream, replayEvents } from '../rooms/realtime';
 
-const uploadsDir = path.resolve(process.cwd(), 'uploads');
+// Upload limits. The per-file byte counter is authoritative; Content-Length
+// and the total-body counter are coarse early gates (see upload route below).
+const DEFAULT_MAX_UPLOAD_BYTES = 1.5 * 1024 * 1024 * 1024; // 1.5 GB
+const BODY_OVERHEAD_ALLOWANCE = 1024 * 1024; // multipart framing slack
+const MAX_PART_HEADER_BYTES = 64 * 1024; // cap on the first part's headers
+const MAX_VALIDATION_PREFIX_BYTES = 4096; // container sniff window
+const PART_HEADER_END = Buffer.from('\r\n\r\n', 'ascii');
+
+// UPLOADS_DIR is overridable for test isolation; defaults to ./uploads.
+const uploadsDir = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.resolve(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+function maxUploadBytes(): number {
+  const raw = process.env.MAX_UPLOAD_BYTES;
+  if (raw) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return DEFAULT_MAX_UPLOAD_BYTES;
 }
 
 export function getMimeType(filePath: string): string {
@@ -358,9 +378,6 @@ export function inspectVideoContainer(buffer: Buffer): 'mp4' | 'webm' | 'mov' | 
 }
 
 rooms.post('/:id/media/upload', async (c) => {
-  const reqContentLength = c.req.header('content-length');
-  console.log('[Diagnostics] [Server Upload Route Content-Length header]:', reqContentLength);
-
   const roomId = c.req.param('id');
   const userId = c.get('userId');
   const guard = activeMemberGuard(c, roomId, userId);
@@ -372,55 +389,243 @@ rooms.post('/:id/media/upload', async (c) => {
     return c.json(apiError('NOT_HOST', 'Only the room host can upload media.'), 403);
   }
 
-  try {
-    const formData = await c.req.parseBody();
-    const rawFile = formData['file'];
+  // ─── Boundary + limits ────────────────────────────────────────────────────
+  const contentType = c.req.header('content-type') ?? '';
+  const boundaryMatch = contentType.match(/boundary=(?:"([^"]+)"|([^;\s]+))/i);
+  const boundary = boundaryMatch ? boundaryMatch[1] || boundaryMatch[2] : null;
+  if (!boundary || boundary.length > 70 || /[\r\n]/.test(boundary)) {
+    return c.json(apiError('VALIDATION_ERROR', 'Invalid multipart/form-data body (missing or malformed boundary).'), 400);
+  }
+  const delim = Buffer.from(`\r\n--${boundary}`, 'ascii');
+  const keep = delim.length + 4;
 
-    if (!rawFile || typeof rawFile === 'string' || typeof (rawFile as any).arrayBuffer !== 'function') {
-      return c.json(apiError('VALIDATION_ERROR', 'Please provide a valid video file in the file field.'), 400);
+  const maxBytes = maxUploadBytes();
+  const bodyLimit = maxBytes + BODY_OVERHEAD_ALLOWANCE;
+
+  // Coarse pre-check only — the per-file byte counter below is authoritative.
+  const contentLength = Number(c.req.header('content-length') ?? '');
+  if (Number.isFinite(contentLength) && contentLength > bodyLimit) {
+    return c.json(apiError('FILE_TOO_LARGE', 'Uploaded movie exceeds maximum allowed size of 1.5GB.'), 400);
+  }
+
+  const body = c.req.raw.body;
+  if (!body) {
+    return c.json(apiError('VALIDATION_ERROR', 'Please provide a valid video file in the file field.'), 400);
+  }
+  const reader = body.getReader();
+  const abortSignal = c.req.raw.signal;
+
+  let partPath = '';
+  let sink: fs.WriteStream | null = null;
+  let sinkError: Error | null = null;
+  let finalized = false;
+
+  async function cleanupPartial(): Promise<void> {
+    if (sink && !sink.destroyed) {
+      await new Promise<void>((resolve) => {
+        sink!.once('close', () => resolve());
+        sink!.once('error', () => resolve());
+        sink!.destroy();
+      });
+    }
+    if (partPath) {
+      try {
+        fs.rmSync(partPath, { force: true });
+      } catch {
+        // already gone
+      }
+    }
+  }
+
+  const onAbort = () => {
+    if (!finalized) {
+      reader.cancel().catch(() => {});
+      cleanupPartial().catch(() => {});
+    }
+  };
+  abortSignal.addEventListener('abort', onAbort);
+
+  async function fail(status: number, code: string, message: string): Promise<Response> {
+    await cleanupPartial();
+    return c.json(apiError(code, message), status);
+  }
+
+  try {
+    // ─── Read the first part headers (bounded window) ───────────────────────
+    let headerBuf = Buffer.alloc(0);
+    let headerEnd = -1;
+    let bodyBytes = 0;
+    while (headerBuf.length <= MAX_PART_HEADER_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.length === 0) continue;
+      bodyBytes += value.length;
+      if (bodyBytes > bodyLimit) {
+        return fail(413, 'PAYLOAD_TOO_LARGE', 'Upload body exceeds the allowed size.');
+      }
+      headerBuf = headerBuf.length === 0 ? value : Buffer.concat([headerBuf, value]);
+      headerEnd = headerBuf.indexOf(PART_HEADER_END);
+      if (headerEnd !== -1) break;
     }
 
-    const file = rawFile as File | Blob;
-    const originalName = typeof (file as any).name === 'string' ? (file as any).name : 'movie.mp4';
+    const firstLine = Buffer.from(`--${boundary}\r\n`, 'ascii');
+    if (headerEnd === -1 || !headerBuf.subarray(0, firstLine.length).equals(firstLine)) {
+      return fail(400, 'VALIDATION_ERROR', 'Invalid multipart/form-data body.');
+    }
+
+    const partHeaders = headerBuf.subarray(firstLine.length, headerEnd).toString('latin1');
+    const dispositionLine = partHeaders.split('\r\n').find((line) => /^content-disposition\s*:/i.test(line));
+    const nameMatch = dispositionLine?.match(/;\s*name="([^"]*)"/i);
+    if (!dispositionLine || !nameMatch || nameMatch[1] !== 'file') {
+      return fail(400, 'VALIDATION_ERROR', 'Please provide a valid video file in the file field.');
+    }
+
+    const filenameMatch = dispositionLine.match(/;\s*filename="([^"]*)"/i);
+    const originalName = filenameMatch ? filenameMatch[1] : 'movie.mp4';
     const ext = path.extname(originalName).toLowerCase() || '.mp4';
     const allowedExts = ['.mp4', '.webm', '.mov'];
-
-    console.log('[Diagnostics] [Server Upload Parsed File]:', {
-      name: originalName,
-      fileSizeProperty: file.size,
-      ext,
-    });
-
-    if (file.size === 0) {
-      return c.json(
-        apiError('EMPTY_FILE', 'The uploaded file is empty (0 bytes). Please upload a valid video file.'),
-        400
+    if (!allowedExts.includes(ext)) {
+      return fail(
+        400,
+        'INVALID_MEDIA_TYPE',
+        `This file format (${ext}) isn't supported for playback. Please upload MP4 or WebM.`
       );
     }
 
-    // Size limit: 1.5GB
-    const MAX_SIZE = 1.5 * 1024 * 1024 * 1024;
-    if (file.size > MAX_SIZE) {
-      return c.json(apiError('FILE_TOO_LARGE', 'Uploaded movie exceeds maximum allowed size of 1.5GB.'), 400);
+    const safeId = crypto.randomUUID().slice(0, 12);
+    const finalName = `media-${Date.now()}-${safeId}${ext}`;
+    const destination = path.join(uploadsDir, finalName);
+    let pending = headerBuf.subarray(headerEnd + 4);
+    let fileBytes = 0;
+    let prefixBytes = 0;
+    const prefixChunks: Buffer[] = [];
+
+    function capturePrefix(chunk: Buffer): void {
+      if (prefixBytes >= MAX_VALIDATION_PREFIX_BYTES) return;
+      const take = chunk.subarray(0, MAX_VALIDATION_PREFIX_BYTES - prefixBytes);
+      prefixChunks.push(take);
+      prefixBytes += take.length;
     }
 
-    // Read ArrayBuffer ONCE into Buffer and reuse for inspection & writing
-    const buffer = Buffer.from(await file.arrayBuffer());
-    console.log('[Diagnostics] [Server Buffer Read Size]:', buffer.length, 'bytes');
+    function writeChunk(chunk: Buffer): Promise<void> {
+      return new Promise((resolve, reject) => {
+        if (!sink) {
+          partPath = path.join(uploadsDir, `${finalName}.part`);
+          sink = fs.createWriteStream(partPath, { flags: 'wx' });
+          sink.on('error', (err) => {
+            sinkError = err;
+          });
+        }
+        let settled = false;
+        const onError = (err: Error) => {
+          if (!settled) {
+            settled = true;
+            sinkError = err;
+            reject(err);
+          }
+        };
+        const onDrain = () => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        sink.once('error', onError);
+        sink.once('drain', onDrain);
+        try {
+          if (sink.write(chunk)) {
+            if (!settled) {
+              settled = true;
+              resolve();
+            }
+          }
+        } catch (err) {
+          if (!settled) {
+            settled = true;
+            sinkError = err as Error;
+            reject(err as Error);
+          }
+        }
+      });
+    }
 
-    if (buffer.length === 0) {
-      return c.json(
-        apiError('EMPTY_FILE', 'The uploaded file content is 0 bytes on disk. Please re-select the file.'),
-        400
+    // ─── Stream the file part to disk, byte by byte, never buffering it ─────
+    while (true) {
+      const idx = pending.indexOf(delim);
+      if (idx !== -1) {
+        const tailStart = idx + delim.length;
+        const tailLen = pending.length - tailStart;
+        if (tailLen < 2) {
+          // Delimiter straddles the read boundary — pull more before deciding.
+          const { done, value } = await reader.read();
+          if (done) {
+            return fail(400, 'UPLOAD_FAILED', 'Failed to upload media file: the upload stream ended prematurely.');
+          }
+          if (value.length === 0) continue;
+          bodyBytes += value.length;
+          if (bodyBytes > bodyLimit) {
+            return fail(413, 'PAYLOAD_TOO_LARGE', 'Upload body exceeds the allowed size.');
+          }
+          pending = Buffer.concat([pending, value]);
+          continue;
+        }
+        const b1 = pending[tailStart];
+        const b2 = pending[tailStart + 1];
+        if ((b1 === 0x2d && b2 === 0x2d) || (b1 === 0x0d && b2 === 0x0a)) {
+          // Real end of the part (`--` closing or `\r\n` next-part separator).
+          const content = pending.subarray(0, idx);
+          if (content.length > 0) {
+            capturePrefix(content);
+            await writeChunk(content);
+            if (sinkError) throw sinkError;
+            fileBytes += content.length;
+            if (fileBytes > maxBytes) {
+              return fail(400, 'FILE_TOO_LARGE', 'Uploaded movie exceeds maximum allowed size of 1.5GB.');
+            }
+          }
+          break;
+        }
+        // False positive — the bytes coincidentally matched; keep scanning.
+        pending = pending.subarray(idx + 1);
+        continue;
+      }
+
+      if (pending.length > keep) {
+        const toFlush = pending.length - keep;
+        capturePrefix(pending.subarray(0, toFlush));
+        await writeChunk(pending.subarray(0, toFlush));
+        if (sinkError) throw sinkError;
+        fileBytes += toFlush;
+        if (fileBytes > maxBytes) {
+          return fail(400, 'FILE_TOO_LARGE', 'Uploaded movie exceeds maximum allowed size of 1.5GB.');
+        }
+        pending = pending.subarray(toFlush);
+        continue;
+      }
+
+      const { done, value } = await reader.read();
+      if (done) {
+        return fail(400, 'UPLOAD_FAILED', 'Failed to upload media file: the upload stream ended prematurely.');
+      }
+      if (value.length === 0) continue;
+      bodyBytes += value.length;
+      if (bodyBytes > bodyLimit) {
+        return fail(413, 'PAYLOAD_TOO_LARGE', 'Upload body exceeds the allowed size.');
+      }
+      pending = Buffer.concat([pending, value]);
+    }
+
+    // ─── Validate & finalize ────────────────────────────────────────────────
+    if (fileBytes === 0) {
+      return fail(
+        400,
+        'EMPTY_FILE',
+        'The uploaded file is empty (0 bytes). Please upload a valid video file.'
       );
     }
 
-    const detectedContainer = inspectVideoContainer(buffer);
-    console.log('[Diagnostics] [Server Detected Container]:', detectedContainer);
-
-    // Reject formats outside allowed containers/extensions
-    const isDisallowedContainer = ['mkv', 'avi', 'wmv', 'ogv'].includes(detectedContainer);
-    if (!allowedExts.includes(ext) || isDisallowedContainer) {
+    const detectedContainer = inspectVideoContainer(Buffer.concat(prefixChunks));
+    if (['mkv', 'avi', 'wmv', 'ogv'].includes(detectedContainer)) {
       const displayExt =
         ext === '.mkv' || detectedContainer === 'mkv'
           ? '.mkv'
@@ -429,24 +634,33 @@ rooms.post('/:id/media/upload', async (c) => {
           : ext === '.wmv' || detectedContainer === 'wmv'
           ? '.wmv'
           : ext;
-      return c.json(
-        apiError(
-          'INVALID_MEDIA_TYPE',
-          `This file format (${displayExt}) isn't supported for playback. Please upload MP4 or WebM.`
-        ),
-        400
+      return fail(
+        400,
+        'INVALID_MEDIA_TYPE',
+        `This file format (${displayExt}) isn't supported for playback. Please upload MP4 or WebM.`
       );
     }
 
-    const safeId = crypto.randomUUID().slice(0, 12);
-    const safeFilename = `media-${Date.now()}-${safeId}${ext}`;
-    const destination = path.join(uploadsDir, safeFilename);
+    if (sink) {
+      await new Promise<void>((resolve, reject) => {
+        sink!.once('error', (err) => reject(err));
+        sink!.once('close', () => resolve());
+        sink!.end();
+      });
+      if (sinkError) throw sinkError;
+      try {
+        fs.renameSync(partPath, destination);
+      } catch (err) {
+        await cleanupPartial();
+        throw err;
+      }
+    }
 
-    fs.writeFileSync(destination, buffer);
+    finalized = true;
 
     const media: MediaInput = {
       title: originalName.replace(/\.[^/.]+$/, ''),
-      url: `/api/uploads/${safeFilename}`,
+      url: `/api/uploads/${finalName}`,
       poster: 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=800&q=80',
       type: 'video',
     };
@@ -457,8 +671,13 @@ rooms.post('/:id/media/upload', async (c) => {
     emit(result.payload.id, 'room:update', { room: result.payload });
     return c.json({ ok: true, room: result.payload, media });
   } catch (err: any) {
+    await cleanupPartial();
     console.error('[rooms] Media upload error:', err);
     return c.json(apiError('UPLOAD_FAILED', `Failed to upload media file: ${err.message || 'Server error'}`), 500);
+  } finally {
+    finalized = true;
+    abortSignal.removeEventListener('abort', onAbort);
+    reader.cancel().catch(() => {});
   }
 });
 
@@ -733,4 +952,4 @@ rooms.get('/:id/events', (c) => {
   });
 });
 
-export { rooms };
+export { rooms, uploadsDir };

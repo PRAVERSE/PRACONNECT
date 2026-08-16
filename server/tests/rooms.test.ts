@@ -10,6 +10,7 @@
 
 import os from 'node:os';
 import path from 'node:path';
+import fs from 'node:fs';
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { Hono } from 'hono';
@@ -17,9 +18,10 @@ import { Hono } from 'hono';
 process.env.NODE_ENV = 'test';
 process.env.DATABASE_PATH = path.join(os.tmpdir(), `praconnect-test-${process.pid}-${Date.now()}.db`);
 process.env.ROOM_EMPTY_TTL_MS = '60000';
+process.env.UPLOADS_DIR = path.join(os.tmpdir(), `praconnect-uploads-${process.pid}-${Date.now()}`);
 
 const { db } = await import('../db/index');
-const { rooms, handleMediaServing } = await import('../routes/rooms');
+const { rooms, handleMediaServing, uploadsDir } = await import('../routes/rooms');
 const { createSession, SESSION_COOKIE_NAME } = await import('../auth/session');
 const { cleanupEmptyRooms } = await import('../rooms/service');
 
@@ -81,6 +83,7 @@ before(async () => {
 
 after(() => {
   db.close();
+  fs.rmSync(uploadsDir, { recursive: true, force: true });
 });
 
 // ─── 1. Authentication guards ────────────────────────────────────────────────
@@ -741,6 +744,117 @@ test('media URL rejects blob URLs; host can upload media and stream with HTTP 20
   });
   assert.equal(rangeInvalidRes.status, 416);
   assert.equal(rangeInvalidRes.headers.get('content-range'), 'bytes */2048');
+});
+
+// ─── 12b. Streaming upload hardening ──────────────────────────────────────────
+
+test('upload at exactly the byte limit is accepted; over-limit is rejected and leaves no partial file', async () => {
+  process.env.MAX_UPLOAD_BYTES = '4096';
+  try {
+    const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Limit Room' });
+    const roomId = ((await json(created)).room as { id: string }).id;
+
+    // Exact limit accepted
+    const exactBytes = new Uint8Array(4096);
+    for (let i = 0; i < exactBytes.length; i++) exactBytes[i] = (i * 7) % 256;
+    const exactForm = new FormData();
+    exactForm.append('file', new Blob([exactBytes], { type: 'video/mp4' }), 'exact.mp4');
+    const exactRes = await app.request(`/api/rooms/${roomId}/media/upload`, {
+      method: 'POST',
+      headers: { cookie: cookie(tokens.a) },
+      body: exactForm,
+    });
+    assert.equal(exactRes.status, 200);
+    const exactJson = (await exactRes.json()) as { ok: boolean; media: { url: string } };
+    assert.equal(exactJson.ok, true);
+    const exactFile = path.join(uploadsDir, path.basename(exactJson.media.url));
+    assert.equal(fs.statSync(exactFile).size, 4096);
+
+    // Over limit rejected
+    const overBytes = new Uint8Array(8192);
+    for (let i = 0; i < overBytes.length; i++) overBytes[i] = (i * 13) % 256;
+    const overForm = new FormData();
+    overForm.append('file', new Blob([overBytes], { type: 'video/mp4' }), 'over.mp4');
+    const overRes = await app.request(`/api/rooms/${roomId}/media/upload`, {
+      method: 'POST',
+      headers: { cookie: cookie(tokens.a) },
+      body: overForm,
+    });
+    assert.equal(overRes.status, 400);
+    const overJson = (await overRes.json()) as { error: { code: string } };
+    assert.equal(overJson.error.code, 'FILE_TOO_LARGE');
+
+    // No temp or oversized files may remain
+    const leftovers = fs.readdirSync(uploadsDir).filter((f) => f.endsWith('.part'));
+    assert.deepEqual(leftovers, [], 'no .part temp files may remain after a rejected upload');
+    const oversized = fs
+      .readdirSync(uploadsDir)
+      .filter((f) => f.startsWith('media-') && fs.statSync(path.join(uploadsDir, f)).size > 4096);
+    assert.deepEqual(oversized, [], 'no file above the limit may remain');
+  } finally {
+    delete process.env.MAX_UPLOAD_BYTES;
+  }
+});
+
+test('hostile client filenames are neutralized; only the generated safe name is stored', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Evil Name Room' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+
+  const bytes = new Uint8Array(512).fill(0x5a);
+  const evilForm = new FormData();
+  evilForm.append('file', new Blob([bytes], { type: 'video/mp4' }), '../../evil-escape.mp4');
+  const res = await app.request(`/api/rooms/${roomId}/media/upload`, {
+    method: 'POST',
+    headers: { cookie: cookie(tokens.a) },
+    body: evilForm,
+  });
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { ok: boolean; media: { url: string; title: string } };
+  assert.match(body.media.url, /^\/api\/uploads\/media-[0-9]+-[0-9a-f-]{12}\.mp4$/);
+  assert.ok(!body.media.url.includes('..'), 'stored URL must not contain path traversal');
+  const storedName = path.basename(body.media.url);
+  assert.ok(fs.existsSync(path.join(uploadsDir, storedName)), 'file must exist on disk under the safe name');
+  assert.ok(!fs.existsSync(path.join(uploadsDir, '..', 'evil-escape.mp4')), 'no file may escape the uploads dir');
+});
+
+test('disallowed container rejection cleans up any temporary upload file', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Container Cleanup Room' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+
+  const mkvBytes = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42, 0x82, 0x88, 0x6d, 0x61, 0x74, 0x72, 0x6f, 0x73, 0x6b, 0x61]);
+  const form = new FormData();
+  form.append('file', new Blob([mkvBytes], { type: 'video/x-matroska' }), 'clip.mkv');
+  const res = await app.request(`/api/rooms/${roomId}/media/upload`, {
+    method: 'POST',
+    headers: { cookie: cookie(tokens.a) },
+    body: form,
+  });
+  assert.equal(res.status, 400);
+
+  const leftovers = fs.readdirSync(uploadsDir);
+  assert.ok(!leftovers.some((f) => f.endsWith('.part')), 'no .part temp file may remain');
+  assert.ok(!leftovers.some((f) => f.startsWith('media-') && f.endsWith('.mkv')), 'rejected container must not be stored');
+});
+
+test('zero-byte upload is rejected without creating any file', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Empty File Room' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+
+  const filesBefore = fs.readdirSync(uploadsDir).filter((f) => f.startsWith('media-')).length;
+  const form = new FormData();
+  form.append('file', new Blob([], { type: 'video/mp4' }), 'empty.mp4');
+  const res = await app.request(`/api/rooms/${roomId}/media/upload`, {
+    method: 'POST',
+    headers: { cookie: cookie(tokens.a) },
+    body: form,
+  });
+  assert.equal(res.status, 400);
+  const body = (await res.json()) as { error: { code: string } };
+  assert.equal(body.error.code, 'EMPTY_FILE');
+
+  const filesAfter = fs.readdirSync(uploadsDir).filter((f) => f.startsWith('media-')).length;
+  assert.equal(filesAfter, filesBefore, 'rejected empty upload must not create any file');
+  assert.ok(!fs.readdirSync(uploadsDir).some((f) => f.endsWith('.part')), 'no .part temp file may remain');
 });
 
 // ─── 13. Ephemeral signal buffering (SSE-registration race) ───────────────────
