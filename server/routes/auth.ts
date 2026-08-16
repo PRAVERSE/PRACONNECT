@@ -21,6 +21,7 @@ import { buildGoogleAuthUrl, exchangeCodeForTokens, getGoogleUserInfo, generateO
 import { sendEmailVerificationOtp, sendPasswordResetOtp, sendResendVerificationOtp } from '../email/smtp';
 import { recordLoginActivity } from '../auth/loginActivity';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
+import { getClientIp, rateLimit } from '../rate-limit';
 
 const auth = new Hono();
 
@@ -38,35 +39,6 @@ function getCoarseLocation(c: { req: { header: (h: string) => string | undefined
     // fallback
   }
   return 'unknown';
-}
-
-// ─── In-memory rate limiter ───────────────────────────────────────────────────
-// Simple, appropriate for a 12-person private application.
-
-interface RateLimitEntry {
-  count: number;
-  resetAt: number;
-}
-
-const rateLimits = new Map<string, RateLimitEntry>();
-
-function checkRateLimit(key: string, maxCount: number, windowMs: number): boolean {
-  const now = Date.now();
-  const entry = rateLimits.get(key);
-
-  if (!entry || entry.resetAt < now) {
-    rateLimits.set(key, { count: 1, resetAt: now + windowMs });
-    return true; // allowed
-  }
-
-  if (entry.count >= maxCount) return false; // blocked
-
-  entry.count += 1;
-  return true; // allowed
-}
-
-function getClientIp(c: Parameters<typeof checkRateLimit>[0] extends string ? never : { req: { header: (h: string) => string | undefined }; env: Record<string, unknown> }): string {
-  return (c as { req: { header: (h: string) => string | undefined } }).req.header('x-forwarded-for') ?? 'local';
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -102,7 +74,8 @@ import {
 // ─── POST /signup ─────────────────────────────────────────────────────────────
 
 auth.post('/signup', async (c) => {
-  const ip = c.req.header('x-forwarded-for') ?? 'local';
+  const ipLimit = rateLimit(c, `signup:ip:${getClientIp(c)}`, 'signup');
+  if (ipLimit) return ipLimit;
 
   const body = await c.req.json().catch(() => null);
   if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
@@ -124,6 +97,10 @@ auth.post('/signup', async (c) => {
 
   const email = normalizeEmail(rawEmail);
   const username = rawUsername.trim().toLowerCase();
+
+  // Protect against repeated signup attempts targeting the same email.
+  const emailLimit = rateLimit(c, `signup:email:${email}`, 'signupEmail');
+  if (emailLimit) return emailLimit;
 
   // Check uniqueness against verified users in the permanent users table
   const existingEmail = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
@@ -155,6 +132,9 @@ auth.post('/signup', async (c) => {
 // ─── POST /verify-email ───────────────────────────────────────────────────────
 
 auth.post('/verify-email', async (c) => {
+  const ipLimit = rateLimit(c, `verifyEmail:ip:${getClientIp(c)}`, 'verifyEmail');
+  if (ipLimit) return ipLimit;
+
   const body = await c.req.json().catch(() => null);
   if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
 
@@ -162,6 +142,11 @@ auth.post('/verify-email', async (c) => {
   if (!rawEmail || !otp) return c.json(apiError('VALIDATION_ERROR', 'Email and OTP are required.'), 400);
 
   const email = normalizeEmail(rawEmail);
+
+  // Rate limit per target email. The per-OTP attempt cap inside
+  // verifyPendingSignupOtp is preserved and enforced independently.
+  const emailLimit = rateLimit(c, `verifyEmail:email:${email}`, 'verifyEmailEmail');
+  if (emailLimit) return emailLimit;
 
   // Verifies OTP and atomically activates user in `users` table
   const result = await verifyPendingSignupOtp(email, otp.trim());
@@ -191,10 +176,8 @@ auth.post('/verify-email', async (c) => {
 // ─── POST /resend-verification ────────────────────────────────────────────────
 
 auth.post('/resend-verification', async (c) => {
-  const ip = c.req.header('x-forwarded-for') ?? 'local';
-  if (!checkRateLimit(`resend:${ip}`, 5, 15 * 60 * 1000)) {
-    return c.json(apiError('RATE_LIMITED', 'Too many requests. Please wait before trying again.'), 429);
-  }
+  const ipLimit = rateLimit(c, `resend:ip:${getClientIp(c)}`, 'resendVerification');
+  if (ipLimit) return ipLimit;
 
   const body = await c.req.json().catch(() => null);
   if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
@@ -203,6 +186,10 @@ auth.post('/resend-verification', async (c) => {
   if (!rawEmail) return c.json(apiError('VALIDATION_ERROR', 'Email is required.'), 400);
 
   const email = normalizeEmail(rawEmail);
+
+  // Aggressive per-email limit — every resend triggers an SMTP delivery.
+  const emailLimit = rateLimit(c, `resend:email:${email}`, 'resendVerificationEmail');
+  if (emailLimit) return emailLimit;
 
   // If an unverified pending signup exists, regenerate OTP and dispatch email
   const pending = await resendPendingSignupOtp(email);
@@ -220,10 +207,8 @@ auth.post('/resend-verification', async (c) => {
 // ─── POST /login ──────────────────────────────────────────────────────────────
 
 auth.post('/login', async (c) => {
-  const ip = c.req.header('x-forwarded-for') ?? 'local';
-  if (!checkRateLimit(`login:${ip}`, 10, 15 * 60 * 1000)) {
-    return c.json(apiError('RATE_LIMITED', 'Too many login attempts. Please wait before trying again.'), 429);
-  }
+  const ipLimit = rateLimit(c, `login:ip:${getClientIp(c)}`, 'login');
+  if (ipLimit) return ipLimit;
 
   const body = await c.req.json().catch(() => null);
   if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
@@ -233,8 +218,13 @@ auth.post('/login', async (c) => {
     return c.json(apiError('VALIDATION_ERROR', 'Identifier and password are required.'), 400);
   }
 
-  // Find by email or username
+  // Per-identifier limit applied BEFORE the account lookup so it never leaks
+  // whether an account exists (both real and unknown identifiers get blocked).
   const normalizedIdentifier = identifier.trim().toLowerCase();
+  const userLimit = rateLimit(c, `login:user:${normalizedIdentifier}`, 'loginUser');
+  if (userLimit) return userLimit;
+
+  // Find by email or username
   const user = (db.prepare(`
     SELECT * FROM users WHERE email = ? OR username = ?
   `).get(normalizedIdentifier, normalizedIdentifier) as UserRow | undefined) ?? null;
@@ -393,10 +383,8 @@ auth.get('/google/callback', async (c) => {
 // ─── POST /forgot-password ────────────────────────────────────────────────────
 
 auth.post('/forgot-password', async (c) => {
-  const ip = c.req.header('x-forwarded-for') ?? 'local';
-  if (!checkRateLimit(`forgot:${ip}`, 5, 15 * 60 * 1000)) {
-    return c.json(apiError('RATE_LIMITED', 'Too many requests. Please wait before trying again.'), 429);
-  }
+  const ipLimit = rateLimit(c, `forgot:ip:${getClientIp(c)}`, 'forgotPassword');
+  if (ipLimit) return ipLimit;
 
   const body = await c.req.json().catch(() => null);
   if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
@@ -412,6 +400,12 @@ auth.post('/forgot-password', async (c) => {
   if (emailErr) return c.json(GENERIC_RESPONSE); // Don't reveal validation issues
 
   const email = normalizeEmail(rawEmail);
+
+  // Per-email SMTP abuse guard. Applied before the account lookup so the
+  // generic response (and account enumeration) is unaffected.
+  const emailLimit = rateLimit(c, `forgot:email:${email}`, 'forgotPasswordEmail');
+  if (emailLimit) return emailLimit;
+
   const user = findUserByEmail(email);
 
   if (user && user.emailVerified) {
@@ -429,6 +423,9 @@ auth.post('/forgot-password', async (c) => {
 // ─── POST /verify-password-reset ─────────────────────────────────────────────
 
 auth.post('/verify-password-reset', async (c) => {
+  const ipLimit = rateLimit(c, `verifyReset:ip:${getClientIp(c)}`, 'verifyPasswordReset');
+  if (ipLimit) return ipLimit;
+
   const body = await c.req.json().catch(() => null);
   if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
 
@@ -436,6 +433,9 @@ auth.post('/verify-password-reset', async (c) => {
   if (!rawEmail || !otp) return c.json(apiError('VALIDATION_ERROR', 'Email and OTP are required.'), 400);
 
   const email = normalizeEmail(rawEmail);
+
+  const emailLimit = rateLimit(c, `verifyReset:email:${email}`, 'verifyPasswordResetEmail');
+  if (emailLimit) return emailLimit;
 
   const result = await verifyOtp(email, 'password_reset', otp.trim());
   if (!result.ok) {
@@ -477,6 +477,9 @@ auth.post('/verify-password-reset', async (c) => {
 // ─── POST /reset-password ─────────────────────────────────────────────────────
 
 auth.post('/reset-password', async (c) => {
+  const ipLimit = rateLimit(c, `resetPassword:ip:${getClientIp(c)}`, 'resetPassword');
+  if (ipLimit) return ipLimit;
+
   const body = await c.req.json().catch(() => null);
   if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
 
@@ -494,6 +497,10 @@ auth.post('/reset-password', async (c) => {
     const buf = await crypto.subtle.digest('SHA-256', data);
     return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
   })(resetToken);
+
+  // Prevent brute-forcing a specific reset token across requests.
+  const tokenLimit = rateLimit(c, `resetPassword:token:${tokenHash}`, 'resetPasswordToken');
+  if (tokenLimit) return tokenLimit;
 
   const now = new Date().toISOString();
 

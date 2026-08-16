@@ -32,6 +32,7 @@ import {
 } from '../rooms/service';
 import type { MediaInput, RoomPayload, RoomError } from '../rooms/service';
 import { emit, emitEphemeral, openEventStream, replayEvents } from '../rooms/realtime';
+import { getClientIp, rateLimit } from '../rate-limit';
 
 // Upload limits. The per-file byte counter is authoritative; Content-Length
 // and the total-body counter are coarse early gates (see upload route below).
@@ -270,6 +271,12 @@ rooms.post('/', async (c) => {
 rooms.post('/:id/join', (c) => {
   const roomId = c.req.param('id');
   const userId = c.get('userId');
+
+  const ipLimit = rateLimit(c, `join:ip:${getClientIp(c)}`, 'join');
+  if (ipLimit) return ipLimit;
+  const userLimit = rateLimit(c, `join:user:${userId}`, 'joinUser');
+  if (userLimit) return userLimit;
+
   const result = joinRoom(roomId, userId);
   if (!result.ok) return sendResult(c, result);
 
@@ -806,6 +813,9 @@ rooms.post('/:id/chat', async (c) => {
   const guard = activeMemberGuard(c, roomId, userId);
   if (guard) return guard;
 
+  const chatLimit = rateLimit(c, `chat:${userId}:${roomId}`, 'chat');
+  if (chatLimit) return chatLimit;
+
   const body = await readJson(c);
   if (!body || typeof body.text !== 'string' || !body.text.trim()) {
     return c.json(apiError('VALIDATION_ERROR', 'Text is required.'), 400);
@@ -843,6 +853,9 @@ rooms.post('/:id/signal', async (c) => {
   const userId = c.get('userId');
   const guard = activeMemberGuard(c, roomId, userId);
   if (guard) return guard;
+
+  const signalLimit = rateLimit(c, `signal:${userId}:${roomId}`, 'signal');
+  if (signalLimit) return signalLimit;
 
   const body = await readJson(c);
   if (!body || typeof body.signal !== 'object' || body.signal === null) {
