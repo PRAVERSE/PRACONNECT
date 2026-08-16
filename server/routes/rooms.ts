@@ -475,7 +475,8 @@ rooms.post('/:id/media/upload', async (c) => {
   };
   abortSignal.addEventListener('abort', onAbort);
 
-  async function fail(status: number, code: string, message: string): Promise<Response> {
+  // Upload error statuses are literals so c.json can type them strictly.
+  async function fail(status: 400 | 413, code: string, message: string): Promise<Response> {
     await cleanupPartial();
     return c.json(apiError(code, message), status);
   }

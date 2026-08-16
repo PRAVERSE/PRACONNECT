@@ -86,7 +86,7 @@ export async function getSessionUser(
   const now = new Date().toISOString();
 
   const session = db
-    .prepare<SessionRow, string>(`SELECT * FROM sessions WHERE tokenHash = ? AND expiresAt > ?`)
+    .prepare<string[], SessionRow>(`SELECT * FROM sessions WHERE tokenHash = ? AND expiresAt > ?`)
     .get(tokenHash, now);
 
   if (!session) return null;
@@ -95,7 +95,7 @@ export async function getSessionUser(
   db.prepare(`UPDATE sessions SET lastUsedAt = ? WHERE id = ?`).run(now, session.id);
 
   const user = db
-    .prepare<UserRow, string>(`SELECT * FROM users WHERE id = ?`)
+    .prepare<string[], UserRow>(`SELECT * FROM users WHERE id = ?`)
     .get(session.userId);
 
   if (!user) return null;

@@ -86,7 +86,7 @@ export async function verifyOtp(
   const now = new Date().toISOString();
 
   const row = db
-    .prepare<{ id: string; userId: string; otpHash: string; expiresAt: string; attempts: number }, [string, string]>(`
+    .prepare<[string, string], { id: string; userId: string; otpHash: string; expiresAt: string; attempts: number }>(`
       SELECT id, userId, otpHash, expiresAt, attempts
       FROM emailOtps
       WHERE email = ? AND purpose = ? AND consumedAt IS NULL
