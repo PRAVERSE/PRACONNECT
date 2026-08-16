@@ -23,6 +23,19 @@ export interface WebRTCOptions {
   sendSignal: (targetUserId: string, signal: WebRTCSignalPayload) => Promise<void>;
 }
 
+/**
+ * Bounded camera acquisition state machine. Transitions:
+ *   IDLE -> REQUESTING (startCamera invoked)
+ *   REQUESTING -> ACQUIRED (stream committed + attached to peers)
+ *   REQUESTING -> FAILED_NO_DEVICE (videoinput===0 or NotFoundError)
+ *   FAILED_NO_DEVICE -> WAITING_FOR_DEVICE (devicechange watcher armed)
+ *   WAITING_FOR_DEVICE -> RECOVERING (devicechange reported a video input)
+ *   RECOVERING -> REQUESTING (single one-shot retry via startCamera)
+ *   ACQUIRED -> IDLE (stopCamera)
+ *   any -> IDLE (manager destroyed)
+ */
+type CameraState = 'IDLE' | 'REQUESTING' | 'ACQUIRED' | 'FAILED_NO_DEVICE' | 'WAITING_FOR_DEVICE' | 'RECOVERING';
+
 /** Parse an SDP string into a per-m-line summary for diagnostic evidence. */
 function summarizeSdp(sdp: string | undefined): { section: string; mid?: string; msid?: string; content?: string; dir?: string }[] | null {
   if (!sdp) return null;
@@ -104,6 +117,13 @@ export class WebRTCManager {
   private isDestroyed = false;
   private cameraStartPromise: Promise<boolean> | null = null;
   private lastCameraAttemptTime = 0;
+  /** Stable identity of this manager instance. Every camera diagnostic logs it
+   *  so StrictMode double-mount / stale-manager races are provable in traces. */
+  public readonly managerId: string;
+  public cameraState: CameraState = 'IDLE';
+  private cameraRecoveryAttempts = 0;
+  private cameraAcquisitionInFlight = false;
+  private static managerCounter = 0;
 
   constructor(options: WebRTCOptions) {
     this.roomId = options.roomId;
@@ -113,6 +133,7 @@ export class WebRTCManager {
     this.onLocalScreenStreamChange = options.onLocalScreenStreamChange;
     this.onError = options.onError;
     this.sendSignal = options.sendSignal;
+    this.managerId = `${options.myUserId}-${++WebRTCManager.managerCounter}`;
   }
 
   /** Synchronize active peer connections with current room participants */
@@ -820,21 +841,34 @@ export class WebRTCManager {
     const handler = async () => {
       const devices = await navigator.mediaDevices.enumerateDevices();
       const videoInputs = devices.filter((d) => d.kind === 'videoinput');
-      console.log('[CAMERA LIFECYCLE] devicechange fired:', {
+      const audioInputs = devices.filter((d) => d.kind === 'audioinput');
+
+      // Diagnostic H — every devicechange observed by the recovery watcher.
+      console.log('[CAMERA DEBUG] devicechange:', {
         ts: new Date().toISOString(),
-        videoInputs: videoInputs.length,
+        videoInputCount: videoInputs.length,
+        audioInputCount: audioInputs.length,
+        recoveryAttempt: this.cameraRecoveryAttempts,
+        destroyed: this.isDestroyed,
+        managerId: this.managerId,
+        cameraState: this.cameraState,
       });
-      if (videoInputs.length === 0) {
+
+      if (this.isDestroyed || videoInputs.length === 0) {
         return;
       }
+      this.cameraRecoveryAttempts += 1;
       console.log('[CAMERA LIFECYCLE] video input reappeared — performing one-shot camera retry', {
         ts: new Date().toISOString(),
         videoInputs: videoInputs.map((d) => ({ kind: d.kind, label: d.label, deviceId: d.deviceId })),
+        recoveryAttempt: this.cameraRecoveryAttempts,
+        managerId: this.managerId,
       });
       this.disarmCameraDeviceRecovery();
       // Bypass the 1500ms cooldown so a freshly reappeared device is
       // acquired immediately instead of being silently throttled.
       this.lastCameraAttemptTime = 0;
+      this.setCameraState('RECOVERING', 'devicechange reported a video input — one-shot retry');
       this.startCamera().catch(() => {});
     };
 
@@ -849,6 +883,67 @@ export class WebRTCManager {
     if (this.cameraRecoveryDisarm) {
       this.cameraRecoveryDisarm();
     }
+  }
+
+  /** Log camera state transitions. Only the current (non-destroyed) manager
+   *  may advance the camera state machine. */
+  private setCameraState(next: CameraState, reason: string) {
+    if (this.cameraState !== next) {
+      console.log('[CAMERA STATE]', `${this.cameraState} -> ${next}`, {
+        ts: new Date().toISOString(),
+        reason,
+        managerId: this.managerId,
+        destroyed: this.isDestroyed,
+      });
+      this.cameraState = next;
+    }
+  }
+
+  /**
+   * Separation invariant check: a camera track must never live inside
+   * screenStream, and a screen track must never live inside localStream.
+   * Pure diagnostic — never mutates anything.
+   */
+  private assertMediaSeparation(action: string) {
+    const cameraTrackIds = new Set((this.localStream?.getTracks() ?? []).map((t) => t.id));
+    const screenTrackIds = new Set((this.screenStream?.getTracks() ?? []).map((t) => t.id));
+    const cameraTrackInScreenStream = (this.screenStream?.getTracks() ?? [])
+      .filter((t) => cameraTrackIds.has(t.id))
+      .map((t) => `${t.kind}:${t.id}`);
+    const screenTrackInCameraStream = (this.localStream?.getTracks() ?? [])
+      .filter((t) => screenTrackIds.has(t.id))
+      .map((t) => `${t.kind}:${t.id}`);
+
+    if (cameraTrackInScreenStream.length > 0 || screenTrackInCameraStream.length > 0) {
+      console.error('[MEDIA SEPARATION DEBUG] VIOLATION:', {
+        ts: new Date().toISOString(),
+        action,
+        managerId: this.managerId,
+        cameraTrackInScreenStream,
+        screenTrackInCameraStream,
+      });
+    } else {
+      console.log('[MEDIA SEPARATION DEBUG] ok:', {
+        ts: new Date().toISOString(),
+        action,
+        managerId: this.managerId,
+        cameraTrackCount: this.localStream?.getTracks().length ?? 0,
+        screenTrackCount: this.screenStream?.getTracks().length ?? 0,
+      });
+    }
+  }
+
+  /** Snapshot of the camera state machine for UI-level diagnostics. */
+  public getCameraDiagnostics() {
+    return {
+      managerId: this.managerId,
+      destroyed: this.isDestroyed,
+      cameraState: this.cameraState,
+      cameraRecoveryAttempts: this.cameraRecoveryAttempts,
+      cameraAcquisitionInFlight: this.cameraAcquisitionInFlight,
+      hasCameraStream: Boolean(this.localStream?.getVideoTracks().some((t) => t.readyState === 'live')),
+      hasScreenStream: Boolean(this.screenStream?.getTracks().some((t) => t.readyState === 'live')),
+    };
   }
 
   /** Start local camera track via getUserMedia with robust fallback constraints */
@@ -868,6 +963,9 @@ export class WebRTCManager {
       return false;
     }
     this.lastCameraAttemptTime = now;
+
+    this.setCameraState('REQUESTING', 'startCamera invoked');
+    this.cameraAcquisitionInFlight = true;
 
     this.cameraStartPromise = (async () => {
       try {
@@ -910,7 +1008,18 @@ export class WebRTCManager {
         // because the permission prompt itself can make devices appear.
         const skipAcquisition = devCounts.videoInputs === 0 && (permissionState === 'granted' || permissionState === 'denied');
         if (skipAcquisition) {
+          this.setCameraState('FAILED_NO_DEVICE', `videoinput===0 with permission=${permissionState}`);
+          console.log('[CAMERA DEBUG] CAMERA DEVICE NOT EXPOSED BY BROWSER:', {
+            ts: new Date().toISOString(),
+            videoInputsReported: devCounts.videoInputs,
+            audioInputsReported: devCounts.audioInputs,
+            permissionState,
+            managerId: this.managerId,
+            destroyed: this.isDestroyed,
+            action: 'skipping getUserMedia — waiting for devicechange',
+          });
           console.log('[CAMERA LIFECYCLE] videoinput === 0, permission =', permissionState, '— skipping getUserMedia, arming device recovery watcher');
+          this.setCameraState('WAITING_FOR_DEVICE', 'arming one-shot devicechange watcher');
           this.armCameraDeviceRecovery();
           if (permissionState === 'denied') {
             const deniedDiag: MediaDiagnosticError = {
@@ -939,17 +1048,22 @@ export class WebRTCManager {
         let stream: MediaStream | null = null;
         let lastError: any = null;
 
-        console.log('[CAMERA DEBUG] getUserMedia called:', {
-          ts: new Date().toISOString(),
-          videoInputsReported: devCounts.videoInputs,
-          constraints: 'video:true -> {width:{ideal:640},height:{ideal:480}} fallback',
-        });
-
         // Try native video constraint first for optimal DirectShow & MediaFoundation driver compatibility
         const constraintCandidates: (boolean | MediaTrackConstraints)[] = [
           true,
           { width: { ideal: 640 }, height: { ideal: 480 } },
         ];
+
+        // Diagnostic B — immediately BEFORE the getUserMedia call.
+        console.log('[CAMERA DEBUG] getUserMedia requested:', {
+          ts: new Date().toISOString(),
+          constraints: constraintCandidates,
+          videoInputsReported: devCounts.videoInputs,
+          permissionState,
+          managerId: this.managerId,
+          destroyed: this.isDestroyed,
+          cameraState: this.cameraState,
+        });
 
         for (let i = 0; i < constraintCandidates.length; i++) {
           console.log(`[CAMERA LIFECYCLE] getUserMedia invocation ${i + 1}/${constraintCandidates.length}:`, {
@@ -1011,6 +1125,18 @@ export class WebRTCManager {
           this.onError('No video track returned from camera device.');
           return false;
         }
+
+        // Diagnostic D — immediately after successful getUserMedia.
+        console.log('[CAMERA DEBUG] camera acquired:', {
+          ts: new Date().toISOString(),
+          streamId: stream.id,
+          videoTrackId: videoTrack.id,
+          trackReadyState: videoTrack.readyState,
+          trackEnabled: videoTrack.enabled,
+          trackMuted: videoTrack.muted,
+          trackSettings: videoTrack.getSettings ? videoTrack.getSettings() : {},
+          managerId: this.managerId,
+        });
         console.log('[CAMERA DEBUG] camera track created:', {
           ts: new Date().toISOString(),
           trackId: videoTrack.id,
@@ -1051,6 +1177,14 @@ export class WebRTCManager {
           return false;
         }
 
+        // Diagnostic E — immediately BEFORE attaching the camera track to peers.
+        console.log('[CAMERA DEBUG] attaching camera track:', {
+          ts: new Date().toISOString(),
+          trackId: videoTrack.id,
+          peerCount: this.peerConnections.size,
+          managerId: this.managerId,
+        });
+
         this.onLocalStreamChange(this.localStream);
         this.updateLocalTracksOnAllPeers();
 
@@ -1086,6 +1220,43 @@ export class WebRTCManager {
             senders: pc.getSenders().map((s) => ({ kind: s.track?.kind ?? null, trackId: s.track?.id ?? null, label: s.track?.label ?? null, readyState: s.track?.readyState ?? null })),
           });
         }
+
+        // Diagnostic F — per-peer camera sender verification. The camera sender
+        // is any video sender that is NOT the bookkept screen sender.
+        const screenTrackId = this.screenStream?.getVideoTracks()[0]?.id ?? null;
+        for (const [remoteUserId, pc] of this.peerConnections) {
+          if (pc.connectionState === 'closed') continue;
+          const bookkeptScreenSender = this.screenSenderByPeer.get(remoteUserId) ?? null;
+          const videoSenders = pc.getSenders().filter((s) => s.track?.kind === 'video');
+          const cameraSenders = videoSenders.filter((s) => s !== bookkeptScreenSender && s.track?.id !== screenTrackId);
+          const cameraSender = cameraSenders[0] ?? null;
+          console.log('[CAMERA DEBUG] camera sender attached:', {
+            ts: new Date().toISOString(),
+            remotePeerId: remoteUserId,
+            senderKind: cameraSender?.track?.kind ?? null,
+            senderTrackId: cameraSender?.track?.id ?? null,
+            senderTrackReadyState: cameraSender?.track?.readyState ?? null,
+            totalVideoSenders: videoSenders.length,
+            managerId: this.managerId,
+          });
+          const cameraOnSender = cameraSenders.some((s) => s.track && s.track.id === videoTrack.id);
+          if (!cameraOnSender) {
+            console.warn('[CAMERA DEBUG] camera track NOT present on any sender of peer:', {
+              remotePeerId: remoteUserId,
+              videoSenders: videoSenders.length,
+              trackId: videoTrack.id,
+            });
+          }
+          if (this.screenStream && videoSenders.length < 2) {
+            console.warn('[CAMERA DEBUG] screen sharing active but peer has < 2 video senders (camera+screen expected):', {
+              remotePeerId: remoteUserId,
+              videoSenders: videoSenders.length,
+            });
+          }
+        }
+
+        this.assertMediaSeparation('startCamera commit');
+        this.setCameraState('ACQUIRED', 'camera committed and attached to peers');
         return true;
       } catch (err: any) {
         console.group('[GET USER MEDIA]');
@@ -1137,6 +1308,17 @@ export class WebRTCManager {
             console.log('F. OS/browser issue outside app -> enumeration and permission look fine yet capture fails:', devSummary.videoDeviceCount > 0 && permissionState !== 'denied');
             console.groupEnd();
             if (devSummary.videoDeviceCount === 0) {
+              this.setCameraState('FAILED_NO_DEVICE', `NotFoundError with videoDeviceCount===0 (permission=${permissionState})`);
+              console.log('[CAMERA DEBUG] CAMERA DEVICE NOT EXPOSED BY BROWSER:', {
+                ts: new Date().toISOString(),
+                videoInputsReported: devSummary.videoDeviceCount,
+                audioInputsReported: devSummary.audioDeviceCount,
+                permissionState,
+                managerId: this.managerId,
+                destroyed: this.isDestroyed,
+                action: 'NotFoundError — waiting for devicechange',
+              });
+              this.setCameraState('WAITING_FOR_DEVICE', 'arming one-shot devicechange watcher');
               this.armCameraDeviceRecovery();
               const noCamDiag: MediaDiagnosticError = {
                 type: 'device_not_found',
@@ -1157,9 +1339,11 @@ export class WebRTCManager {
 
         const diag = diagnoseMediaError(err, 'camera');
         this.onError(diag);
+        this.setCameraState('IDLE', `camera acquisition failed with ${errName || 'unknown'} — user can retry`);
         return false;
       } finally {
         this.cameraStartPromise = null;
+        this.cameraAcquisitionInFlight = false;
       }
     })();
 
@@ -1178,6 +1362,7 @@ export class WebRTCManager {
         ts: new Date().toISOString(),
         screenTracks: this.screenStream?.getTracks().map((t) => `${t.kind}:${t.readyState}`) ?? [],
         peers: Array.from(this.peerConnections.keys()),
+        managerId: this.managerId,
       });
       console.log('[CAMERA LIFECYCLE] after camera track stop:', {
         ts: new Date().toISOString(),
@@ -1185,6 +1370,8 @@ export class WebRTCManager {
         screenTracksStillLive: this.screenStream?.getTracks().filter((t) => t.readyState === 'live').length ?? 0,
       });
       logFullDeviceEnumeration('stopCamera (immediately after camera track stopped)').catch(() => {});
+      this.assertMediaSeparation('stopCamera');
+      this.setCameraState('IDLE', 'stopCamera');
       this.onLocalStreamChange(this.localStream);
       this.updateLocalTracksOnAllPeers();
     }
@@ -1330,6 +1517,13 @@ export class WebRTCManager {
         audioTracks: this.localStream?.getAudioTracks().length ?? 0,
         screenTracks: this.screenStream?.getTracks().map((t) => `${t.kind}:${t.readyState}`) ?? [],
       });
+      const devicesBeforeScreenShare = await navigator.mediaDevices.enumerateDevices().catch(() => [] as MediaDeviceInfo[]);
+      const videoInputsBeforeScreenShare = devicesBeforeScreenShare.filter((d) => d.kind === 'videoinput').length;
+      console.log('[CAMERA DEBUG] enumerateDevices before screen share:', {
+        ts: new Date().toISOString(),
+        videoInputsBeforeScreenShare,
+        managerId: this.managerId,
+      });
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: { cursor: 'always' } as MediaTrackConstraints,
         audio: false,
@@ -1341,6 +1535,18 @@ export class WebRTCManager {
       });
       console.log('[CAMERA LIFECYCLE] enumeration immediately after getDisplayMedia():');
       await logFullDeviceEnumeration('startScreenShare (immediately after getDisplayMedia resolved)');
+      // Diagnostic C — critical: compare videoinput count before vs after
+      // getDisplayMedia resolved (screen capture must not hide the camera).
+      const devicesAfterScreenShare = await navigator.mediaDevices.enumerateDevices().catch(() => [] as MediaDeviceInfo[]);
+      const videoInputsAfterScreenShare = devicesAfterScreenShare.filter((d) => d.kind === 'videoinput').length;
+      console.log('[CAMERA DEBUG] enumerateDevices after screen share:', {
+        ts: new Date().toISOString(),
+        videoInputsBeforeScreenShare,
+        videoInputsAfterScreenShare,
+        delta: videoInputsAfterScreenShare - videoInputsBeforeScreenShare,
+        managerId: this.managerId,
+        destroyed: this.isDestroyed,
+      });
       console.log('[CAMERA LIFECYCLE] camera stream AFTER getDisplayMedia (before screen attach):', {
         ts: new Date().toISOString(),
         cameraTracks: this.localStream?.getVideoTracks().map((t) => `${t.id}:${t.readyState}:${t.enabled ? 'enabled' : 'disabled'}`) ?? [],
@@ -1411,6 +1617,7 @@ export class WebRTCManager {
         screenTracksRemaining: this.screenStream?.getTracks().map((t) => `${t.kind}:${t.readyState}`) ?? [],
       });
       logFullDeviceEnumeration('setLocalScreenStream(null) (immediately after screen share stopped)').catch(() => {});
+      this.assertMediaSeparation('setLocalScreenStream(null)');
       this.updateLocalTracksOnAllPeers();
       if (previous) {
         for (const [remoteUserId, pc] of this.peerConnections) {
@@ -1506,6 +1713,8 @@ export class WebRTCManager {
     }
     console.log('[SCREEN DEBUG] track-meta signals dispatched to all peers');
 
+    this.assertMediaSeparation('setLocalScreenStream(non-null)');
+
     return true;
   }
 
@@ -1539,6 +1748,20 @@ export class WebRTCManager {
   public destroy() {
     this.isDestroyed = true;
     this.disarmCameraDeviceRecovery();
+
+    // Diagnostic G — manager destruction with full camera state snapshot.
+    const cameraTracksToStop = this.localStream?.getTracks().filter((t) => t.kind === 'video').length ?? 0;
+    console.log('[CAMERA DEBUG] manager destroyed:', {
+      ts: new Date().toISOString(),
+      managerId: this.managerId,
+      cameraAcquisitionInFlight: this.cameraAcquisitionInFlight,
+      cameraStreamExisted: Boolean(this.localStream),
+      cameraTracksStopped: cameraTracksToStop,
+      screenStreamExisted: Boolean(this.screenStream),
+      cameraState: this.cameraState,
+    });
+    this.setCameraState('IDLE', 'manager destroyed');
+
     this.stopScreenShare();
     if (this.localStream) {
       this.localStream.getTracks().forEach((t) => this.stopTrackSafely(t, 'destroy', t.kind === 'audio' ? 'audio' : 'camera'));
@@ -1556,6 +1779,7 @@ export class WebRTCManager {
     this.pendingRenegotiation.clear();
     this.screenSenderByPeer.clear();
     this.trackOwners.clear();
+    this.assertMediaSeparation('destroy');
     this.onLocalStreamChange(null);
     this.onLocalScreenStreamChange?.(null);
   }

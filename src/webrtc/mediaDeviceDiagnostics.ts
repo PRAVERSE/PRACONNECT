@@ -198,6 +198,47 @@ export async function logMediaPermissions(): Promise<void> {
   }
 }
 
+/**
+ * Full room-entry camera diagnostic dump. Runs BEFORE any getUserMedia /
+ * getDisplayMedia call. Logs timestamp, device counts, labels, permission
+ * state, document visibility, secure context and mediaDevices availability.
+ */
+export async function logRoomEntryDeviceDiagnostics(action: string): Promise<{ videoInputs: number; audioInputs: number }> {
+  const result = { videoInputs: 0, audioInputs: 0 };
+  if (typeof navigator === 'undefined') return result;
+
+  let permissionState: string | null = null;
+  try {
+    permissionState = await queryCameraPermissionState();
+  } catch {}
+
+  let devices: MediaDeviceInfo[] = [];
+  if (navigator.mediaDevices?.enumerateDevices) {
+    try {
+      devices = await navigator.mediaDevices.enumerateDevices();
+    } catch (e) {
+      console.warn('[DEVICES] room-entry enumeration failed:', e);
+    }
+  }
+  result.videoInputs = devices.filter((d) => d.kind === 'videoinput').length;
+  result.audioInputs = devices.filter((d) => d.kind === 'audioinput').length;
+
+  console.group(`[CAMERA DEBUG] enumerateDevices on room entry (${action})`);
+  console.log('timestamp:', new Date().toISOString());
+  console.log('videoinputCount:', result.videoInputs);
+  console.log('audioinputCount:', result.audioInputs);
+  console.log('totalDeviceCount:', devices.length);
+  console.log('deviceLabels:', devices.map((d) => `${d.kind}:${d.label || '(masked)'}`));
+  console.log('permissionState:', permissionState);
+  console.log('documentVisibility:', typeof document !== 'undefined' ? document.visibilityState : 'n/a');
+  console.log('secureContext:', typeof window !== 'undefined' ? window.isSecureContext : false);
+  console.log('mediaDevicesAvailable:', Boolean(navigator.mediaDevices));
+  console.log('enumerateDevicesAvailable:', typeof navigator.mediaDevices?.enumerateDevices);
+  console.groupEnd();
+
+  return result;
+}
+
 /** Convert raw getUserMedia / getDisplayMedia errors into actionable user diagnostics */
 export function diagnoseMediaError(
   err: unknown,

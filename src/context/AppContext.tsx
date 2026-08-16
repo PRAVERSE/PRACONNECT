@@ -48,7 +48,7 @@ import {
   ServerRoomMember
 } from '../api/rooms';
 import { WebRTCManager } from '../webrtc/WebRTCManager';
-import { MediaDiagnosticError } from '../webrtc/mediaDeviceDiagnostics';
+import { MediaDiagnosticError, logRoomEntryDeviceDiagnostics } from '../webrtc/mediaDeviceDiagnostics';
 
 interface AppContextType {
   activeTab: NavigationTab;
@@ -103,6 +103,15 @@ interface AppContextType {
   mediaErrorMessage: string | null;
   mediaDiagnosticError: MediaDiagnosticError | null;
   clearMediaError: () => void;
+  getManagerCameraDiagnostics: () => {
+    managerId: string;
+    destroyed: boolean;
+    cameraState: string;
+    cameraRecoveryAttempts: number;
+    cameraAcquisitionInFlight: boolean;
+    hasCameraStream: boolean;
+    hasScreenStream: boolean;
+  } | null;
 
   // Controls
   micOn: boolean;
@@ -241,6 +250,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setMediaErrorMessage(null);
     setMediaDiagnosticError(null);
   }, []);
+  const getManagerCameraDiagnostics = useCallback(
+    () => (webrtcRef.current ? webrtcRef.current.getCameraDiagnostics() : null),
+    []
+  );
 
   const [userProfile, setUserProfile] = useState<UserProfile>(initialUserProfile);
   const [userSettings, setUserSettings] = useState<UserSettings>(initialUserSettings);
@@ -400,13 +413,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const initCamera = async () => {
       const rtc = webrtcRef.current;
       if (!rtc) return;
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      console.log('[CAMERA DEBUG] enumerateDevices (on room entry):', {
-        ts: new Date().toISOString(),
-        videoInputs: devices.filter((d) => d.kind === 'videoinput').length,
-        audioInputs: devices.filter((d) => d.kind === 'audioinput').length,
-        total: devices.length,
-      });
+      // Diagnostic A — full device/permission/environment dump on room entry,
+      // BEFORE any getUserMedia / getDisplayMedia call.
+      await logRoomEntryDeviceDiagnostics('room entry (before screen share)');
       const ok = await rtc.startCamera();
       if (ok && !cancelled) {
         setCameraOn(true);
@@ -1073,6 +1082,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         mediaErrorMessage,
         mediaDiagnosticError,
         clearMediaError,
+        getManagerCameraDiagnostics,
         micOn,
         cameraOn,
         screenShareOn,

@@ -233,6 +233,7 @@ export const RoomView: React.FC = () => {
     mediaErrorMessage,
     mediaDiagnosticError,
     clearMediaError,
+    getManagerCameraDiagnostics,
     uploadRoomMedia,
   } = useApp();
 
@@ -403,7 +404,19 @@ export const RoomView: React.FC = () => {
       try {
         const devices = await navigator.mediaDevices.enumerateDevices();
         const videoInputs = devices.filter((d) => d.kind === 'videoinput');
-        console.log('[Diagnostics] devicechange: videoinput count =', videoInputs.length);
+        const audioInputs = devices.filter((d) => d.kind === 'audioinput');
+        const mgr = getManagerCameraDiagnostics();
+        // Diagnostic H — UI-level devicechange snapshot (the manager's own
+        // recovery watcher logs the same event with full state).
+        console.log('[CAMERA DEBUG] devicechange:', {
+          ts: new Date().toISOString(),
+          videoInputCount: videoInputs.length,
+          audioInputCount: audioInputs.length,
+          recoveryAttempt: mgr?.cameraRecoveryAttempts ?? null,
+          destroyed: mgr?.destroyed ?? null,
+          managerId: mgr?.managerId ?? null,
+          cameraState: mgr?.cameraState ?? null,
+        });
         if (videoInputs.length > 0 && (mediaDiagnosticError?.type === 'device_not_found' || mediaErrorMessage)) {
           console.log('[Diagnostics] Camera device detected on devicechange event. Clearing camera error state.');
           clearMediaError();
