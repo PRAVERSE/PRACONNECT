@@ -399,69 +399,267 @@ export async function sendSignalApi(
   }
 }
 
-/** Connect to the room Server-Sent Events stream with automatic reconnection */
-export function connectRoomEvents(
-  roomId: string,
-  onEvent: (type: string, payload: any) => void,
-  onError?: (err: unknown) => void
-): () => void {
-  let eventSource: EventSource | null = null;
+// ─── Room SSE: reconnect manager ──────────────────────────────────────────────
+//
+// Lifecycle: CONNECTING -> CONNECTED <-> DISCONNECTED, with
+// RECOVERING_MEMBERSHIP in between when the server no longer considers the
+// user an active member, and CLOSED once the stream is intentionally torn
+// down (room left, removed, destroyed, terminal error).
+//
+// - Last-Event-ID is preserved across reconnects and only advanced after an
+//   event has been processed, so a reconnect resumes from the last consumed
+//   persisted event.
+// - Persisted events carry an `id:`; frames with an id <= the cursor are
+//   duplicate/replayed and skipped. Ephemeral signaling frames carry no id
+//   and are never deduplicated by the cursor.
+// - A fetch stream (instead of EventSource) is used so the cursor can be sent
+//   as a header and so HTTP error responses (401/403/404/409/429) can be
+//   distinguished instead of being retried blindly.
+// - Membership recovery re-joins via the existing join API and, on success,
+//   hands the authoritative room state to onRoomRecovered before resuming the
+//   event stream with the preserved cursor.
+
+export type RoomSseState =
+  | 'CONNECTING'
+  | 'CONNECTED'
+  | 'DISCONNECTED'
+  | 'RECOVERING_MEMBERSHIP'
+  | 'CLOSED';
+
+export interface ConnectRoomEventsOptions {
+  roomId: string;
+  onEvent: (type: string, payload: unknown) => void;
+  /** Fired on every state transition with the current persisted-event cursor. */
+  onStateChange?: (state: RoomSseState, info?: { lastEventId?: number; reason?: string }) => void;
+  /** Fired with authoritative room state after membership recovery succeeds. */
+  onRoomRecovered?: (room: ServerRoom) => void;
+  /** Fired when recovery is abandoned (401/403/404/409) so the UI can surface it. */
+  onRecoveryFailure?: (code: string) => void;
+  /** Prevents auto-rejoin (e.g. user intentionally left or was removed). Default: true. */
+  canAutoRejoin?: () => boolean;
+  reconnectBaseDelayMs?: number;
+  reconnectMaxDelayMs?: number;
+}
+
+const RECOVERY_TERMINAL_CODES = [
+  'UNAUTHENTICATED',
+  'REMOVED_FROM_ROOM',
+  'ROOM_MEMBERSHIP_REQUIRED',
+  'ROOM_NOT_FOUND',
+  'ROOM_GONE',
+  'ROOM_FULL',
+];
+
+/** Connect to the room Server-Sent Events stream with automatic reconnection. */
+export function connectRoomEvents(options: ConnectRoomEventsOptions): () => void {
+  const {
+    roomId,
+    onEvent,
+    onStateChange,
+    onRoomRecovered,
+    onRecoveryFailure,
+  } = options;
+  const canAutoRejoin = options.canAutoRejoin ?? (() => true);
+  const baseDelay = options.reconnectBaseDelayMs ?? 2000;
+  const maxDelay = options.reconnectMaxDelayMs ?? 15000;
+
   let closed = false;
+  let lastEventId = 0;
+  let attempt = 0;
+  let recovering = false;
+  let abortController: AbortController | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-  function connect() {
+  function setState(next: RoomSseState, reason?: string): void {
+    if (closed && next !== 'CLOSED') return;
+    console.log(
+      `[ROOM SSE] ${next} room=${roomId} lastEventId=${lastEventId}${reason ? ` reason=${reason}` : ''}`
+    );
+    onStateChange?.(next, { lastEventId: lastEventId || undefined, reason });
+  }
+
+  function clearRetry(): void {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+  }
+
+  function stop(reason: string): void {
     if (closed) return;
+    closed = true;
+    clearRetry();
+    abortController?.abort();
+    setState('CLOSED', reason);
+  }
+
+  function scheduleReconnect(reason: string): void {
+    if (closed) return;
+    clearRetry();
+    const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
+    attempt += 1;
+    setState('DISCONNECTED', reason);
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      void connect();
+    }, delay);
+  }
+
+  /** Re-establish server-side membership (grace period expired / private room 403). */
+  async function recoverMembership(): Promise<void> {
+    if (closed || recovering) return;
+    recovering = true;
+    setState('RECOVERING_MEMBERSHIP', 'membership-lost');
     try {
-      eventSource = new EventSource(`/api/rooms/${encodeURIComponent(roomId)}/events`, {
-        withCredentials: true,
-      });
-
-      const eventTypes = [
-        'room:update',
-        'member:join',
-        'member:leave',
-        'member:removed',
-        'member:state',
-        'host:changed',
-        'chat:message',
-        'signal',
-      ];
-
-      for (const type of eventTypes) {
-        eventSource.addEventListener(type, (e: MessageEvent) => {
-          if (closed) return;
-          try {
-            const data = JSON.parse(e.data);
-            onEvent(type, data);
-          } catch (err) {
-            console.warn(`[SSE] Failed to parse event ${type}:`, err);
-          }
-        });
+      if (!canAutoRejoin()) {
+        stop('leave');
+        return;
       }
+      const res = await joinRoomApi(roomId);
+      if (!res.ok || !res.data) {
+        const code = res.error?.code ?? 'UNKNOWN';
+        const terminal = RECOVERY_TERMINAL_CODES.includes(code);
+        console.log(`[ROOM SSE] membership recovery failed room=${roomId} code=${code} terminal=${terminal}`);
+        if (terminal) {
+          onRecoveryFailure?.(code);
+          stop(code);
+        } else {
+          // Transient (network / rate limit / 5xx): keep retrying with backoff.
+          scheduleReconnect(`recovery-retry:${code}`);
+        }
+        return;
+      }
+      console.log(`[ROOM SSE] membership recovered room=${roomId} lastEventId=${lastEventId}`);
+      onRoomRecovered?.(res.data);
+      attempt = 0;
+      void connect();
+    } finally {
+      recovering = false;
+    }
+  }
 
-      eventSource.onerror = (err) => {
-        if (closed) return;
-        onError?.(err);
-        eventSource?.close();
-        // Retry connection after 2 seconds
-        retryTimer = setTimeout(connect, 2000);
-      };
-    } catch (err) {
-      onError?.(err);
-      if (!closed) {
-        retryTimer = setTimeout(connect, 2000);
+  /** Dispatch one complete SSE frame; skip duplicates and advance the cursor. */
+  function handleFrame(frame: string): void {
+    if (!frame.trim()) return;
+    let eventType = 'message';
+    let eventId: number | null = null;
+    const dataLines: string[] = [];
+    for (const rawLine of frame.split(/\r?\n/)) {
+      if (rawLine.startsWith(':')) continue; // comment / heartbeat ping
+      if (rawLine.startsWith('id:')) {
+        eventId = Number(rawLine.slice(3).trim());
+      } else if (rawLine.startsWith('event:')) {
+        eventType = rawLine.slice(6).trim();
+      } else if (rawLine.startsWith('data:')) {
+        dataLines.push(rawLine.slice(5).trimStart());
+      }
+    }
+    if (dataLines.length === 0) return;
+    let payload: unknown;
+    try {
+      payload = JSON.parse(dataLines.join('\n'));
+    } catch {
+      return;
+    }
+
+    if (eventId !== null) {
+      if (eventId <= lastEventId) return; // duplicate / replayed — already processed
+      onEvent(eventType, payload);
+      lastEventId = eventId; // advance only after processing succeeded
+    } else {
+      // Ephemeral frame (WebRTC signals) — never deduplicated by the cursor.
+      onEvent(eventType, payload);
+    }
+  }
+
+  async function readStream(res: Response): Promise<void> {
+    const reader = res.body?.getReader();
+    if (!reader) return;
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (!closed) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const sep = /\r?\n\r?\n/;
+        let match = buffer.match(sep);
+        while (match && match.index !== undefined) {
+          const frame = buffer.slice(0, match.index);
+          buffer = buffer.slice(match.index + match[0].length);
+          handleFrame(frame);
+          match = buffer.match(sep);
+        }
+      }
+    } catch {
+      // Stream aborted or network failure — handled by the caller.
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        // already released
       }
     }
   }
 
-  connect();
+  async function connect(): Promise<void> {
+    if (closed) return;
+    clearRetry();
+    abortController?.abort();
+    abortController = new AbortController();
+    setState('CONNECTING');
+
+    let res: Response;
+    try {
+      res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/events`, {
+        headers: lastEventId > 0 ? { 'Last-Event-ID': String(lastEventId) } : undefined,
+        credentials: 'include',
+        signal: abortController.signal,
+      });
+    } catch (err) {
+      if (closed) return;
+      if ((err as Error)?.name === 'AbortError') return;
+      scheduleReconnect('fetch-failed');
+      return;
+    }
+
+    if (closed) return;
+    if (!res.ok) {
+      if (res.status === 401) {
+        onRecoveryFailure?.('UNAUTHENTICATED');
+        stop('auth');
+        return;
+      }
+      if (res.status === 404) {
+        onRecoveryFailure?.('ROOM_GONE');
+        stop('room-gone');
+        return;
+      }
+      if (res.status === 403) {
+        // Membership lost (private room) or never authorized: attempt recovery.
+        void recoverMembership();
+        return;
+      }
+      // 429 (rate limited) and 5xx are transient.
+      scheduleReconnect(`http-${res.status}`);
+      return;
+    }
+
+    attempt = 0;
+    setState('CONNECTED');
+    await readStream(res);
+    if (closed) return;
+    scheduleReconnect('stream-ended');
+  }
+
+  void connect();
 
   return () => {
+    if (closed) return;
     closed = true;
-    if (retryTimer) clearTimeout(retryTimer);
-    if (eventSource) {
-      eventSource.close();
-      eventSource = null;
-    }
+    clearRetry();
+    abortController?.abort();
+    console.log(`[ROOM SSE] closed room=${roomId} lastEventId=${lastEventId}`);
+    onStateChange?.('CLOSED', { lastEventId: lastEventId || undefined, reason: 'closed' });
   };
 }

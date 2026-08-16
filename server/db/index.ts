@@ -22,4 +22,11 @@ for (const statement of schema
   db.exec(statement + ';');
 }
 
+// Phase 6.5: add removedAt to roomMembers on databases created before this
+// column existed. Fresh databases get it from the CREATE TABLE above.
+const memberCols = (db.prepare('PRAGMA table_info(roomMembers)').all() as { name: string }[]).map((r) => r.name);
+if (!memberCols.includes('removedAt')) {
+  db.exec('ALTER TABLE roomMembers ADD COLUMN removedAt TEXT');
+}
+
 console.log(`[db] SQLite database opened at: ${dbPath}`);

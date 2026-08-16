@@ -31,7 +31,7 @@ import {
   RoomErrors,
 } from '../rooms/service';
 import type { MediaInput, RoomPayload, RoomError } from '../rooms/service';
-import { emit, emitEphemeral, openEventStream, replayEvents } from '../rooms/realtime';
+import { emit, emitEphemeral, openEventStream, replayEventsWithMeta } from '../rooms/realtime';
 import { getClientIp, rateLimit } from '../rate-limit';
 
 // Upload limits. The per-file byte counter is authoritative; Content-Length
@@ -960,13 +960,14 @@ rooms.get('/:id/events', (c) => {
   }
 
   const afterId = Number(c.req.header('last-event-id') ?? '0') || 0;
-  const replay = replayEvents(roomId, afterId);
+  const { events: replay, truncated } = replayEventsWithMeta(roomId, afterId);
   const encoder = new TextEncoder();
   let cleanupHub: (() => void) | null = null;
 
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
-      // Replay missed events BEFORE any live frames, so ordering holds.
+      // Register the live sink BEFORE enqueueing replay so no live events are
+      // missed; the client deduplicates by persisted event id.
       cleanupHub = openEventStream(
         roomId,
         userId,
@@ -983,6 +984,15 @@ rooms.get('/:id/events', (c) => {
           }
         }
       );
+
+      // The client's cursor fell outside the replay window: replay alone cannot
+      // reconstruct room state. Emit an explicit resync marker (non-persisted)
+      // before the replay frames so the client refetches authoritative state.
+      if (truncated && afterId > 0) {
+        controller.enqueue(
+          encoder.encode(`event: room:resync\ndata: {"reason":"replay-window-truncated"}\n\n`)
+        );
+      }
       for (const ev of replay) {
         controller.enqueue(
           encoder.encode(`id: ${ev.id}\nevent: ${ev.type}\ndata: ${JSON.stringify(ev.payload)}\n\n`)

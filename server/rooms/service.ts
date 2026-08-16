@@ -41,6 +41,7 @@ interface MemberRow {
   screenShareOn: number;
   joinedAt: string;
   leftAt: string | null;
+  removedAt: string | null;
 }
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
@@ -294,6 +295,12 @@ export function joinRoom(roomIdOrCode: string, userId: string): { ok: true; payl
     return { ok: true, payload: roomPayload(room.id, userId)! };
   }
 
+  // A host-removed member cannot re-enter by reconnecting. Only an ordinary
+  // leave (leftAt set, removedAt NULL) may be reversed by a fresh join.
+  if (existing?.removedAt) {
+    return { ok: false, error: RoomErrors.removed() };
+  }
+
   const currentActives = activeMemberCount(room.id);
   if (currentActives >= room.maxParticipants) {
     return { ok: false, error: RoomErrors.full() };
@@ -381,10 +388,9 @@ export function removeMember(
   if (!target || target.leftAt) return { ok: false, error: RoomErrors.invalidTarget() };
 
   const now = nowIso();
-  db.prepare('UPDATE roomMembers SET leftAt = ?, micOn = 0, cameraOn = 0, screenShareOn = 0 WHERE id = ?').run(
-    now,
-    target.id
-  );
+  db.prepare(
+    'UPDATE roomMembers SET leftAt = ?, removedAt = ?, micOn = 0, cameraOn = 0, screenShareOn = 0 WHERE id = ?'
+  ).run(now, now, target.id);
   touchActivity(roomId);
   return { ok: true, payload: roomPayload(roomId, hostUserId)! };
 }

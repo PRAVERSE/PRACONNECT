@@ -30,6 +30,7 @@ import {
 import { getCurrentUser, logoutApi, AuthUser } from '../api/auth';
 import {
   fetchRoomsApi,
+  fetchRoomApi,
   createRoomApi,
   joinRoomApi,
   leaveRoomApi,
@@ -45,7 +46,8 @@ import {
   connectRoomEvents,
   uploadRoomMediaApi,
   ServerRoom,
-  ServerRoomMember
+  ServerRoomMember,
+  RoomSseState
 } from '../api/rooms';
 import { WebRTCManager } from '../webrtc/WebRTCManager';
 import { MediaDiagnosticError, logRoomEntryDeviceDiagnostics } from '../webrtc/mediaDeviceDiagnostics';
@@ -69,6 +71,7 @@ interface AppContextType {
   rooms: RoomItem[];
   refreshRooms: () => Promise<void>;
   participants: Participant[];
+  roomSseState: RoomSseState;
   updateParticipantRole: (participantId: string, role: 'host' | 'co-host' | 'viewer') => void;
   kickParticipant: (participantId: string) => void;
   chatMessages: ChatMessage[];
@@ -266,6 +269,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Room Specific State
   const [participants, setParticipants] = useState<Participant[]>([]);
+  const [roomSseState, setRoomSseState] = useState<RoomSseState>('CLOSED');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [roomNotes, setRoomNotes] = useState<string>('');
   const [roomFiles, setRoomFiles] = useState<RoomFile[]>([]);
@@ -887,13 +891,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const currentUserIdRef = useRef<string | null>(null);
   currentUserIdRef.current = currentUser?.id ?? null;
 
+  const exitRoomState = useCallback(() => {
+    setCurrentRoom(null);
+    setParticipants([]);
+    setRoomSseState('CLOSED');
+    setActiveTab('dashboard');
+    refreshRooms();
+  }, [refreshRooms]);
+
   useEffect(() => {
     if (!currentRoom?.id) return;
 
-    const cleanupSse = connectRoomEvents(
-      currentRoom.id,
-      (type, payload) => {
+    const cleanupSse = connectRoomEvents({
+      roomId: currentRoom.id,
+      onEvent: (type, rawPayload) => {
         const uid = currentUserIdRef.current;
+        const payload = rawPayload as any;
 
         switch (type) {
           case 'room:update': {
@@ -906,6 +919,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               }
               setScreenShareOn(updated.hostUserId === uid ? updated.screenShareActive : false);
             }
+            break;
+          }
+
+          case 'room:resync': {
+            // Replay window was truncated: persisted events alone cannot
+            // rebuild state, so refetch the authoritative snapshot.
+            const roomId = currentRoomIdRef.current;
+            if (!roomId) return;
+            fetchRoomApi(roomId)
+              .then((res) => {
+                if (!res.ok || !res.data) return;
+                const updated = res.data;
+                const item = mapServerRoomToItem(updated, uid);
+                setCurrentRoom(item);
+                setParticipants(updated.members.map((m) => mapServerMemberToParticipant(m, uid)));
+                setScreenShareOn(updated.hostUserId === uid ? updated.screenShareActive : false);
+              })
+              .catch(() => {});
             break;
           }
 
@@ -934,10 +965,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             if (removedUserId === uid) {
               // Current user was removed by host
               alert('You were removed from this room by the host.');
-              setCurrentRoom(null);
-              setParticipants([]);
-              setActiveTab('dashboard');
-              refreshRooms();
+              exitRoomState();
             } else {
               setParticipants((prev) => prev.filter((p) => p.userId !== removedUserId && p.id !== removedUserId));
             }
@@ -1026,15 +1054,43 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }
         }
       },
-      () => {
-        // SSE error or reconnecting
-      }
-    );
+      onStateChange: (state, info) => {
+        setRoomSseState(state);
+        if (state !== 'CLOSED' || !info?.reason) return;
+        // 'closed' fires on every effect cleanup (room switch, leave, exit) and
+        // 'leave' means the user intentionally tore the stream down: both are
+        // benign. Any other terminal reason exits the room UI.
+        if (info.reason === 'closed' || info.reason === 'leave') return;
+        const reason = info.reason;
+        if (reason === 'auth' || reason === 'UNAUTHENTICATED') {
+          // Session expired; the auth layer handles the redirect.
+          exitRoomState();
+        } else if (reason === 'room-gone' || reason === 'ROOM_NOT_FOUND' || reason === 'ROOM_GONE') {
+          alert('This room no longer exists.');
+          exitRoomState();
+        } else if (reason === 'ROOM_FULL') {
+          alert('This room is at full capacity and can no longer be joined.');
+          exitRoomState();
+        } else if (reason === 'REMOVED_FROM_ROOM' || reason === 'ROOM_MEMBERSHIP_REQUIRED') {
+          alert('You were removed from this room by the host.');
+          exitRoomState();
+        }
+      },
+      onRoomRecovered: (room) => {
+        const uid = currentUserIdRef.current;
+        setCurrentRoom(mapServerRoomToItem(room, uid));
+        setParticipants(room.members.map((m) => mapServerMemberToParticipant(m, uid)));
+        setScreenShareOn(room.hostUserId === uid ? room.screenShareActive : false);
+      },
+      onRecoveryFailure: (code) => {
+        console.log(`[ROOM SSE] recovery abandoned room=${currentRoomIdRef.current} code=${code}`);
+      },
+    });
 
     return () => {
       cleanupSse();
     };
-  }, [currentRoom?.id, refreshRooms]);
+  }, [currentRoom?.id, refreshRooms, exitRoomState]);
 
   // Modals state
   const [createRoomModalOpen, setCreateRoomModalOpen] = useState(false);
@@ -1058,7 +1114,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setActiveRoomTab,
         rooms,
         refreshRooms,
-        participants,
+participants,
+        roomSseState,
         updateParticipantRole,
         kickParticipant,
         chatMessages,

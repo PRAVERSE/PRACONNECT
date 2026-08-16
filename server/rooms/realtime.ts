@@ -35,6 +35,16 @@ const pendingEphemeral = new Map<string, { frame: Uint8Array; expiresAt: number 
 const EPHEMERAL_BUFFER_TTL_MS = 30_000;
 const EPHEMERAL_BUFFER_MAX_PER_USER = 200;
 
+// Disconnect grace: how long a member stays in the room after their last SSE
+// stream closes. Overridable via DISCONNECT_GRACE_MS (tests use small values).
+export const DISCONNECT_GRACE_MS = Math.max(
+  50,
+  parseInt(process.env.DISCONNECT_GRACE_MS ?? '20000', 10) || 20000
+);
+
+/** Maximum persisted events replayed per reconnect. */
+export const REPLAY_WINDOW = 500;
+
 // Disconnect grace timers: "roomId:userId" -> Timeout
 const disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -134,15 +144,31 @@ function flushPendingEphemeral(roomId: string, userId: string, sink: StreamSink)
   }
 }
 
-/** Events persisted after the given event id, oldest first. */
-export function replayEvents(roomId: string, afterId: number): RoomEvent[] {
+/**
+ * Events persisted after the given event id, oldest first, plus whether the
+ * 500-event replay window was truncated (the client missed too many events to
+ * reconstruct state from replay alone and should resync authoritative state).
+ */
+export function replayEventsWithMeta(roomId: string, afterId: number): {
+  events: RoomEvent[];
+  truncated: boolean;
+} {
   const rows = db
     .prepare(
       `SELECT id, type, payloadJson FROM roomEvents
-       WHERE roomId = ? AND id > ? ORDER BY id ASC LIMIT 500`
+       WHERE roomId = ? AND id > ? ORDER BY id ASC LIMIT ${REPLAY_WINDOW + 1}`
     )
     .all(roomId, afterId) as { id: number; type: string; payloadJson: string }[];
-  return rows.map((r) => ({ id: r.id, type: r.type, payload: JSON.parse(r.payloadJson) }));
+  const truncated = rows.length > REPLAY_WINDOW;
+  return {
+    events: rows.slice(0, REPLAY_WINDOW).map((r) => ({ id: r.id, type: r.type, payload: JSON.parse(r.payloadJson) })),
+    truncated,
+  };
+}
+
+/** Events persisted after the given event id, oldest first. */
+export function replayEvents(roomId: string, afterId: number): RoomEvent[] {
+  return replayEventsWithMeta(roomId, afterId).events;
 }
 
 /** Last persisted event id for a room (0 if none). */
@@ -218,7 +244,7 @@ export function openEventStream(
           pendingEphemeral.delete(`${roomId}:${userId}`);
 
           // User has no more active SSE streams in this room.
-          // Start a 20s grace period before marking member as left in the DB.
+          // Start a grace period before marking member as left in the DB.
           const timer = setTimeout(() => {
             disconnectTimers.delete(timerKey);
             try {
@@ -241,7 +267,7 @@ export function openEventStream(
             } catch (err) {
               // Ignore errors if test closed database
             }
-          }, 20000);
+          }, DISCONNECT_GRACE_MS);
 
           timer.unref?.();
           disconnectTimers.set(timerKey, timer);

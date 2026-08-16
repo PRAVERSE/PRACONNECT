@@ -142,6 +142,7 @@ export const schema = `
     screenShareOn INTEGER NOT NULL DEFAULT 0,
     joinedAt      TEXT NOT NULL,
     leftAt        TEXT,
+    removedAt     TEXT,
     FOREIGN KEY (roomId) REFERENCES rooms (id) ON DELETE CASCADE,
     FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE,
     UNIQUE (roomId, userId)

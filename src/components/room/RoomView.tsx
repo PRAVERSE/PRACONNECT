@@ -202,6 +202,7 @@ export const RoomView: React.FC = () => {
     activeRoomTab,
     setActiveRoomTab,
     participants,
+    roomSseState,
     chatMessages,
     sendRoomChatMessage,
     sendReaction,
@@ -793,6 +794,14 @@ export const RoomView: React.FC = () => {
       <div className="h-13 px-4 bg-[var(--bg-surface-1)] border-b border-[var(--border-subtle)] flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2.5 min-w-0">
           <LiveBadge label="LIVE" size="sm" />
+          {(roomSseState === 'DISCONNECTED' || roomSseState === 'RECOVERING_MEMBERSHIP') && (
+            <span
+              className="px-2 py-0.5 bg-amber-500/15 text-amber-400 text-[10px] font-bold rounded-md uppercase tracking-wider animate-pulse"
+              title="Connection interrupted — reconnecting"
+            >
+              {roomSseState === 'RECOVERING_MEMBERSHIP' ? 'Rejoining…' : 'Reconnecting…'}
+            </span>
+          )}
           <h1 className="text-xs font-extrabold text-[var(--text-primary)] font-heading truncate">
             {currentRoom.name}
           </h1>
