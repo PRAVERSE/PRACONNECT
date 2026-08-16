@@ -4,6 +4,7 @@
 // ICE restarts, flexible camera constraint fallbacks, and actionable device diagnostics.
 
 import { checkMediaSupport, diagnoseMediaError, inspectAvailableMediaDevices, logFullDeviceEnumeration, logMediaEnvironmentDiagnostics, logMediaPermissions, queryCameraPermissionState, MediaDiagnosticError } from './mediaDeviceDiagnostics';
+import { getEnvIceConfig, nextIceRestartDelayMs, IceConfigResult } from './iceConfig';
 
 export interface WebRTCSignalPayload {
   type: 'offer' | 'answer' | 'candidate' | 'track-meta';
@@ -56,35 +57,6 @@ function summarizeSdp(sdp: string | undefined): { section: string; mid?: string;
   return blocks;
 }
 
-// Configurable ICE servers with public STUN fallbacks
-const getIceServers = (): RTCIceServer[] => {
-  const servers: RTCIceServer[] = [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-  ];
-
-  try {
-    const envStun = (import.meta as any)?.env?.VITE_STUN_SERVER;
-    if (envStun) {
-      servers.unshift({ urls: envStun });
-    }
-
-    const envTurn = (import.meta as any)?.env?.VITE_TURN_SERVER;
-    const envTurnUser = (import.meta as any)?.env?.VITE_TURN_USERNAME;
-    const envTurnPass = (import.meta as any)?.env?.VITE_TURN_CREDENTIAL;
-    if (envTurn && envTurnUser && envTurnPass) {
-      servers.unshift({
-        urls: envTurn,
-        username: envTurnUser,
-        credential: envTurnPass,
-      });
-    }
-  } catch {}
-
-  return servers;
-};
-
 export class WebRTCManager {
   private roomId: string;
   private myUserId: string;
@@ -110,6 +82,15 @@ export class WebRTCManager {
   // separate tracks; identifying the screen sender by sniffing contentHint is
   // fragile, so we track the RTCRtpSender directly per peer.
   private screenSenderByPeer = new Map<string, RTCRtpSender | null>();
+  // Bounded ICE restart state per peer (Phase 6.6): a hard 'failed'
+  // connection is restarted at most ICE_RESTART.maxAttempts times with
+  // exponential backoff; counters reset once the connection recovers.
+  private iceRestartAttempts = new Map<string, number>();
+  private iceRestartTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private iceRestartExhausted = new Set<string>();
+  // Single authoritative ICE configuration (Phase 6.6) — read once per
+  // manager from the environment, never built inline per peer.
+  private readonly iceConfig: IceConfigResult;
   // trackId -> remoteUserId that sent it. Lets late-arriving track-meta
   // reclassify a video track already committed to cameraStream as screen
   // (signaling and ontrack can arrive in either order).
@@ -134,6 +115,9 @@ export class WebRTCManager {
     this.onError = options.onError;
     this.sendSignal = options.sendSignal;
     this.managerId = `${options.myUserId}-${++WebRTCManager.managerCounter}`;
+    this.iceConfig = getEnvIceConfig();
+    // One concise diagnostics line per manager (never contains credentials).
+    console.log('[WEBRTC] ICE config:', this.iceConfig.diagnostics);
   }
 
   /** Synchronize active peer connections with current room participants */
@@ -175,7 +159,7 @@ export class WebRTCManager {
     });
 
     const config: RTCConfiguration = {
-      iceServers: getIceServers(),
+      ...this.iceConfig.rtcConfig,
       iceCandidatePoolSize: 10,
     };
 
@@ -334,12 +318,13 @@ export class WebRTCManager {
       };
     };
 
-    // Connection state diagnostics and automatic ICE restart
+    // Connection state diagnostics and bounded automatic ICE restart
     pc.onconnectionstatechange = () => {
       console.log('[WEBRTC] connection state', pc?.connectionState);
-      if (pc?.connectionState === 'failed') {
-        console.warn(`[WebRTC] Connection failed with ${remoteUserId}, restarting ICE...`);
-        pc.restartIce?.();
+      if (pc?.connectionState === 'connected') {
+        this.resetIceRestart(remoteUserId);
+      } else if (pc?.connectionState === 'failed') {
+        this.scheduleIceRestart(remoteUserId, pc);
       } else if (pc?.connectionState === 'closed') {
         this.closePeerConnection(remoteUserId);
       }
@@ -358,8 +343,10 @@ export class WebRTCManager {
         receiverReady: t.receiver.track?.readyState ?? null,
       }));
       console.log('[WEBRTC] ICE state transceivers:', { ts: new Date().toISOString(), transceivers });
-      if (pc?.iceConnectionState === 'failed') {
-        pc.restartIce?.();
+      if (pc?.iceConnectionState === 'connected' || pc?.iceConnectionState === 'completed') {
+        this.resetIceRestart(remoteUserId);
+      } else if (pc?.iceConnectionState === 'failed') {
+        this.scheduleIceRestart(remoteUserId, pc);
       }
     };
 
@@ -382,6 +369,57 @@ export class WebRTCManager {
     }
 
     return pc;
+  }
+
+  /**
+   * Schedule a bounded ICE restart for a peer whose connection hard-failed.
+   * At most one restart is pending per peer at any time; attempts use
+   * exponential backoff and stop after ICE_RESTART.maxAttempts. The peer
+   * stays observable once the budget is spent (a future rejoin can recover).
+   */
+  private scheduleIceRestart(remoteUserId: string, pc: RTCPeerConnection) {
+    if (this.isDestroyed || pc.connectionState === 'closed') return;
+    if (this.iceRestartTimers.has(remoteUserId)) return; // already one pending
+    if (this.iceRestartExhausted.has(remoteUserId)) return; // budget spent
+
+    const attempt = (this.iceRestartAttempts.get(remoteUserId) ?? 0) + 1;
+    const delay = nextIceRestartDelayMs(attempt);
+    if (delay === null) {
+      this.iceRestartExhausted.add(remoteUserId);
+      console.warn(
+        `[WebRTC] ICE restart budget exhausted for ${remoteUserId} after ${attempt - 1} attempt(s); automatic retries stopped (rejoin to recover)`
+      );
+      return;
+    }
+
+    this.iceRestartAttempts.set(remoteUserId, attempt);
+    console.warn(`[WebRTC] ICE failed with ${remoteUserId}; scheduling restart attempt ${attempt} in ${delay}ms`);
+    const timer = setTimeout(() => {
+      this.iceRestartTimers.delete(remoteUserId);
+      if (this.isDestroyed) return;
+      const current = this.peerConnections.get(remoteUserId);
+      if (!current || current.connectionState === 'closed') return;
+      try {
+        current.restartIce?.();
+      } catch (err) {
+        console.warn(`[WebRTC] restartIce failed for ${remoteUserId}:`, {
+          name: (err as Error)?.name,
+          message: (err as Error)?.message,
+        });
+      }
+    }, delay);
+    this.iceRestartTimers.set(remoteUserId, timer);
+  }
+
+  /** Clear ICE restart state once a peer connection recovers. */
+  private resetIceRestart(remoteUserId: string) {
+    const timer = this.iceRestartTimers.get(remoteUserId);
+    if (timer) {
+      clearTimeout(timer);
+      this.iceRestartTimers.delete(remoteUserId);
+    }
+    this.iceRestartAttempts.delete(remoteUserId);
+    this.iceRestartExhausted.delete(remoteUserId);
   }
 
   private notifyRemoteStreamUpdate(remoteUserId: string) {
@@ -1738,6 +1776,7 @@ export class WebRTCManager {
     this.makingOffer.delete(remoteUserId);
     this.pendingRenegotiation.delete(remoteUserId);
     this.screenSenderByPeer.delete(remoteUserId);
+    this.resetIceRestart(remoteUserId);
     for (const [trackId, owner] of this.trackOwners) {
       if (owner === remoteUserId) this.trackOwners.delete(trackId);
     }
@@ -1778,6 +1817,12 @@ export class WebRTCManager {
     this.makingOffer.clear();
     this.pendingRenegotiation.clear();
     this.screenSenderByPeer.clear();
+    for (const timer of this.iceRestartTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.iceRestartTimers.clear();
+    this.iceRestartAttempts.clear();
+    this.iceRestartExhausted.clear();
     this.trackOwners.clear();
     this.assertMediaSeparation('destroy');
     this.onLocalStreamChange(null);
