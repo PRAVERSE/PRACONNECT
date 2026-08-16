@@ -1,0 +1,519 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+:root, [data-theme="dark"], .dark {
+  color-scheme: dark;
+  /* ── Core Design Tokens (monochrome — brightness & opacity only) ───────── */
+  --bg:              #0A0A0C;   /* base page background */
+  --bg-elevated:     #131318;   /* true floating surfaces (dropdowns, modals) */
+  --bg-glass:        rgba(255,255,255,0.045);
+  --border-hairline: rgba(255,255,255,0.08);
+  --border-strong:   rgba(255,255,255,0.16);
+  --text-primary:    #F5F5F7;
+  --text-secondary:  #9A9AA3;
+  --text-tertiary:   #57575F;
+
+  /* Emphasis — near-white, the ONE most important thing on screen */
+  --emphasis:        #F5F5F7;
+  --emphasis-dim:    rgba(255,255,255,0.10);
+  --emphasis-strong: rgba(245,245,247,0.9);
+  --emphasis-glow:   rgba(245,245,247,0.3);
+
+  /* Sidebar nav icons — exactly two states, applied via shared classes */
+  --nav-icon:        rgba(255,255,255,0.6);
+  --nav-icon-active: #FFFFFF;
+
+  /* Sidebar rhythm */
+  --nav-gap: 16px;
+
+  /* Motion */
+  --ease:      cubic-bezier(.16, 1, .3, 1);
+  --dur-fast:  150ms;
+  --dur-base:  250ms;
+  --dur-slow:  400ms;
+
+  /* ── Legacy aliases (shared utilities & unredesigned pages) ────────── */
+  --bg-base: var(--bg);
+  --bg-surface-1: #111113;
+  --bg-surface-2: #17171A;
+  --bg-surface-3: #222226;
+  --border-subtle: var(--border-hairline);
+  --text-muted: var(--text-tertiary);
+  --accent: #F6B8D0;
+  --accent-hover: #E8A7BF;
+  --accent-subtle: rgba(246, 184, 208, 0.15);
+  --accent-glow: rgba(246, 184, 208, 0.25);
+  --accent-text: #17171A;
+  --status-success: #10B981;
+  --status-success-bg: rgba(16, 185, 129, 0.15);
+  --status-error: #EF4444;
+  --status-error-bg: rgba(239, 68, 68, 0.15);
+  --bg-canvas: var(--bg-base);
+  --bg-surface: var(--bg-surface-1);
+  --bg-elevated-legacy: var(--bg-surface-2);
+  --bg-higher: var(--bg-surface-3);
+  --control-primary-bg: var(--accent);
+  --control-primary-text: var(--accent-text);
+
+  background-color: var(--bg);
+  color: var(--text-primary);
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+[data-theme="light"], .light {
+  color-scheme: light;
+  --bg:              #F7F7F8;
+  --bg-elevated:     #FFFFFF;
+  --bg-glass:        rgba(0,0,0,0.035);
+  --border-hairline: rgba(0,0,0,0.09);
+  --border-strong:   rgba(0,0,0,0.16);
+  --text-primary:    #101113;
+  --text-secondary:  #55565C;
+  --text-tertiary:   #8A8B91;
+  --emphasis:        #101113;
+  --emphasis-dim:    rgba(0,0,0,0.08);
+  --emphasis-strong: rgba(16,17,19,0.9);
+  --emphasis-glow:   rgba(16,17,19,0.25);
+
+  /* Sidebar nav icons — exactly two states, applied via shared classes */
+  --nav-icon:        rgba(0,0,0,0.55);
+  --nav-icon-active: #101113;
+
+  /* Sidebar rhythm */
+  --nav-gap: 16px;
+
+  --bg-base: var(--bg);
+  --bg-surface-1: #FFFFFF;
+  --bg-surface-2: #F0F1F3;
+  --bg-surface-3: #E6E7EA;
+  --border-subtle: var(--border-hairline);
+  --text-muted: var(--text-tertiary);
+  --accent: #F6B8D0;
+  --accent-hover: #E8A7BF;
+  --accent-subtle: rgba(246, 184, 208, 0.12);
+  --accent-glow: rgba(246, 184, 208, 0.25);
+  --accent-text: #101113;
+  --status-success: #10B981;
+  --status-success-bg: rgba(16, 185, 129, 0.12);
+  --status-error: #EF4444;
+  --status-error-bg: rgba(239, 68, 68, 0.12);
+  --bg-canvas: var(--bg-base);
+  --bg-surface: var(--bg-surface-1);
+  --bg-elevated-legacy: var(--bg-surface-2);
+  --bg-higher: var(--bg-surface-3);
+  --control-primary-bg: var(--accent);
+  --control-primary-text: var(--accent-text);
+
+  background-color: var(--bg);
+  color: var(--text-primary);
+}
+
+html, body {
+  background-color: var(--bg);
+  color: var(--text-primary);
+}
+
+h1, h2, h3, h4, .font-heading {
+  font-family: 'Sora', 'Outfit', Inter, sans-serif;
+}
+
+/* Display type — Bricolage Grotesque for headlines & section titles */
+.font-display {
+  font-family: 'Bricolage Grotesque', 'Sora', 'Outfit', Inter, sans-serif;
+}
+
+/* ── Typography utilities ─────────────────────────────────────────────── */
+.eyebrow {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+.eyebrow-dim {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+/* ── Hairline divider (the only line between sections) ────────────────── */
+.divider {
+  height: 1px;
+  width: 100%;
+  background: var(--border-hairline);
+  margin: 48px 0;
+}
+
+/* ── Glass pill (stat indicators, tooltips, badges) ───────────────────── */
+.pill-glass {
+  background: var(--bg-glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-radius: 999px;
+  border: 1px solid var(--border-hairline);
+}
+
+/* ── Floating surface (dropdowns, modals, popovers) — large radius, no stroke ── */
+.float-surface {
+  background: var(--bg-elevated);
+  border-radius: 24px;
+  box-shadow: 0 20px 50px -12px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255,255,255,0.04);
+}
+
+/* Glassmorphism Utilities (legacy) */
+.glass-panel {
+  background: rgba(17, 17, 19, 0.75);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.glass-modal {
+  background: rgba(17, 17, 19, 0.88);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border-radius: 24px;
+  border: none;
+  box-shadow: 0 24px 60px -16px rgba(0, 0, 0, 0.6);
+}
+
+/* Stagger entrance utility classes for Home page */
+.stagger-1 { animation-delay: 0ms; }
+.stagger-2 { animation-delay: 50ms; }
+.stagger-3 { animation-delay: 100ms; }
+.stagger-4 { animation-delay: 150ms; }
+
+/* Subtle button hover lift & baby-pink glow (legacy) */
+.btn-glow {
+  transition: all 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.btn-glow:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 20px -2px rgba(255, 255, 255, 0.2), 0 0 12px 0 rgba(255, 255, 255, 0.1);
+}
+.btn-glow:active {
+  transform: scale(0.97);
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────────── */
+.btn-primary {
+  background: var(--emphasis);
+  color: var(--bg);
+  font-family: 'Inter', sans-serif;
+  font-weight: 600;
+  font-size: 14.5px;
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 10px 22px;
+  box-shadow: 0 4px 20px rgba(255, 255, 255, 0.15);
+  transition: transform var(--dur-base) var(--ease), box-shadow var(--dur-base) var(--ease), opacity var(--dur-fast) var(--ease);
+}
+.btn-primary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(255, 255, 255, 0.25);
+}
+.btn-primary:active {
+  transform: translateY(0) scale(0.98);
+}
+.btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.btn-secondary {
+  background: transparent;
+  color: var(--text-primary);
+  border: 1px solid var(--border-hairline);
+  font-family: 'Inter', sans-serif;
+  font-weight: 600;
+  font-size: 14.5px;
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 10px 22px;
+  transition: color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), background-color var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+}
+.btn-secondary:hover {
+  color: var(--text-primary);
+  border-color: var(--text-primary);
+  background-color: var(--emphasis-dim);
+  transform: translateY(-1px);
+}
+.btn-secondary:active {
+  transform: scale(0.97);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: 'Inter', sans-serif;
+  font-weight: 600;
+  font-size: 14.5px;
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 10px 16px;
+  transition: color var(--dur-fast) var(--ease), background-color var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+}
+.btn-ghost:hover {
+  color: var(--text-primary);
+  background-color: var(--bg-glass);
+  transform: translateY(-1px);
+}
+.btn-ghost:active {
+  transform: scale(0.97);
+}
+
+/* ── Arrow link ("Browse rooms →") ────────────────────────────────────── */
+.arrow-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+  font-size: 14px;
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+  transition: color var(--dur-fast) var(--ease);
+}
+.arrow-link .arrow-glyph {
+  transition: transform var(--dur-base) var(--ease);
+}
+.arrow-link:hover .arrow-glyph {
+  transform: translateX(4px);
+}
+.arrow-link:hover {
+  color: var(--text-primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: var(--border-strong);
+}
+
+/* ── Input fields: large-radius soft fill, glow focus, no visible stroke ── */
+.field {
+  background: var(--bg-glass);
+  border: none;
+  border-radius: 24px;
+  color: var(--text-primary);
+  font-family: 'Inter', sans-serif;
+  font-size: 14px;
+  padding: 11px 18px;
+  transition: box-shadow var(--dur-fast) var(--ease), background-color var(--dur-fast) var(--ease);
+}
+.field::placeholder {
+  color: var(--text-tertiary);
+}
+.field:focus {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--emphasis-dim);
+  background: var(--bg-glass);
+}
+
+/* ── Focus ring: soft white glow, never a rectangular outline ─────────── */
+:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--emphasis-dim);
+}
+
+/* ── Sidebar nav icons: exactly two shared states, no per-icon overrides ── */
+.nav-icon {
+  color: var(--nav-icon);
+  transition: color var(--dur-fast) var(--ease);
+}
+.nav-icon:hover {
+  color: var(--nav-icon-active);
+}
+.nav-icon--active {
+  color: var(--nav-icon-active);
+}
+
+/* ── Tooltip: fixed-position glass pill, computed from trigger rect ───── */
+.tooltip {
+  position: fixed;
+  z-index: 9999;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: var(--bg-glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-hairline);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  white-space: nowrap;
+  pointer-events: none;
+  animation: tooltipIn 120ms var(--ease) both;
+}
+@keyframes tooltipIn {
+  from { opacity: 0; transform: scale(.94); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+/* ── Live/online status dot: ambient 2s pulse ─────────────────────────── */
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.live-dot {
+  animation: live-pulse 2s ease-in-out infinite;
+}
+
+/* ── Empty-state icon: slow breathing scale ───────────────────────────── */
+@keyframes breath {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.04); }
+}
+.breath {
+  animation: breath 2.4s ease-in-out infinite;
+}
+
+/* ── Page entrance: rise 16px + fade, staggered via inline delays ─────── */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.rise {
+  animation: rise 640ms var(--ease) both;
+}
+
+/* ── Dropdown/popover entrance: scale + fade from trigger ─────────────── */
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.pop-in {
+  animation: pop-in var(--dur-base) var(--ease) both;
+  transform-origin: top;
+}
+
+.interactive-row {
+  transition: all 180ms ease-out;
+}
+.interactive-row:hover {
+  background-color: rgba(255, 255, 255, 0.025);
+  transform: translateX(2px);
+}
+
+/* Custom minimal scrollbar */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
+}
+
+/* Premium Subtle Animations */
+@keyframes fade-in-up {
+  0% {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes modal-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes fade-in {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+@keyframes ambient-float-1 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(30px, -20px) scale(1.05); }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 240ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-modal-pop {
+  animation: modal-pop 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-fade-in {
+  animation: fade-in 180ms ease-out forwards;
+}
+
+.animate-ambient-1 {
+  animation: ambient-float-1 30s ease-in-out infinite;
+}
+
+/* Reduced Motion Override */
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in-up,
+  .animate-modal-pop,
+  .animate-fade-in,
+  .animate-ambient-1,
+  .rise,
+  .pop-in,
+  .breath,
+  .live-dot,
+  .tooltip,
+  .arrow-link .arrow-glyph,
+  .btn-primary,
+  .btn-secondary,
+  .btn-ghost,
+  .field,
+  .interactive-row,
+  .btn-glow {
+    animation: none !important;
+    transition: none !important;
+  }
+}

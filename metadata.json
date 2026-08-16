@@ -1,0 +1,6 @@
+{
+  "name": "PraConnect",
+  "description": "Modern dark social watch-party platform featuring an advanced procedural 3D Voxel Sandbox game with biomes, caves, dynamic day/night cycles, and survival physics.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

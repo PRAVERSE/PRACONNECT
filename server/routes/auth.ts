@@ -1,0 +1,520 @@
+// server/routes/auth.ts
+// All authentication endpoints mounted under /api/auth
+
+import { Hono } from 'hono';
+import { db } from '../db/index';
+import {
+  hashPassword,
+  verifyPassword,
+  normalizeEmail,
+  validateEmail,
+  validateUsername,
+  validatePassword,
+  validateName,
+  sanitizeUser,
+  generateId,
+  apiError,
+} from '../auth/auth';
+import { createSession, deleteSession, deleteAllUserSessions, setSessionCookie, clearSessionCookie, getSessionToken, getSessionUser } from '../auth/session';
+import { createOtp, verifyOtp } from '../auth/otp';
+import { buildGoogleAuthUrl, exchangeCodeForTokens, getGoogleUserInfo, generateOAuthState, deriveUsernameFromGoogle } from '../auth/google';
+import { sendEmailVerificationOtp, sendPasswordResetOtp, sendResendVerificationOtp } from '../email/smtp';
+import { recordLoginActivity } from '../auth/loginActivity';
+import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
+
+const auth = new Hono();
+
+function getCoarseLocation(c: { req: { header: (h: string) => string | undefined } }): string {
+  try {
+    const headerVal =
+      c.req.header('cf-ipcountry') ||
+      c.req.header('x-country-code') ||
+      c.req.header('x-vercel-ip-country') ||
+      c.req.header('x-geo-country');
+    if (headerVal && headerVal.trim() && headerVal !== 'XX' && headerVal !== 'T1') {
+      return headerVal.trim();
+    }
+  } catch {
+    // fallback
+  }
+  return 'unknown';
+}
+
+// ─── In-memory rate limiter ───────────────────────────────────────────────────
+// Simple, appropriate for a 12-person private application.
+
+interface RateLimitEntry {
+  count: number;
+  resetAt: number;
+}
+
+const rateLimits = new Map<string, RateLimitEntry>();
+
+function checkRateLimit(key: string, maxCount: number, windowMs: number): boolean {
+  const now = Date.now();
+  const entry = rateLimits.get(key);
+
+  if (!entry || entry.resetAt < now) {
+    rateLimits.set(key, { count: 1, resetAt: now + windowMs });
+    return true; // allowed
+  }
+
+  if (entry.count >= maxCount) return false; // blocked
+
+  entry.count += 1;
+  return true; // allowed
+}
+
+function getClientIp(c: Parameters<typeof checkRateLimit>[0] extends string ? never : { req: { header: (h: string) => string | undefined }; env: Record<string, unknown> }): string {
+  return (c as { req: { header: (h: string) => string | undefined } }).req.header('x-forwarded-for') ?? 'local';
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+interface UserRow {
+  id: string;
+  name: string;
+  username: string;
+  email: string;
+  passwordHash: string | null;
+  avatarUrl: string | null;
+  emailVerified: number;
+  googleProviderId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function findUserByEmail(email: string): UserRow | null {
+  return (db.prepare('SELECT * FROM users WHERE email = ?').get(email) as UserRow | undefined) ?? null;
+}
+
+function findUserById(id: string): UserRow | null {
+  return (db.prepare('SELECT * FROM users WHERE id = ?').get(id) as UserRow | undefined) ?? null;
+}
+
+import {
+  createPendingSignup,
+  resendPendingSignupOtp,
+  verifyPendingSignupOtp,
+  deletePendingSignup
+} from '../auth/pendingSignup';
+
+// ─── POST /signup ─────────────────────────────────────────────────────────────
+
+auth.post('/signup', async (c) => {
+  const ip = c.req.header('x-forwarded-for') ?? 'local';
+
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
+
+  const { name, email: rawEmail, username: rawUsername, password } = body as Record<string, string>;
+
+  // Validate inputs
+  const nameErr = validateName(name ?? '');
+  if (nameErr) return c.json(apiError('VALIDATION_ERROR', nameErr), 400);
+
+  const emailErr = validateEmail(rawEmail ?? '');
+  if (emailErr) return c.json(apiError('VALIDATION_ERROR', emailErr), 400);
+
+  const usernameErr = validateUsername(rawUsername ?? '');
+  if (usernameErr) return c.json(apiError('VALIDATION_ERROR', usernameErr), 400);
+
+  const passwordErr = validatePassword(password ?? '');
+  if (passwordErr) return c.json(apiError('VALIDATION_ERROR', passwordErr), 400);
+
+  const email = normalizeEmail(rawEmail);
+  const username = rawUsername.trim().toLowerCase();
+
+  // Check uniqueness against verified users in the permanent users table
+  const existingEmail = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  if (existingEmail) return c.json(apiError('EMAIL_TAKEN', 'An account with this email already exists.'), 409);
+
+  const existingUsername = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+  if (existingUsername) return c.json(apiError('USERNAME_TAKEN', 'This username is already taken.'), 409);
+
+  const passwordHash = await hashPassword(password);
+
+  // Store in pendingSignups (NOT the users table) and generate OTP
+  const otp = await createPendingSignup(name.trim(), username, email, passwordHash);
+
+  try {
+    await sendEmailVerificationOtp(email, name.trim(), otp);
+  } catch (err) {
+    // Roll back pending signup on delivery failure
+    deletePendingSignup(email);
+    return c.json(apiError('EMAIL_DELIVERY_FAILED', "We couldn't send the verification email. Please try again."), 503);
+  }
+
+  return c.json({
+    message: 'Account created. Please check your email for a verification code.',
+    emailVerificationRequired: true,
+    email,
+  }, 201);
+});
+
+// ─── POST /verify-email ───────────────────────────────────────────────────────
+
+auth.post('/verify-email', async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
+
+  const { email: rawEmail, otp } = body as Record<string, string>;
+  if (!rawEmail || !otp) return c.json(apiError('VALIDATION_ERROR', 'Email and OTP are required.'), 400);
+
+  const email = normalizeEmail(rawEmail);
+
+  // Verifies OTP and atomically activates user in `users` table
+  const result = await verifyPendingSignupOtp(email, otp.trim());
+
+  if (!result.ok || !result.user) {
+    const messages: Record<string, string> = {
+      NOT_FOUND: 'No pending verification found for this email. Please sign up again.',
+      EXPIRED: 'The verification code has expired. Please request a new one.',
+      MAX_ATTEMPTS: 'Too many incorrect attempts. Please request a new code.',
+      INVALID: 'Invalid verification code.',
+    };
+    const code = result.error ?? 'INVALID';
+    const status = code === 'MAX_ATTEMPTS' ? 429 : 400;
+    return c.json(apiError(code, messages[code] ?? 'Invalid code.'), status);
+  }
+
+  const user = result.user;
+
+  // Create session
+  const token = await createSession(user.id);
+  setSessionCookie(c, token);
+  recordLoginActivity(user.id, 'signup', getCoarseLocation(c));
+
+  return c.json({ authenticated: true, user: sanitizeUser(user as unknown as Record<string, unknown>) });
+});
+
+// ─── POST /resend-verification ────────────────────────────────────────────────
+
+auth.post('/resend-verification', async (c) => {
+  const ip = c.req.header('x-forwarded-for') ?? 'local';
+  if (!checkRateLimit(`resend:${ip}`, 5, 15 * 60 * 1000)) {
+    return c.json(apiError('RATE_LIMITED', 'Too many requests. Please wait before trying again.'), 429);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
+
+  const { email: rawEmail } = body as Record<string, string>;
+  if (!rawEmail) return c.json(apiError('VALIDATION_ERROR', 'Email is required.'), 400);
+
+  const email = normalizeEmail(rawEmail);
+
+  // If an unverified pending signup exists, regenerate OTP and dispatch email
+  const pending = await resendPendingSignupOtp(email);
+  if (pending) {
+    try {
+      await sendResendVerificationOtp(email, pending.name, pending.otp);
+    } catch (err) {
+      return c.json(apiError('EMAIL_DELIVERY_FAILED', "We couldn't send the verification email. Please try again."), 503);
+    }
+  }
+
+  return c.json({ message: 'If an unverified account exists for this email, a new code has been sent.' });
+});
+
+// ─── POST /login ──────────────────────────────────────────────────────────────
+
+auth.post('/login', async (c) => {
+  const ip = c.req.header('x-forwarded-for') ?? 'local';
+  if (!checkRateLimit(`login:${ip}`, 10, 15 * 60 * 1000)) {
+    return c.json(apiError('RATE_LIMITED', 'Too many login attempts. Please wait before trying again.'), 429);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
+
+  const { identifier, password } = body as Record<string, string>;
+  if (!identifier || !password) {
+    return c.json(apiError('VALIDATION_ERROR', 'Identifier and password are required.'), 400);
+  }
+
+  // Find by email or username
+  const normalizedIdentifier = identifier.trim().toLowerCase();
+  const user = (db.prepare(`
+    SELECT * FROM users WHERE email = ? OR username = ?
+  `).get(normalizedIdentifier, normalizedIdentifier) as UserRow | undefined) ?? null;
+
+  // Use a generic error to prevent account enumeration
+  const INVALID_CREDS = apiError('INVALID_CREDENTIALS', 'Invalid email/username or password.');
+
+  if (!user) return c.json(INVALID_CREDS, 401);
+  if (!user.passwordHash) {
+    // Google-only account — give a more helpful message
+    return c.json(apiError('NO_PASSWORD', 'This account uses Google sign-in. Please continue with Google.'), 401);
+  }
+
+  const valid = await verifyPassword(user.passwordHash, password);
+  if (!valid) return c.json(INVALID_CREDS, 401);
+
+  if (!user.emailVerified) {
+    return c.json(apiError('EMAIL_NOT_VERIFIED', 'Please verify your email before logging in.'), 403);
+  }
+
+  const token = await createSession(user.id);
+  setSessionCookie(c, token);
+  recordLoginActivity(user.id, 'email', getCoarseLocation(c));
+
+  return c.json({ authenticated: true, user: sanitizeUser(user as unknown as Record<string, unknown>) });
+});
+
+// ─── GET /me ──────────────────────────────────────────────────────────────────
+
+auth.get('/me', async (c) => {
+  const token = getSessionToken(c);
+  if (!token) return c.json({ authenticated: false });
+
+  const result = await getSessionUser(token);
+  if (!result) return c.json({ authenticated: false });
+
+  return c.json({
+    authenticated: true,
+    user: sanitizeUser(result.user as unknown as Record<string, unknown>),
+  });
+});
+
+// ─── POST /logout ─────────────────────────────────────────────────────────────
+
+auth.post('/logout', async (c) => {
+  const token = getSessionToken(c);
+  if (token) {
+    await deleteSession(token);
+  }
+  clearSessionCookie(c);
+  return c.json({ message: 'Logged out successfully.' });
+});
+
+// ─── GET /google ──────────────────────────────────────────────────────────────
+
+auth.get('/google', (c) => {
+  const state = generateOAuthState();
+  // Store state in a short-lived cookie (5 min) for CSRF validation
+  setCookie(c, 'praconnect_oauth_state', state, {
+    httpOnly: true,
+    sameSite: 'Lax',
+    secure: process.env.NODE_ENV === 'production',
+    path: '/',
+    maxAge: 5 * 60,
+  });
+
+  const url = buildGoogleAuthUrl(state);
+  return c.redirect(url, 302);
+});
+
+// ─── GET /google/callback ─────────────────────────────────────────────────────
+
+auth.get('/google/callback', async (c) => {
+  const appUrl = process.env.APP_URL ?? 'http://localhost:3000';
+  const { code, state, error: googleError } = c.req.query();
+
+  if (googleError) {
+    console.error('[google/callback] Google returned error:', googleError);
+    return c.redirect(`${appUrl}/auth?error=google_denied`, 302);
+  }
+
+  if (!code || !state) {
+    return c.redirect(`${appUrl}/auth?error=invalid_callback`, 302);
+  }
+
+  // Verify CSRF state
+  const storedState = getCookie(c, 'praconnect_oauth_state');
+  deleteCookie(c, 'praconnect_oauth_state', { path: '/' });
+
+  if (!storedState || storedState !== state) {
+    return c.redirect(`${appUrl}/auth?error=invalid_state`, 302);
+  }
+
+  let googleUser;
+  try {
+    const tokens = await exchangeCodeForTokens(code);
+    googleUser = await getGoogleUserInfo(tokens.access_token);
+  } catch (err) {
+    console.error('[google/callback] Token exchange error:', (err as Error).message);
+    return c.redirect(`${appUrl}/auth?error=google_error`, 302);
+  }
+
+  if (!googleUser.email_verified) {
+    return c.redirect(`${appUrl}/auth?error=google_unverified_email`, 302);
+  }
+
+  const email = normalizeEmail(googleUser.email);
+  const now = new Date().toISOString();
+
+  // Check if we already have a user with this Google provider ID
+  let user: UserRow | null = (db.prepare(
+    'SELECT * FROM users WHERE googleProviderId = ?'
+  ).get(googleUser.sub) as UserRow | undefined) ?? null;
+
+  if (!user) {
+    // Check if there's already a password-based account with this email
+    const emailUser = findUserByEmail(email);
+
+    if (emailUser) {
+      // Safe account linking: link Google to the existing account
+      // We only do this because Google has verified the email (email_verified = true above)
+      db.prepare(`
+        UPDATE users SET googleProviderId = ?, avatarUrl = COALESCE(avatarUrl, ?), updatedAt = ? WHERE id = ?
+      `).run(googleUser.sub, googleUser.picture ?? null, now, emailUser.id);
+      user = findUserById(emailUser.id);
+    } else {
+      // Create a new user
+      const baseUsername = deriveUsernameFromGoogle(googleUser.name, email);
+      // Ensure uniqueness
+      let username = baseUsername;
+      let suffix = 1;
+      while (db.prepare('SELECT id FROM users WHERE username = ?').get(username)) {
+        username = `${baseUsername}${suffix++}`;
+      }
+
+      const userId = generateId();
+      db.prepare(`
+        INSERT INTO users (id, name, username, email, passwordHash, avatarUrl, emailVerified, googleProviderId, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?)
+      `).run(userId, googleUser.name, username, email, googleUser.picture ?? null, googleUser.sub, now, now);
+      user = findUserById(userId);
+    }
+  }
+
+  if (!user) {
+    return c.redirect(`${appUrl}/auth?error=server_error`, 302);
+  }
+
+  const token = await createSession(user.id);
+  setSessionCookie(c, token);
+  recordLoginActivity(user.id, 'google', getCoarseLocation(c));
+
+  return c.redirect(`${appUrl}/`, 302);
+});
+
+// ─── POST /forgot-password ────────────────────────────────────────────────────
+
+auth.post('/forgot-password', async (c) => {
+  const ip = c.req.header('x-forwarded-for') ?? 'local';
+  if (!checkRateLimit(`forgot:${ip}`, 5, 15 * 60 * 1000)) {
+    return c.json(apiError('RATE_LIMITED', 'Too many requests. Please wait before trying again.'), 429);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
+
+  const { email: rawEmail } = body as Record<string, string>;
+  if (!rawEmail) return c.json(apiError('VALIDATION_ERROR', 'Email is required.'), 400);
+
+  const GENERIC_RESPONSE = {
+    message: 'If an account exists for this email, a verification code has been sent.',
+  };
+
+  const emailErr = validateEmail(rawEmail);
+  if (emailErr) return c.json(GENERIC_RESPONSE); // Don't reveal validation issues
+
+  const email = normalizeEmail(rawEmail);
+  const user = findUserByEmail(email);
+
+  if (user && user.emailVerified) {
+    const otp = await createOtp(user.id, email, 'password_reset');
+    try {
+      await sendPasswordResetOtp(email, user.name, otp);
+    } catch {
+      console.error('[forgot-password] Password reset email delivery failed.');
+    }
+  }
+
+  return c.json(GENERIC_RESPONSE);
+});
+
+// ─── POST /verify-password-reset ─────────────────────────────────────────────
+
+auth.post('/verify-password-reset', async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
+
+  const { email: rawEmail, otp } = body as Record<string, string>;
+  if (!rawEmail || !otp) return c.json(apiError('VALIDATION_ERROR', 'Email and OTP are required.'), 400);
+
+  const email = normalizeEmail(rawEmail);
+
+  const result = await verifyOtp(email, 'password_reset', otp.trim());
+  if (!result.ok) {
+    const messages: Record<string, string> = {
+      NOT_FOUND: 'No password reset request found. Please request a new code.',
+      EXPIRED: 'The code has expired. Please request a new one.',
+      MAX_ATTEMPTS: 'Too many incorrect attempts. Please request a new code.',
+      INVALID: 'Invalid code.',
+    };
+    const code = result.error ?? 'INVALID';
+    const status = code === 'MAX_ATTEMPTS' ? 429 : 400;
+    return c.json(apiError(code, messages[code] ?? 'Invalid code.'), status);
+  }
+
+  // Issue a short-lived password-reset token
+  const resetToken = (() => {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+  })();
+
+  const tokenHash = await (async (token: string) => {
+    const data = new TextEncoder().encode(token);
+    const buf = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  })(resetToken);
+
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15 min
+
+  db.prepare(`
+    INSERT INTO passwordResetTokens (id, userId, tokenHash, expiresAt, usedAt, createdAt)
+    VALUES (?, ?, ?, ?, NULL, ?)
+  `).run(generateId(), result.userId!, tokenHash, expiresAt, now);
+
+  return c.json({ resetToken });
+});
+
+// ─── POST /reset-password ─────────────────────────────────────────────────────
+
+auth.post('/reset-password', async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
+
+  const { resetToken, newPassword } = body as Record<string, string>;
+  if (!resetToken || !newPassword) {
+    return c.json(apiError('VALIDATION_ERROR', 'Reset token and new password are required.'), 400);
+  }
+
+  const passwordErr = validatePassword(newPassword);
+  if (passwordErr) return c.json(apiError('VALIDATION_ERROR', passwordErr), 400);
+
+  // Hash the submitted token for DB lookup
+  const tokenHash = await (async (token: string) => {
+    const data = new TextEncoder().encode(token);
+    const buf = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  })(resetToken);
+
+  const now = new Date().toISOString();
+
+  const row = (db.prepare(`
+    SELECT id, userId, expiresAt, usedAt FROM passwordResetTokens WHERE tokenHash = ?
+  `).get(tokenHash) as { id: string; userId: string; expiresAt: string; usedAt: string | null } | undefined) ?? null;
+
+  if (!row) return c.json(apiError('INVALID_RESET_TOKEN', 'Invalid or expired reset token.'), 400);
+  if (row.usedAt) return c.json(apiError('RESET_TOKEN_USED', 'This reset token has already been used.'), 400);
+  if (row.expiresAt < now) return c.json(apiError('RESET_TOKEN_EXPIRED', 'This reset token has expired. Please request a new one.'), 400);
+
+  const passwordHash = await hashPassword(newPassword);
+
+  // Mark token as used
+  db.prepare('UPDATE passwordResetTokens SET usedAt = ? WHERE id = ?').run(now, row.id);
+
+  // Update password and invalidate all sessions (force re-login)
+  db.prepare('UPDATE users SET passwordHash = ?, updatedAt = ? WHERE id = ?').run(passwordHash, now, row.userId);
+  deleteAllUserSessions(row.userId);
+
+  return c.json({ message: 'Password reset successfully. Please log in with your new password.' });
+});
+
+export { auth };
