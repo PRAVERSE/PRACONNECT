@@ -22,11 +22,13 @@ process.env.UPLOADS_DIR = path.join(os.tmpdir(), `praconnect-uploads-${process.p
 
 const { db } = await import('../db/index');
 const { rooms, handleMediaServing, uploadsDir } = await import('../routes/rooms');
+const { requireAuth } = await import('../middleware/auth');
 const { createSession, SESSION_COOKIE_NAME } = await import('../auth/session');
 const { cleanupEmptyRooms } = await import('../rooms/service');
 
 const app = new Hono();
 app.route('/api/rooms', rooms);
+app.use('/api/uploads/*', requireAuth);
 app.on(['GET', 'HEAD'], '/api/uploads/:filename', handleMediaServing);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -706,6 +708,9 @@ test('media URL rejects blob URLs; host can upload media and stream with HTTP 20
   // 5. Verify HEAD request returns Content-Length, Accept-Ranges, and Content-Type
   const headRes = await app.request(uploadJson.media.url, {
     method: 'HEAD',
+    headers: {
+      cookie: cookie(tokens.a),
+    },
   });
   assert.equal(headRes.status, 200);
   assert.equal(headRes.headers.get('content-length'), '2048');
@@ -716,6 +721,7 @@ test('media URL rejects blob URLs; host can upload media and stream with HTTP 20
   const range1Res = await app.request(uploadJson.media.url, {
     method: 'GET',
     headers: {
+      cookie: cookie(tokens.a),
       range: 'bytes=0-1023',
     },
   });
@@ -728,6 +734,7 @@ test('media URL rejects blob URLs; host can upload media and stream with HTTP 20
   const range2Res = await app.request(uploadJson.media.url, {
     method: 'GET',
     headers: {
+      cookie: cookie(tokens.a),
       range: 'bytes=1024-2047',
     },
   });
@@ -739,6 +746,7 @@ test('media URL rejects blob URLs; host can upload media and stream with HTTP 20
   const rangeInvalidRes = await app.request(uploadJson.media.url, {
     method: 'GET',
     headers: {
+      cookie: cookie(tokens.a),
       range: 'bytes=5000-6000',
     },
   });
@@ -855,6 +863,161 @@ test('zero-byte upload is rejected without creating any file', async () => {
   const filesAfter = fs.readdirSync(uploadsDir).filter((f) => f.startsWith('media-')).length;
   assert.equal(filesAfter, filesBefore, 'rejected empty upload must not create any file');
   assert.ok(!fs.readdirSync(uploadsDir).some((f) => f.endsWith('.part')), 'no .part temp file may remain');
+});
+
+// ─── 12d. Secure media serving (Phase 6.2) ────────────────────────────────────
+
+test('uploaded media is only served to active members of the owning room', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Secure Media Room' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+  await call(tokens.b, 'POST', `/api/rooms/${roomId}/join`, {});
+
+  const bytes = new Uint8Array(4096);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 11) % 256;
+  const form = new FormData();
+  form.append('file', new Blob([bytes], { type: 'video/mp4' }), 'secure.mp4');
+  const uploadRes = await app.request(`/api/rooms/${roomId}/media/upload`, {
+    method: 'POST',
+    headers: { cookie: cookie(tokens.a) },
+    body: form,
+  });
+  assert.equal(uploadRes.status, 200);
+  const url = ((await uploadRes.json()) as { media: { url: string } }).media.url;
+
+  // A. Unauthenticated GET → 401 (no filename existence leak)
+  const unauth = await app.request(url, { method: 'GET' });
+  assert.equal(unauth.status, 401);
+
+  // B. Authenticated non-member GET → 403
+  const outsider = await app.request(url, { method: 'GET', headers: { cookie: cookie(tokens.c) } });
+  assert.equal(outsider.status, 403);
+
+  // C. Authenticated active member GET → 200
+  const memberRes = await app.request(url, { method: 'GET', headers: { cookie: cookie(tokens.b) } });
+  assert.equal(memberRes.status, 200);
+  assert.equal(memberRes.headers.get('content-length'), '4096');
+
+  // D. Host GET → 200
+  const hostRes = await app.request(url, { method: 'GET', headers: { cookie: cookie(tokens.a) } });
+  assert.equal(hostRes.status, 200);
+
+  // E. HEAD follows the same authorization rules
+  const headUnauth = await app.request(url, { method: 'HEAD' });
+  assert.equal(headUnauth.status, 401);
+  const headOutsider = await app.request(url, { method: 'HEAD', headers: { cookie: cookie(tokens.c) } });
+  assert.equal(headOutsider.status, 403);
+  const headHost = await app.request(url, { method: 'HEAD', headers: { cookie: cookie(tokens.a) } });
+  assert.equal(headHost.status, 200);
+  assert.equal(headHost.headers.get('accept-ranges'), 'bytes');
+
+  // F. Authorized range request → 206
+  const rangeOk = await app.request(url, {
+    method: 'GET',
+    headers: { cookie: cookie(tokens.b), range: 'bytes=0-1023' },
+  });
+  assert.equal(rangeOk.status, 206);
+  assert.equal(rangeOk.headers.get('content-range'), 'bytes 0-1023/4096');
+  assert.equal(rangeOk.headers.get('content-length'), '1024');
+
+  // G. Unauthorized range request → 403
+  const rangeBad = await app.request(url, {
+    method: 'GET',
+    headers: { cookie: cookie(tokens.c), range: 'bytes=0-1023' },
+  });
+  assert.equal(rangeBad.status, 403);
+
+  // H. Unknown filename → safe 404 (authenticated)
+  const unknown = await app.request('/api/uploads/no-such-file.mp4', {
+    method: 'GET',
+    headers: { cookie: cookie(tokens.a) },
+  });
+  assert.equal(unknown.status, 404);
+
+  // I. Traversal attempt remains rejected
+  const traversal = await app.request('/api/uploads/..%2F..%2F..%2Fetc%2Fpasswd', {
+    method: 'GET',
+    headers: { cookie: cookie(tokens.a) },
+  });
+  assert.equal(traversal.status, 404);
+
+  // Removed members are locked out too
+  await call(tokens.a, 'POST', `/api/rooms/${roomId}/members/${U.b}/remove`, {});
+  const removedRes = await app.request(url, { method: 'GET', headers: { cookie: cookie(tokens.b) } });
+  assert.equal(removedRes.status, 403);
+});
+
+test('failed or invalid uploads do not create upload records in the database', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'No Record Room' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+
+  const txtForm = new FormData();
+  txtForm.append('file', new Blob(['fake text content'], { type: 'text/plain' }), 'document.txt');
+  const txtRes = await app.request(`/api/rooms/${roomId}/media/upload`, {
+    method: 'POST',
+    headers: { cookie: cookie(tokens.a) },
+    body: txtForm,
+  });
+  assert.equal(txtRes.status, 400);
+
+  const mkvBytes = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42, 0x82, 0x88, 0x6d, 0x61, 0x74, 0x72, 0x6f, 0x73, 0x6b, 0x61]);
+  const mkvForm = new FormData();
+  mkvForm.append('file', new Blob([mkvBytes], { type: 'video/x-matroska' }), 'clip.mkv');
+  const mkvRes = await app.request(`/api/rooms/${roomId}/media/upload`, {
+    method: 'POST',
+    headers: { cookie: cookie(tokens.a) },
+    body: mkvForm,
+  });
+  assert.equal(mkvRes.status, 400);
+
+  const emptyForm = new FormData();
+  emptyForm.append('file', new Blob([], { type: 'video/mp4' }), 'empty.mp4');
+  const emptyRes = await app.request(`/api/rooms/${roomId}/media/upload`, {
+    method: 'POST',
+    headers: { cookie: cookie(tokens.a) },
+    body: emptyForm,
+  });
+  assert.equal(emptyRes.status, 400);
+
+  const count = (
+    db.prepare('SELECT COUNT(*) AS n FROM uploads WHERE roomId = ?').get(roomId) as { n: number }
+  ).n;
+  assert.equal(count, 0, 'rejected uploads must not create upload records');
+});
+
+test('successful upload creates a persistent upload record with ownership metadata', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Record Room' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+
+  const bytes = new Uint8Array(2048);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = i % 256;
+  const form = new FormData();
+  form.append('file', new Blob([bytes], { type: 'video/mp4' }), 'recorded.mp4');
+  const uploadRes = await app.request(`/api/rooms/${roomId}/media/upload`, {
+    method: 'POST',
+    headers: { cookie: cookie(tokens.a) },
+    body: form,
+  });
+  assert.equal(uploadRes.status, 200);
+  const url = ((await uploadRes.json()) as { media: { url: string } }).media.url;
+  const filename = path.basename(url);
+
+  const record = db.prepare('SELECT roomId, userId, size, mimeType, createdAt FROM uploads WHERE filename = ?').get(filename) as
+    | { roomId: string; userId: string; size: number; mimeType: string; createdAt: string }
+    | undefined;
+  assert.ok(record, 'upload record must exist after a successful upload');
+  assert.equal(record.roomId, roomId);
+  assert.equal(record.userId, U.a);
+  assert.equal(record.size, 2048);
+  assert.equal(record.mimeType, 'video/mp4');
+  assert.ok(record.createdAt, 'createdAt must be set');
+
+  // Room cleanup cascades the upload record away with the room
+  await call(tokens.a, 'POST', `/api/rooms/${roomId}/leave`, {});
+  const old = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  db.prepare('UPDATE rooms SET emptySince = ? WHERE id = ?').run(old, roomId);
+  cleanupEmptyRooms();
+  const gone = db.prepare('SELECT filename FROM uploads WHERE filename = ?').get(filename);
+  assert.equal(gone, undefined, 'upload record must cascade-delete with its room');
 });
 
 // ─── 13. Ephemeral signal buffering (SSE-registration race) ───────────────────

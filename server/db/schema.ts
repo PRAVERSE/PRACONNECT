@@ -164,4 +164,22 @@ export const schema = `
 
   CREATE INDEX IF NOT EXISTS idx_room_events_room
     ON roomEvents (roomId, id);
+
+  -- ─── Phase 6.2: Upload ownership metadata ─────────────────────────────────
+  -- Created only for finalized uploads — media serving authorizes against the
+  -- owning room. The filename PK doubles as the UNIQUE constraint.
+
+  CREATE TABLE IF NOT EXISTS uploads (
+    filename  TEXT PRIMARY KEY,
+    roomId    TEXT NOT NULL,
+    userId    TEXT NOT NULL,
+    size      INTEGER NOT NULL,
+    mimeType  TEXT,
+    createdAt TEXT NOT NULL,
+    FOREIGN KEY (roomId) REFERENCES rooms (id) ON DELETE CASCADE,
+    FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_uploads_room
+    ON uploads (roomId);
 `;

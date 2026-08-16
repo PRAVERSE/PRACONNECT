@@ -83,6 +83,29 @@ export function handleMediaServing(c: Context) {
   if (!filename || filename === '.' || filename === '..') {
     return c.json({ error: { code: 'NOT_FOUND', message: 'Media file not found.' } }, 404);
   }
+
+  // Phase 6.2: media is served only to active members of the owning room.
+  // Filename obscurity is not authorization — every request is checked.
+  const upload = db.prepare('SELECT roomId FROM uploads WHERE filename = ?').get(filename) as
+    | { roomId: string }
+    | undefined;
+  if (!upload) {
+    return c.json({ error: { code: 'NOT_FOUND', message: 'Media file not found.' } }, 404);
+  }
+  const room = getRoomOrNull(upload.roomId);
+  if (!room || room.emptySince) {
+    return c.json({ error: { code: 'NOT_FOUND', message: 'Media file not found.' } }, 404);
+  }
+  let userId: string;
+  try {
+    userId = c.get('userId');
+  } catch {
+    return c.json(apiError('UNAUTHENTICATED', 'Authentication required.'), 401);
+  }
+  if (memberStatus(room.id, userId) !== 'active') {
+    return c.json(apiError('ROOM_MEMBERSHIP_REQUIRED', 'You are not a member of this room.'), 403);
+  }
+
   const filePath = path.join(uploadsDir, filename);
 
   if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
@@ -652,6 +675,21 @@ rooms.post('/:id/media/upload', async (c) => {
         fs.renameSync(partPath, destination);
       } catch (err) {
         await cleanupPartial();
+        throw err;
+      }
+
+      // Persist ownership metadata atomically with finalization. If the
+      // record cannot be written, remove the file so no orphan exists.
+      try {
+        db.prepare(
+          'INSERT INTO uploads (filename, roomId, userId, size, mimeType, createdAt) VALUES (?, ?, ?, ?, ?, ?)'
+        ).run(finalName, roomId, userId, fileBytes, getMimeType(destination), new Date().toISOString());
+      } catch (err) {
+        try {
+          fs.rmSync(destination, { force: true });
+        } catch {
+          // already gone
+        }
         throw err;
       }
     }

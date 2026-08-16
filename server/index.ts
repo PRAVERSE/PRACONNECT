@@ -78,12 +78,16 @@ function getMimeType(filePath: string): string {
 }
 
 import { handleMediaServing } from './routes/rooms';
+import { requireAuth } from './middleware/auth';
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.route('/api/auth', auth);
 app.route('/api/rooms', rooms);
 
 // ─── Media File Serving with HTTP 206 Partial Content (Range Requests) ────────
+// Phase 6.2: media requests require a valid session; room-membership
+// authorization happens inside handleMediaServing.
+app.use('/api/uploads/*', requireAuth);
 app.on(['GET', 'HEAD'], '/api/uploads/:filename', handleMediaServing);
 
 // Health check
