@@ -11,6 +11,13 @@ import type { Context } from 'hono';
 import { requireAuth } from '../middleware/auth';
 import { apiError } from '../auth/auth';
 import { db } from '../db/index';
+import { uploadsDir } from '../uploads/config';
+import {
+  convertToPlayable,
+  isFfmpegAvailable,
+  isFfprobeAvailable,
+  probeBrowserCompatibility,
+} from '../uploads/transcode';
 import {
   createRoom,
   joinRoom,
@@ -42,14 +49,6 @@ const MAX_PART_HEADER_BYTES = 64 * 1024; // cap on the first part's headers
 const MAX_VALIDATION_PREFIX_BYTES = 4096; // container sniff window
 const PART_HEADER_END = Buffer.from('\r\n\r\n', 'ascii');
 
-// UPLOADS_DIR is overridable for test isolation; defaults to ./uploads.
-const uploadsDir = process.env.UPLOADS_DIR
-  ? path.resolve(process.env.UPLOADS_DIR)
-  : path.resolve(process.cwd(), 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
 function maxUploadBytes(): number {
   const raw = process.env.MAX_UPLOAD_BYTES;
   if (raw) {
@@ -57,6 +56,19 @@ function maxUploadBytes(): number {
     if (Number.isFinite(n) && n >= 0) return n;
   }
   return DEFAULT_MAX_UPLOAD_BYTES;
+}
+
+/**
+ * Validate a host-provided poster URL server-side (Phase 6.8). Only http(s)
+ * and the app's own /api/uploads/ media URLs are allowed; javascript:, data:,
+ * blob:, file:, ftp:, and protocol-relative URLs are rejected.
+ */
+function validatePosterUrl(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  if (trimmed.startsWith('/api/uploads/')) return trimmed;
+  return null;
 }
 
 export function getMimeType(filePath: string): string {
@@ -320,7 +332,29 @@ rooms.post('/:id/media', async (c) => {
 
   const body = await readJson(c);
   let media: MediaInput | null = null;
-  if (body && typeof body.url === 'string' && body.url.trim() !== '') {
+
+  // Phase 6.10: local movies are shared peer-to-peer via WebRTC. The room
+  // stores only lightweight metadata (title / mime type / duration / source
+  // user) — never the file, never a URL. Blob and file URLs are meaningless
+  // outside the host browser and are explicitly rejected.
+  if (body && body.mediaType === 'local-movie') {
+    if (typeof body.url === 'string' && body.url.trim() !== '') {
+      return c.json(
+        apiError(
+          'VALIDATION_ERROR',
+          'Local movie media is shared peer-to-peer — URLs (including blob: URLs) are never stored in room state.'
+        ),
+        400
+      );
+    }
+    media = {
+      title: typeof body.title === 'string' && body.title.trim() ? body.title.trim() : 'Local movie',
+      mediaType: 'local-movie',
+      sourceUserId: typeof body.sourceUserId === 'string' ? body.sourceUserId : undefined,
+      mimeType: typeof body.mimeType === 'string' && body.mimeType.trim() ? body.mimeType.trim() : undefined,
+      duration: typeof body.duration === 'number' && body.duration >= 0 ? body.duration : undefined,
+    };
+  } else if (body && typeof body.url === 'string' && body.url.trim() !== '') {
     const url = body.url.trim();
 
     if (url.startsWith('blob:')) {
@@ -337,10 +371,19 @@ rooms.post('/:id/media', async (c) => {
       return c.json(apiError('VALIDATION_ERROR', 'Media URL must be an http(s) or /api/uploads/ URL.'), 400);
     }
 
+    let poster: string | undefined;
+    if (typeof body.poster === 'string' && body.poster.trim() !== '') {
+      const validPoster = validatePosterUrl(body.poster);
+      if (!validPoster) {
+        return c.json(apiError('VALIDATION_ERROR', 'Poster URL must be an http(s) or /api/uploads/ URL.'), 400);
+      }
+      poster = validPoster;
+    }
+
     media = {
       title: typeof body.title === 'string' && body.title.trim() ? body.title.trim() : 'Untitled stream',
       url,
-      poster: typeof body.poster === 'string' ? body.poster : undefined,
+      poster,
       duration: typeof body.duration === 'number' ? body.duration : undefined,
       type: body.type === 'stream' ? 'stream' : 'video',
     };
@@ -514,12 +557,12 @@ rooms.post('/:id/media/upload', async (c) => {
     const filenameMatch = dispositionLine.match(/;\s*filename="([^"]*)"/i);
     const originalName = filenameMatch ? filenameMatch[1] : 'movie.mp4';
     const ext = path.extname(originalName).toLowerCase() || '.mp4';
-    const allowedExts = ['.mp4', '.webm', '.mov'];
+    const allowedExts = ['.mp4', '.webm', '.mov', '.mkv'];
     if (!allowedExts.includes(ext)) {
       return fail(
         400,
         'INVALID_MEDIA_TYPE',
-        `This file format (${ext}) isn't supported for playback. Please upload MP4 or WebM.`
+        `This file format (${ext}) isn't supported for playback. Please upload MP4, WebM, MOV, or MKV.`
       );
     }
 
@@ -656,7 +699,7 @@ rooms.post('/:id/media/upload', async (c) => {
     }
 
     const detectedContainer = inspectVideoContainer(Buffer.concat(prefixChunks));
-    if (['mkv', 'avi', 'wmv', 'ogv'].includes(detectedContainer)) {
+    if (['avi', 'wmv', 'ogv'].includes(detectedContainer)) {
       const displayExt =
         ext === '.mkv' || detectedContainer === 'mkv'
           ? '.mkv'
@@ -668,7 +711,31 @@ rooms.post('/:id/media/upload', async (c) => {
       return fail(
         400,
         'INVALID_MEDIA_TYPE',
-        `This file format (${displayExt}) isn't supported for playback. Please upload MP4 or WebM.`
+        `This file format (${displayExt}) isn't supported for playback. Please upload MP4, WebM, MOV, or MKV.`
+      );
+    }
+
+    // A .mkv filename is never trusted on its own — the content must actually
+    // be a Matroska/EBML container before we store anything.
+    const isMkv = detectedContainer === 'mkv';
+    if (ext === '.mkv' && !isMkv) {
+      return fail(
+        400,
+        'INVALID_MEDIA_TYPE',
+        "This file isn't a valid MKV (Matroska) container. Please upload a valid MKV, MP4, WebM, or MOV movie."
+      );
+    }
+
+    // Browsers cannot reliably play Matroska directly, and a room must never
+    // reference an unplayable movie. Without FFmpeg on the server there is no
+    // safe way to make an MKV watchable, so reject it clearly up front (the
+    // content signature was already verified above — this is not an
+    // extension-only check).
+    if (isMkv && !isFfmpegAvailable()) {
+      return fail(
+        400,
+        'CONVERSION_UNAVAILABLE',
+        "MKV movies need conversion before they can stream in browsers, but this server doesn't have FFmpeg installed. Please upload MP4, WebM, or MOV instead."
       );
     }
 
@@ -688,10 +755,13 @@ rooms.post('/:id/media/upload', async (c) => {
 
       // Persist ownership metadata atomically with finalization. If the
       // record cannot be written, remove the file so no orphan exists.
+      // MKV sources start as 'processing' (they require conversion); other
+      // containers are 'ready' (the stored file itself is browser-playable).
       try {
         db.prepare(
-          'INSERT INTO uploads (filename, roomId, userId, size, mimeType, createdAt) VALUES (?, ?, ?, ?, ?, ?)'
-        ).run(finalName, roomId, userId, fileBytes, getMimeType(destination), new Date().toISOString());
+          `INSERT INTO uploads (filename, roomId, userId, size, mimeType, createdAt, conversionStatus)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).run(finalName, roomId, userId, fileBytes, getMimeType(destination), new Date().toISOString(), isMkv ? 'processing' : 'ready');
       } catch (err) {
         try {
           fs.rmSync(destination, { force: true });
@@ -704,10 +774,63 @@ rooms.post('/:id/media/upload', async (c) => {
 
     finalized = true;
 
+    const title = originalName.replace(/\.[^/.]+$/, '');
+    const posterUrl = 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=800&q=80';
+
+    function publishConverted(media: { title: string; url: string; poster?: string; type: string }): void {
+      const publishResult = setRoomMedia(roomId, userId, media);
+      if (!publishResult.ok) return;
+      emit(publishResult.payload.id, 'room:update', { room: publishResult.payload });
+      emit(roomId, 'media:conversion', { status: 'ready', roomId });
+    }
+
+    function startConversion(): void {
+      emit(roomId, 'media:conversion', { status: 'processing', title, roomId });
+      void convertToPlayable({
+        sourceName: finalName,
+        roomId,
+        userId,
+        title,
+        poster: posterUrl,
+        onReady: publishConverted,
+        onFailed: () => {
+          emit(roomId, 'media:conversion', { status: 'failed', title, roomId });
+        },
+      });
+    }
+
+    if (isMkv) {
+      // Matroska is never handed to <video> directly. Store the verified
+      // source, convert on the server, and broadcast the playable MP4 only
+      // when conversion completes. Until then the room has no playable media.
+      startConversion();
+      return c.json({
+        ok: true,
+        room: roomPayload(roomId, userId),
+        conversion: { status: 'processing', title, sourceFilename: finalName },
+      });
+    }
+
+    // MP4 / MOV may still carry browser-incompatible codecs. When FFprobe is
+    // available, decide by actual media compatibility rather than extension;
+    // when it is not (or the probe cannot tell), fall back to the existing
+    // direct-play behavior.
+    if ((detectedContainer === 'mp4' || detectedContainer === 'mov') && isFfprobeAvailable()) {
+      const compat = await probeBrowserCompatibility(finalName);
+      if (compat === 'convert') {
+        startConversion();
+        return c.json({
+          ok: true,
+          room: roomPayload(roomId, userId),
+          conversion: { status: 'processing', title, sourceFilename: finalName },
+        });
+      }
+    }
+
     const media: MediaInput = {
-      title: originalName.replace(/\.[^/.]+$/, ''),
+      title,
       url: `/api/uploads/${finalName}`,
-      poster: 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=800&q=80',
+      poster: posterUrl,
       type: 'video',
     };
 

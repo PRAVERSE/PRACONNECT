@@ -24,7 +24,14 @@ const { db } = await import('../db/index');
 const { rooms, handleMediaServing, uploadsDir } = await import('../routes/rooms');
 const { requireAuth } = await import('../middleware/auth');
 const { createSession, SESSION_COOKIE_NAME } = await import('../auth/session');
-const { cleanupEmptyRooms } = await import('../rooms/service');
+const { cleanupEmptyRooms, ROOM_EMPTY_TTL_MS } = await import('../rooms/service');
+const { setFfmpegAvailabilityForTesting } = await import('../uploads/transcode');
+
+// Deterministic upload tests: MKV is rejected with CONVERSION_UNAVAILABLE
+// regardless of whether the host machine has FFmpeg installed. The full
+// conversion pipeline is exercised in mkv-conversion.test.ts with a fake
+// executor.
+setFfmpegAvailabilityForTesting(false);
 
 const app = new Hono();
 app.route('/api/rooms', rooms);
@@ -253,7 +260,7 @@ test('host leave transfers host to earliest-joined member', async () => {
   assert.equal(detail.isHost, true, 'new host sees isHost=true');
 });
 
-test('host leaving alone marks the room empty and hides it from listings', async () => {
+test('host leaving alone marks the room empty but keeps it rejoinable in listings', async () => {
   const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Doomed' });
   const roomId = ((await json(created)).room as { id: string }).id;
 
@@ -264,7 +271,7 @@ test('host leaving alone marks the room empty and hides it from listings', async
   assert.equal(room.memberCount, 0);
 
   const list = (await json(await call(tokens.a, 'GET', '/api/rooms'))).rooms as { id: string }[];
-  assert.ok(!list.some((r) => r.id === roomId), 'empty room must not appear in listings');
+  assert.ok(list.some((r) => r.id === roomId), 'empty rejoinable room must appear in listings');
 
   // joining an empty room before cleanup timeout succeeds and restores the room
   const join = await call(tokens.b, 'POST', `/api/rooms/${roomId}/join`, {});
@@ -353,6 +360,60 @@ test('media URL must be http(s)', async () => {
     url: 'javascript:alert(1)',
   });
   assert.equal(res.status, 400);
+});
+
+// ─── 6b. Phase 6.10: local-movie metadata (peer-to-peer; no file, no URL) ─────
+
+test('local-movie metadata is stored without any URL; source is clamped to the host', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Local Movie Room' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+
+  const res = await call(tokens.a, 'POST', `/api/rooms/${roomId}/media`, {
+    title: 'My Local Movie',
+    mediaType: 'local-movie',
+    mimeType: 'video/mp4',
+    duration: 7230,
+    sourceUserId: 'spoofed-user-id',
+  });
+  assert.equal(res.status, 200);
+  const room = (await json(res)).room as {
+    currentMedia: {
+      title: string;
+      url?: string;
+      mediaType?: string;
+      mimeType?: string;
+      duration?: number;
+      sourceUserId?: string;
+    } | null;
+    hostUserId: string;
+  };
+  assert.ok(room.currentMedia);
+  assert.equal(room.currentMedia.title, 'My Local Movie');
+  assert.equal(room.currentMedia.mediaType, 'local-movie');
+  assert.equal(room.currentMedia.mimeType, 'video/mp4');
+  assert.equal(room.currentMedia.duration, 7230);
+  // The server is authoritative: the source is always the room host.
+  assert.equal(room.currentMedia.sourceUserId, room.hostUserId);
+  assert.equal(room.currentMedia.url, undefined, 'local-movie media must never carry a URL');
+
+  const clear = await call(tokens.a, 'POST', `/api/rooms/${roomId}/media`, {});
+  assert.equal(clear.status, 200);
+  assert.equal(((await json(clear)).room as { currentMedia: unknown }).currentMedia, null);
+});
+
+test('local-movie metadata with any URL (incl. blob:) is rejected — URLs are never stored', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Blob Guard Room' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+
+  for (const url of ['blob:http://localhost:3000/abc', 'https://example.com/v.mp4', '/api/uploads/media-1.mp4']) {
+    const res = await call(tokens.a, 'POST', `/api/rooms/${roomId}/media`, {
+      title: 'X',
+      mediaType: 'local-movie',
+      url,
+    });
+    assert.equal(res.status, 400, `local-movie with url=${url} must be rejected`);
+    assert.equal(((await json(res)).error as { code: string }).code, 'VALIDATION_ERROR');
+  }
 });
 
 // ─── 7. Moderation ───────────────────────────────────────────────────────────
@@ -533,6 +594,120 @@ test('recently-empty rooms survive cleanup', async () => {
   assert.ok(stillThere, 'room row still present');
 });
 
+// ─── 10b. Explore: empty-but-rejoinable rooms ─────────────────────────────────
+
+interface ExploreEntry {
+  id: string;
+  isEmpty: boolean;
+  isRejoinable: boolean;
+  rejoinExpiresAt: string | null;
+  activeMemberCount: number;
+  memberCount: number;
+  emptySince: string | null;
+}
+
+async function exploreList(token: string): Promise<ExploreEntry[]> {
+  const res = await call(token, 'GET', '/api/rooms');
+  assert.equal(res.status, 200);
+  return (await json(res)).rooms as ExploreEntry[];
+}
+
+test('A: active room appears in Explore listing with lifecycle fields', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Active Lifecycle' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+  await call(tokens.b, 'POST', `/api/rooms/${roomId}/join`, {});
+
+  const list = await exploreList(tokens.c);
+  const entry = list.find((r) => r.id === roomId);
+  assert.ok(entry, 'active room must appear in Explore');
+  assert.equal(entry.isEmpty, false);
+  assert.equal(entry.isRejoinable, false);
+  assert.equal(entry.rejoinExpiresAt, null);
+  assert.equal(entry.activeMemberCount, 2);
+  assert.equal(entry.memberCount, 2);
+});
+
+test('B/C/D/E/L: empty room stays in Explore with isEmpty/isRejoinable/rejoinExpiresAt = emptySince + TTL', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Waiting Explore' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+  await call(tokens.b, 'POST', `/api/rooms/${roomId}/join`, {});
+  await call(tokens.a, 'POST', `/api/rooms/${roomId}/leave`, {});
+  await call(tokens.b, 'POST', `/api/rooms/${roomId}/leave`, {});
+
+  const list = await exploreList(tokens.c);
+  const entry = list.find((r) => r.id === roomId);
+  assert.ok(entry, 'empty room must immediately remain visible in Explore');
+  assert.equal(entry.isEmpty, true, 'C: empty room has isEmpty=true');
+  assert.equal(entry.isRejoinable, true, 'D: empty room inside the window is rejoinable');
+  assert.ok(entry.emptySince, 'emptySince must be set');
+  assert.ok(entry.rejoinExpiresAt, 'rejoinExpiresAt must be set');
+  assert.equal(
+    Date.parse(entry.rejoinExpiresAt!) - Date.parse(entry.emptySince!),
+    ROOM_EMPTY_TTL_MS,
+    'E: rejoinExpiresAt = emptySince + 5 minutes'
+  );
+  assert.equal(entry.activeMemberCount, 0, 'L: activeMemberCount is 0 for an empty room');
+  assert.equal(entry.memberCount, 0);
+});
+
+test('F/G/H: rejoining an empty room clears emptySince and returns it to active in Explore', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Revive Explore' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+  await call(tokens.a, 'POST', `/api/rooms/${roomId}/leave`, {});
+
+  const before = await exploreList(tokens.b);
+  assert.ok(before.some((r) => r.id === roomId), 'empty room visible before rejoin');
+
+  const join = await call(tokens.b, 'POST', `/api/rooms/${roomId}/join`, {});
+  assert.equal(join.status, 200, 'F: user can rejoin an empty room before the TTL');
+  const rejoined = (await json(join)).room as { emptySince: string | null };
+  assert.equal(rejoined.emptySince, null, 'G: rejoining clears emptySince');
+
+  const after = await exploreList(tokens.c);
+  const entry = after.find((r) => r.id === roomId);
+  assert.ok(entry, 'H: rejoined room remains in Explore');
+  assert.equal(entry.isEmpty, false, 'H: rejoined room is active in the listing');
+  assert.equal(entry.isRejoinable, false);
+  assert.equal(entry.activeMemberCount, 1);
+});
+
+test('I/J: expired room is excluded from Explore listing and cannot be joined, even before cleanup', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Expired Explore' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+  await call(tokens.a, 'POST', `/api/rooms/${roomId}/leave`, {});
+
+  // Force TTL expiry while the cleanup worker has NOT run.
+  db.prepare('UPDATE rooms SET emptySince = ? WHERE id = ?').run(
+    new Date(Date.now() - 2 * ROOM_EMPTY_TTL_MS).toISOString(),
+    roomId
+  );
+  assert.ok(db.prepare('SELECT id FROM rooms WHERE id = ?').get(roomId), 'row still present (no cleanup run)');
+
+  const list = await exploreList(tokens.b);
+  assert.ok(!list.some((r) => r.id === roomId), 'I: expired room must not appear in Explore');
+
+  const join = await call(tokens.b, 'POST', `/api/rooms/${roomId}/join`, {});
+  assert.equal(join.status, 404, 'J: expired room cannot be joined');
+  assert.equal(((await json(join)).error as { code: string }).code, 'ROOM_GONE');
+});
+
+test('K: private empty room remains access-controlled in Explore', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Private Empty', privacy: 'private' });
+  const roomId = ((await json(created)).room as { id: string }).id;
+  await call(tokens.b, 'POST', `/api/rooms/${roomId}/join`, {});
+  await call(tokens.a, 'POST', `/api/rooms/${roomId}/leave`, {});
+  await call(tokens.b, 'POST', `/api/rooms/${roomId}/leave`, {});
+
+  const outsider = await exploreList(tokens.c);
+  assert.ok(!outsider.some((r) => r.id === roomId), 'K: non-member must not see the private empty room');
+
+  const formerMember = await exploreList(tokens.b);
+  const entry = formerMember.find((r) => r.id === roomId);
+  assert.ok(entry, 'K: former member may see the private empty room during the rejoin window');
+  assert.equal(entry.isEmpty, true);
+  assert.equal(entry.isRejoinable, true);
+});
+
 test('rejoining an empty room before timeout cancels emptySince cleanup state', async () => {
   const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Rejoin Keep Alive' });
   const roomId = ((await json(created)).room as { id: string }).id;
@@ -646,7 +821,10 @@ test('media URL rejects blob URLs; host can upload media and stream with HTTP 20
   });
   assert.equal(badUpload.status, 400);
 
-  // 3b. MKV container format rejected immediately with clear message
+  // 3b. MKV uploads are rejected when FFmpeg is unavailable — the container
+  // signature is verified first, then the server explains that conversion is
+  // required but not possible on this host. The room is never given an
+  // unplayable MKV URL.
   const mkvBytes = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42, 0x82, 0x88, 0x6d, 0x61, 0x74, 0x72, 0x6f, 0x73, 0x6b, 0x61]);
   const mkvFormData = new FormData();
   mkvFormData.append('file', new Blob([mkvBytes], { type: 'video/x-matroska' }), 'movie.mkv');
@@ -658,10 +836,13 @@ test('media URL rejects blob URLs; host can upload media and stream with HTTP 20
     body: mkvFormData,
   });
   assert.equal(mkvUpload.status, 400);
-  const mkvJson = (await mkvUpload.json()) as { error: { message: string } };
-  assert.match(mkvJson.error.message, /isn't supported for playback/);
+  const mkvJson = (await mkvUpload.json()) as { error: { code: string; message: string } };
+  assert.equal(mkvJson.error.code, 'CONVERSION_UNAVAILABLE');
+  assert.match(mkvJson.error.message, /FFmpeg/i);
 
-  // 3c. Spoofed MKV with .mp4 filename rejected via container inspection
+  // 3c. Matroska content is never accepted by spoofing another filename —
+  // container inspection wins over the reported extension, so a Matroska
+  // container with a .mp4 name is still treated as MKV (needs conversion).
   const spoofedFormData = new FormData();
   spoofedFormData.append('file', new Blob([mkvBytes], { type: 'video/mp4' }), 'spoofed.mp4');
   const spoofedUpload = await app.request(`/api/rooms/${roomId}/media/upload`, {
@@ -672,6 +853,8 @@ test('media URL rejects blob URLs; host can upload media and stream with HTTP 20
     body: spoofedFormData,
   });
   assert.equal(spoofedUpload.status, 400);
+  const spoofedJson = (await spoofedUpload.json()) as { error: { code: string } };
+  assert.equal(spoofedJson.error.code, 'CONVERSION_UNAVAILABLE');
 
   // 3d. 0-byte empty file is rejected with 400 EMPTY_FILE
   const emptyFormData = new FormData();
@@ -829,19 +1012,40 @@ test('disallowed container rejection cleans up any temporary upload file', async
   const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Container Cleanup Room' });
   const roomId = ((await json(created)).room as { id: string }).id;
 
-  const mkvBytes = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42, 0x82, 0x88, 0x6d, 0x61, 0x74, 0x72, 0x6f, 0x73, 0x6b, 0x61]);
+  // AVI container ('RIFF' + 'AVI ') — still a rejected format.
+  const aviBytes = new Uint8Array(16);
+  Buffer.from('RIFF').copy(aviBytes, 0);
+  Buffer.from('AVI ').copy(aviBytes, 8);
   const form = new FormData();
-  form.append('file', new Blob([mkvBytes], { type: 'video/x-matroska' }), 'clip.mkv');
+  form.append('file', new Blob([aviBytes], { type: 'video/x-msvideo' }), 'clip.avi');
   const res = await app.request(`/api/rooms/${roomId}/media/upload`, {
     method: 'POST',
     headers: { cookie: cookie(tokens.a) },
     body: form,
   });
   assert.equal(res.status, 400);
+  const body = (await res.json()) as { error: { code: string; message: string } };
+  assert.equal(body.error.code, 'INVALID_MEDIA_TYPE');
+  assert.match(body.error.message, /isn't supported for playback/);
+
+  // Fake .mkv (extension only, not Matroska content) is also rejected.
+  const fakeMkv = new FormData();
+  fakeMkv.append('file', new Blob(['definitely not ebml'], { type: 'application/octet-stream' }), 'fake.mkv');
+  const fakeRes = await app.request(`/api/rooms/${roomId}/media/upload`, {
+    method: 'POST',
+    headers: { cookie: cookie(tokens.a) },
+    body: fakeMkv,
+  });
+  assert.equal(fakeRes.status, 400);
+  const fakeBody = (await fakeRes.json()) as { error: { code: string } };
+  assert.equal(fakeBody.error.code, 'INVALID_MEDIA_TYPE');
 
   const leftovers = fs.readdirSync(uploadsDir);
   assert.ok(!leftovers.some((f) => f.endsWith('.part')), 'no .part temp file may remain');
-  assert.ok(!leftovers.some((f) => f.startsWith('media-') && f.endsWith('.mkv')), 'rejected container must not be stored');
+  assert.ok(
+    !leftovers.some((f) => f.startsWith('media-') && (f.endsWith('.mkv') || f.endsWith('.avi'))),
+    'rejected container must not be stored'
+  );
 });
 
 test('zero-byte upload is rejected without creating any file', async () => {
@@ -959,6 +1163,7 @@ test('failed or invalid uploads do not create upload records in the database', a
   });
   assert.equal(txtRes.status, 400);
 
+  // MKV without FFmpeg on the host is rejected before any file is stored.
   const mkvBytes = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42, 0x82, 0x88, 0x6d, 0x61, 0x74, 0x72, 0x6f, 0x73, 0x6b, 0x61]);
   const mkvForm = new FormData();
   mkvForm.append('file', new Blob([mkvBytes], { type: 'video/x-matroska' }), 'clip.mkv');
@@ -968,6 +1173,8 @@ test('failed or invalid uploads do not create upload records in the database', a
     body: mkvForm,
   });
   assert.equal(mkvRes.status, 400);
+  const mkvErr = (await mkvRes.json()) as { error: { code: string } };
+  assert.equal(mkvErr.error.code, 'CONVERSION_UNAVAILABLE');
 
   const emptyForm = new FormData();
   emptyForm.append('file', new Blob([], { type: 'video/mp4' }), 'empty.mp4');

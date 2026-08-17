@@ -39,6 +39,14 @@ export interface RoomItem {
   status: RoomStatus;
   memberCount: number;
   maxMembers: number;
+  /** Number of members currently active in the room (never counts left/removed). */
+  activeMemberCount?: number;
+  /** True when no member is currently active in the room. */
+  isEmpty?: boolean;
+  /** True when the room is empty but still inside its 5-minute rejoin window. */
+  isRejoinable?: boolean;
+  /** ISO timestamp (emptySince + 5 min) when the rejoin window closes; null when the room is active. */
+  rejoinExpiresAt?: string | null;
   currentMedia: MediaTrack | null;
   playback?: { isPlaying: boolean; position: number; updatedAt?: string };
   screenShareActive?: boolean;

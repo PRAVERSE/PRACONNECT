@@ -19,10 +19,14 @@ export interface ServerRoomMember {
 
 export interface ServerRoomMedia {
   title: string;
-  url: string;
+  url?: string;
   poster?: string;
   duration?: number;
   type?: string;
+  /** 'local-movie' = shared peer-to-peer via WebRTC (url is always absent); 'url' = direct URL; 'hosted' = server upload. */
+  mediaType?: 'local-movie' | 'url' | 'hosted' | string;
+  sourceUserId?: string;
+  mimeType?: string;
 }
 
 export interface ServerRoomPlayback {
@@ -45,6 +49,14 @@ export interface ServerRoom {
   category: string;
   privacy: string;
   maxParticipants: number;
+  /** Number of members currently active in the room (never counts left/removed). */
+  activeMemberCount: number;
+  /** True when no member is currently active in the room. */
+  isEmpty: boolean;
+  /** True when the room is empty but still inside its 5-minute rejoin window. */
+  isRejoinable: boolean;
+  /** ISO timestamp (emptySince + 5 min) when the rejoin window closes; null when the room is active. */
+  rejoinExpiresAt: string | null;
   memberCount: number;
   status: string;
   currentMedia: ServerRoomMedia | null;
@@ -190,7 +202,13 @@ export async function setRoomMediaApi(
 export async function uploadRoomMediaApi(
   roomId: string,
   file: File
-): Promise<RoomApiResponse<{ room: ServerRoom; media: MediaTrack }>> {
+): Promise<
+  RoomApiResponse<{
+    room: ServerRoom;
+    media: MediaTrack | null;
+    conversion?: { status: 'processing' | 'ready' | 'failed' | string; title?: string; sourceFilename?: string };
+  }>
+> {
   try {
     console.log('[Diagnostics] [Before FormData Append]:', {
       name: file.name,

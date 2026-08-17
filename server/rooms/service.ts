@@ -109,6 +109,18 @@ function activeMemberCount(roomId: string): number {
   return row.n;
 }
 
+/** True when the empty-room TTL has elapsed and the room is no longer rejoinable. */
+export function isRoomExpired(room: { emptySince: string | null }): boolean {
+  if (!room.emptySince) return false;
+  return Date.now() >= Date.parse(room.emptySince) + ROOM_EMPTY_TTL_MS;
+}
+
+/** ISO timestamp at which the empty-room rejoin window closes (emptySince + TTL). */
+function rejoinExpiresAtIso(room: { emptySince: string | null }): string | null {
+  if (!room.emptySince) return null;
+  return new Date(Date.parse(room.emptySince) + ROOM_EMPTY_TTL_MS).toISOString();
+}
+
 function touchActivity(roomId: string): void {
   db.prepare('UPDATE rooms SET lastActivityAt = ? WHERE id = ?').run(nowIso(), roomId);
 }
@@ -137,6 +149,14 @@ export interface RoomPayload {
   category: string;
   privacy: string;
   maxParticipants: number;
+  /** Number of members currently active in the room (never counts left/removed). */
+  activeMemberCount: number;
+  /** True when no member is currently active in the room. */
+  isEmpty: boolean;
+  /** True when the room is empty but still inside its 5-minute rejoin window. */
+  isRejoinable: boolean;
+  /** ISO timestamp (emptySince + 5 min) when the rejoin window closes; null when the room is active. */
+  rejoinExpiresAt: string | null;
   memberCount: number;
   status: string;
   currentMedia: {
@@ -226,6 +246,10 @@ export function roomPayload(roomId: string, viewerUserId: string | null): RoomPa
     }
   })();
 
+  const memberCount = members.length;
+  const isEmpty = memberCount === 0;
+  const isRejoinable = isEmpty && !isRoomExpired(room);
+
   return {
     id: room.id,
     name: room.name,
@@ -237,7 +261,11 @@ export function roomPayload(roomId: string, viewerUserId: string | null): RoomPa
     category: room.category,
     privacy: room.privacy,
     maxParticipants: room.maxParticipants,
-    memberCount: members.length,
+    activeMemberCount: memberCount,
+    isEmpty,
+    isRejoinable,
+    rejoinExpiresAt: rejoinExpiresAtIso(room),
+    memberCount,
     status: room.status,
     currentMedia: parseMedia(room.currentMediaJson),
     playback,
@@ -251,16 +279,32 @@ export function roomPayload(roomId: string, viewerUserId: string | null): RoomPa
   };
 }
 
+/**
+ * List rooms visible in Explore: active rooms plus empty rooms still inside
+ * their 5-minute rejoin window (emptySince + TTL). Expired rooms are excluded
+ * here even if the cleanup worker has not swept them yet — the listing query
+ * enforces the TTL itself, so an expired room can never briefly reappear
+ * between sweeps. The cleanup worker remains authoritative for deletion.
+ *
+ * Privacy: public rooms are visible to everyone; private rooms are visible
+ * only to authorized users — anyone who holds a membership row (removed
+ * members are excluded). Rejoinability never overrides privacy: strangers
+ * cannot see a private room through Explore.
+ */
 export function listRoomPayloads(viewerUserId: string | null): RoomPayload[] {
+  const rejoinCutoff = new Date(Date.now() - ROOM_EMPTY_TTL_MS).toISOString();
   const rows = db
     .prepare(
       `SELECT r.* FROM rooms r
-       WHERE r.emptySince IS NULL
+       WHERE (r.emptySince IS NULL OR r.emptySince >= ?)
          AND (r.privacy = 'public'
-              OR EXISTS (SELECT 1 FROM roomMembers m WHERE m.roomId = r.id AND m.userId = ? AND m.leftAt IS NULL))
+              OR EXISTS (SELECT 1 FROM roomMembers m
+                         WHERE m.roomId = r.id AND m.userId = ?
+                           AND m.removedAt IS NULL
+                           AND (m.leftAt IS NULL OR r.emptySince IS NOT NULL)))
        ORDER BY r.lastActivityAt DESC`
     )
-    .all(viewerUserId ?? '') as RoomRow[];
+    .all(rejoinCutoff, viewerUserId ?? '') as RoomRow[];
   return rows
     .map((r) => roomPayload(r.id, viewerUserId))
     .filter((p): p is RoomPayload => p !== null);
@@ -337,6 +381,12 @@ export function createRoom(hostUserId: string, input: CreateRoomInput): RoomPayl
 export function joinRoom(roomIdOrCode: string, userId: string): { ok: true; payload: RoomPayload } | { ok: false; error: RoomError } {
   const room = getRoom(roomIdOrCode);
   if (!room) return { ok: false, error: RoomErrors.notFound() };
+
+  // The 5-minute rejoin window has closed even though the cleanup worker may
+  // not have swept the row yet: an expired room can never be joined.
+  if (isRoomExpired(room)) {
+    return { ok: false, error: RoomErrors.gone() };
+  }
 
   const existing = getMember(room.id, userId);
   if (existing && !existing.leftAt) {

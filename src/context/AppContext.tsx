@@ -205,6 +205,10 @@ function mapServerRoomToItem(r: ServerRoom, currentUserId: string | null): RoomI
     status: (r.status as RoomStatus) || 'LIVE',
     memberCount: r.memberCount,
     maxMembers: r.maxParticipants,
+    activeMemberCount: r.activeMemberCount,
+    isEmpty: r.isEmpty,
+    isRejoinable: r.isRejoinable,
+    rejoinExpiresAt: r.rejoinExpiresAt,
     currentMedia: r.currentMedia
       ? {
           title: r.currentMedia.title,
