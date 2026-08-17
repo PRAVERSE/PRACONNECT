@@ -45,6 +45,8 @@ import {
 import { useApp } from '../../context/AppContext';
 import { RoomFile, Participant } from '../../types';
 import { presetMediaTracks } from '../../data/mockData';
+import { isSupportedLocalMovie, LOCAL_MOVIE_ACCEPT } from '../../utils/mediaValidation';
+import { LocalMovieController, canBrowserPlay, captureStreamTrackCounts, movieSourceHasDecodedAudio } from '../../webrtc/localMovie';
 import { VoiceRing } from '../common/VoiceRing';
 import { AvatarStack } from '../common/AvatarStack';
 import { UserAvatar } from '../common/UserAvatar';
@@ -231,18 +233,28 @@ export const RoomView: React.FC = () => {
     remoteMediaStreams,
     remoteCameraStreams,
     remoteScreenStreams,
+    remoteMovieStreams,
     mediaErrorMessage,
     mediaDiagnosticError,
     clearMediaError,
+    mediaConversion,
+    clearMediaConversion,
     getManagerCameraDiagnostics,
-    uploadRoomMedia,
+    setLocalMovieActive,
   } = useApp();
 
   const [copiedCode, setCopiedCode] = useState(false);
   const [chatInput, setChatInput] = useState('');
   const [showMediaPicker, setShowMediaPicker] = useState(false);
-  const [isUploadingMedia, setIsUploadingMedia] = useState(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [localMovieStatus, setLocalMovieStatus] = useState<'idle' | 'loading' | 'active' | 'error'>('idle');
+  const [localMovieError, setLocalMovieError] = useState<string | null>(null);
+  // Phase 6.10 audio fix: guest browser blocked audible autoplay — offer a
+  // user-gesture "Enable Movie Sound" control instead of forcing audio.
+  const [movieSoundBlocked, setMovieSoundBlocked] = useState(false);
+  // Host-side diagnostic when captureStream() exposed no audio track despite
+  // the source movie clearly having decoded audio (browser limitation — the
+  // movie is still shared video-only, never uploaded).
+  const [movieAudioWarning, setMovieAudioWarning] = useState<string | null>(null);
 
   // Quick Reaction Picker States
   const [showReactionMenu, setShowReactionMenu] = useState(false);
@@ -393,6 +405,436 @@ export const RoomView: React.FC = () => {
     }
   };
 
+  // ─── Phase 6.10: Local Movie Mode ─────────────────────────────────────────
+  // The host picks a local video file. The file NEVER leaves the device:
+  // a blob URL exists only in this browser, the <video> is captured with
+  // video.captureStream() and the captured stream travels host → WebRTC →
+  // participants. The server only ever sees lightweight metadata.
+  const localMovieVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteMovieStageVideoRef = useRef<HTMLVideoElement>(null);
+  const localMovieStatusRef = useRef(localMovieStatus);
+  localMovieStatusRef.current = localMovieStatus;
+
+  const setLocalMovieActiveRef = useRef(setLocalMovieActive);
+  setLocalMovieActiveRef.current = setLocalMovieActive;
+  const localMovieControllerRef = useRef<LocalMovieController | null>(null);
+  if (!localMovieControllerRef.current) {
+    localMovieControllerRef.current = new LocalMovieController({
+      setLocalMovieActive: (stream, metadata) => setLocalMovieActiveRef.current(stream, metadata),
+      revokeObjectUrl: (url) => URL.revokeObjectURL(url),
+    });
+  }
+
+  const isLocalMovieMedia = currentRoom?.currentMedia?.mediaType === 'local-movie';
+  const localMovieHostId = currentRoom?.currentMedia?.sourceUserId || currentRoom?.hostUserId || null;
+  const remoteMovieStream = localMovieHostId ? (remoteMovieStreams.get(localMovieHostId) ?? null) : null;
+  const hasRemoteMovieStream = Boolean(remoteMovieStream && remoteMovieStream.getTracks().length > 0);
+  const localMovieHostName = currentRoom?.hostName || 'the host';
+  // The host's captured source <video> becomes the visible stage only while a
+  // local movie is loading/active and no screen share is taking over.
+  const isHostMovieStageVisible = isHost && !isAnyScreenSharingActive && (localMovieStatus === 'loading' || localMovieStatus === 'active');
+
+  /** The <video> element the player controls should drive right now. */
+  const getStageVideo = (): HTMLVideoElement | null => {
+    if (isLocalMovieMedia && isHost) return localMovieVideoRef.current;
+    if (isLocalMovieMedia && !isHost) return remoteMovieStageVideoRef.current;
+    return videoRef.current;
+  };
+
+  // Guest stage binding: attach the host's movie stream to the stage <video>.
+  // Phase 6.10 audio fix: the remote movie element must NEVER be forced
+  // muted — audible autoplay that the browser blocks is handled by the
+  // "Enable Movie Sound" user-gesture banner, not by muting the element.
+  useEffect(() => {
+    const video = remoteMovieStageVideoRef.current;
+    if (!video) return;
+    if (hasRemoteMovieStream && remoteMovieStream) {
+      console.log('[REMOTE MOVIE STREAM]', {
+        ts: new Date().toISOString(),
+        videoTracks: remoteMovieStream.getVideoTracks().length,
+        audioTracks: remoteMovieStream.getAudioTracks().length,
+        streamId: remoteMovieStream.id,
+      });
+      if (video.srcObject !== remoteMovieStream) {
+        video.srcObject = remoteMovieStream;
+        video.muted = false;
+        video.volume = 1;
+      }
+      // Phase 6.10 audio trace (exact tag) — GUEST VIDEO ELEMENT: the element
+      // rendering the movie stream. muted MUST be false and volume 1 unless
+      // the user muted it — a silent element here is a mute/volume bug, not a
+      // WebRTC bug.
+      console.log('[MOVIE AUDIO DEBUG] GUEST VIDEO ELEMENT', {
+        ts: new Date().toISOString(),
+        muted: video.muted,
+        volume: video.volume,
+        paused: video.paused,
+        autoplay: video.autoplay,
+        readyState: video.readyState,
+        srcObjectStreamId: video.srcObject ? (video.srcObject as MediaStream).id : null,
+        audioTrackCount: (video as any).audioTracks ? (video as any).audioTracks.length : 'n/a',
+        videoTrackCount: (video as any).videoTracks ? (video as any).videoTracks.length : 'n/a',
+      });
+      video
+        .play()
+        .then(() => setMovieSoundBlocked(false))
+        .catch((err: any) => {
+          if (err?.name === 'NotAllowedError') {
+            // Phase 6.10 audio trace (exact tag) — the browser blocked audible
+            // autoplay: the stream is fine, but sound needs a user gesture.
+            console.log('[MOVIE AUDIO DEBUG] GUEST AUTOPLAY BLOCKED', {
+              ts: new Date().toISOString(),
+              errorName: err?.name,
+              errorMessage: err?.message ?? null,
+              wasUnmuted: !video.muted,
+              volume: video.volume,
+            });
+            setMovieSoundBlocked(true);
+          }
+        });
+    } else if (video.srcObject) {
+      video.srcObject = null;
+    }
+  }, [remoteMovieStream, hasRemoteMovieStream]);
+
+  // Guest playback sync: server playback state is authoritative, drift-corrected.
+  useEffect(() => {
+    const video = remoteMovieStageVideoRef.current;
+    if (!video || !isLocalMovieMedia || isHost) return;
+
+    const serverPlaying = Boolean(currentRoom?.playback?.isPlaying);
+    const expectedPos = getExpectedServerPosition(currentRoom?.playback);
+
+    if (serverPlaying && video.paused) {
+      video
+        .play()
+        .then(() => {
+          setIsPlaying(true);
+          setMovieSoundBlocked(false);
+        })
+        .catch((err: any) => {
+          if (err?.name === 'NotAllowedError') {
+            console.log('[MOVIE AUDIO DEBUG] GUEST AUTOPLAY BLOCKED', {
+              ts: new Date().toISOString(),
+              errorName: err?.name,
+              errorMessage: err?.message ?? null,
+              wasUnmuted: !video.muted,
+              volume: video.volume,
+            });
+            setMovieSoundBlocked(true);
+          }
+        });
+    } else if (!serverPlaying && !video.paused) {
+      video.pause();
+      setIsPlaying(false);
+    }
+    if (Math.abs(video.currentTime - expectedPos) > 1.2) {
+      video.currentTime = expectedPos;
+      setCurrentTime(expectedPos);
+    }
+  }, [
+    currentRoom?.playback?.isPlaying,
+    currentRoom?.playback?.position,
+    currentRoom?.playback?.updatedAt,
+    isLocalMovieMedia,
+    isHost,
+    hasRemoteMovieStream,
+  ]);
+
+  // Unmount / room-change cleanup: detach the movie session and revoke any
+  // blob URL still owned by this view.
+  useEffect(() => {
+    return () => {
+      const controller = localMovieControllerRef.current;
+      if (controller) {
+        void controller.stop();
+      }
+      const video = localMovieVideoRef.current;
+      if (video) {
+        video.pause();
+        video.src = '';
+      }
+    };
+  }, []);
+
+  /** Wait until the element has enough data to capture (or it errored). */
+  const waitForMovieReadiness = (video: HTMLVideoElement): Promise<void> =>
+    new Promise((resolve, reject) => {
+      if (video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+        resolve();
+        return;
+      }
+      const cleanup = () => {
+        video.removeEventListener('canplay', onCanPlay);
+        video.removeEventListener('error', onError);
+      };
+      const onCanPlay = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        cleanup();
+        reject(video.error || new Error('media-load-failed'));
+      };
+      video.addEventListener('canplay', onCanPlay);
+      video.addEventListener('error', onError);
+      setTimeout(() => {
+        if (video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+          cleanup();
+          resolve();
+        }
+      }, 8000);
+    });
+
+  /**
+   * Phase 6.10 — host picks a local movie file.
+   * The file is NEVER uploaded: a blob URL is created locally, the <video>
+   * element is captured, and the captured stream is attached to the WebRTC
+   * peers. Only { mediaType: 'local-movie', title, mimeType, duration,
+   * sourceUserId } reaches the room.
+   */
+  const handleLocalMovieFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    if (!isSupportedLocalMovie(file)) {
+      setLocalMovieError('Please select a video file (MP4, WebM, MOV, MKV, AVI, or another supported container).');
+      setLocalMovieStatus('error');
+      return;
+    }
+    if (file.size === 0) {
+      setLocalMovieError('Selected file appears to be empty (0 bytes) — please ensure the file is completely saved on disk and try selecting it again.');
+      setLocalMovieStatus('error');
+      return;
+    }
+
+    setLocalMovieError(null);
+    setLocalMovieStatus('loading');
+    try {
+      const video = localMovieVideoRef.current;
+      if (!video) throw new Error('player-not-ready');
+      const capture = video.captureStream
+        ? () => video.captureStream()
+        : typeof (video as any).mozCaptureStream === 'function'
+        ? () => (video as any).mozCaptureStream()
+        : null;
+      if (!capture) {
+        setLocalMovieError("This browser doesn't support local movie sharing. Please use Chrome or Edge.");
+        setLocalMovieStatus('error');
+        return;
+      }
+
+      // Fast-fail when the browser already knows it cannot play the container.
+      if (canBrowserPlay(video, file.type) === 'no') {
+        setLocalMovieError("This video format isn't supported by your browser.");
+        setLocalMovieStatus('error');
+        return;
+      }
+
+      // Blob URL: exists ONLY in this browser tab; never broadcast, never sent
+      // to the server. Assigned to the element BEFORE the old URL is revoked
+      // by the controller, so the element never dangles.
+      const url = URL.createObjectURL(file);
+      video.src = url;
+      video.muted = false;
+      video.volume = 1;
+      await video.load();
+
+      // The file picker click counts as a user gesture, so unmuted autoplay
+      // is normally allowed — that keeps the captured audio track live.
+      // Phase 6.10 audio fix: the element must NOT stay permanently muted —
+      // a muted source element may not expose usable audio via captureStream.
+      // If the browser still blocks audible autoplay, the muted fallback is
+      // surfaced to the user ("Enable Movie Sound") instead of being silent.
+      try {
+        await video.play();
+        setIsMuted(false);
+        setVolume(1);
+      } catch {
+        video.muted = true;
+        setIsMuted(true);
+        try {
+          await video.play();
+        } catch {
+          // Still blocked — the host stage shows the enable-sound control.
+        }
+      }
+
+      await waitForMovieReadiness(video);
+
+      // Phase 6.10 audio fix — host source-video diagnostics BEFORE capture:
+      // proves whether the movie element itself was muted / blocked.
+      console.log('[LOCAL MOVIE] source video:', {
+        ts: new Date().toISOString(),
+        muted: video.muted,
+        volume: video.volume,
+        paused: video.paused,
+        readyState: video.readyState,
+        currentTime: video.currentTime,
+        duration: video.duration,
+        videoWidth: video.videoWidth,
+        videoHeight: video.videoHeight,
+        hasDecodedAudio: movieSourceHasDecodedAudio(video as any),
+      });
+      // Phase 6.10 audio trace (exact tag) — HOST SOURCE: proves whether the
+      // host <video> element itself was muted/paused/blocked BEFORE capture.
+      console.log('[MOVIE AUDIO DEBUG] HOST SOURCE', {
+        ts: new Date().toISOString(),
+        muted: video.muted,
+        volume: video.volume,
+        paused: video.paused,
+        readyState: video.readyState,
+        currentTime: video.currentTime,
+        duration: video.duration,
+        hasDecodedAudio: movieSourceHasDecodedAudio(video as any),
+      });
+
+      const stream = capture();
+      if (!stream || stream.getVideoTracks().length === 0) {
+        throw new Error('no-video-track');
+      }
+
+      // Phase 6.10 audio fix — capture-stream diagnostics: stream id, all
+      // track kinds, video/audio counts, and per-audio-track state.
+      const captureCounts = captureStreamTrackCounts(stream);
+      console.log('[LOCAL MOVIE] captureStream:', {
+        ts: new Date().toISOString(),
+        streamId: stream.id,
+        trackKinds: stream.getTracks().map((t) => t.kind),
+        videoTrackCount: captureCounts.videoTracks,
+        audioTrackCount: captureCounts.audioTracks,
+      });
+      // Phase 6.10 audio trace (exact tag) — HOST CAPTURE: the captured
+      // stream's video/audio track maps (incl. getSettings). audioTracks
+      // length is the decisive Case-A answer (0 here = captureStream exposed
+      // no audio; >=1 = the host side produced audio for WebRTC).
+      const movieTrackSettings = (t: MediaStreamTrack) => {
+        try {
+          return typeof t.getSettings === 'function' ? t.getSettings() : null;
+        } catch {
+          return null;
+        }
+      };
+      console.log('[MOVIE AUDIO DEBUG] HOST CAPTURE', {
+        ts: new Date().toISOString(),
+        streamId: stream.id,
+        videoTracks: stream.getVideoTracks().map((t) => ({
+          id: t.id,
+          kind: t.kind,
+          readyState: t.readyState,
+          enabled: t.enabled,
+          muted: t.muted,
+          label: t.label,
+          settings: movieTrackSettings(t),
+        })),
+        audioTracks: stream.getAudioTracks().map((t) => ({
+          id: t.id,
+          kind: t.kind,
+          readyState: t.readyState,
+          enabled: t.enabled,
+          muted: t.muted,
+          label: t.label,
+          settings: movieTrackSettings(t),
+        })),
+      });
+      for (const audioTrack of stream.getAudioTracks()) {
+        console.log('[LOCAL MOVIE AUDIO]', {
+          ts: new Date().toISOString(),
+          trackId: audioTrack.id,
+          kind: audioTrack.kind,
+          readyState: audioTrack.readyState,
+          enabled: audioTrack.enabled,
+          muted: audioTrack.muted,
+          label: audioTrack.label,
+        });
+      }
+
+      // Phase 6.10 audio fix — graceful 0-audio-track handling: keep sharing
+      // the video, but surface a diagnostic when the source clearly has audio
+      // while captureStream() exposed none. NEVER fall back to an upload.
+      if (captureCounts.audioTracks === 0 && movieSourceHasDecodedAudio(video as any)) {
+        setMovieAudioWarning("Your browser did not expose the movie's audio track for WebRTC sharing.");
+      }
+
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : undefined;
+      if (duration !== undefined) {
+        setDuration(duration);
+      }
+
+      const result = await localMovieControllerRef.current!.start(file, url, stream, {
+        duration,
+        sourceUserId: currentUser?.id,
+      });
+      if (!result.ok) {
+        URL.revokeObjectURL(url);
+        video.pause();
+        video.src = '';
+        setLocalMovieError('Could not start local movie sharing. Please try again.');
+        setLocalMovieStatus('error');
+        return;
+      }
+
+      setLocalMovieStatus('active');
+      setIsPlaying(true);
+      setShowMediaPicker(false);
+    } catch (err) {
+      console.warn('[MOVIE UI] local movie load failed:', err);
+      setLocalMovieError("This video format isn't supported by your browser.");
+      setLocalMovieStatus('error');
+    }
+  };
+
+  /** Host stops the local movie session (detach peers + clear room media). */
+  const handleStopLocalMovie = async () => {
+    const controller = localMovieControllerRef.current;
+    await controller?.stop();
+    const video = localMovieVideoRef.current;
+    if (video) {
+      video.pause();
+      video.src = '';
+    }
+    setLocalMovieStatus('idle');
+    setLocalMovieError(null);
+    setMovieAudioWarning(null);
+    setMovieSoundBlocked(false);
+    setIsMuted(false);
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+  };
+
+  /** Phase 6.10 audio fix — host-side user gesture to enable movie sound. */
+  const enableHostMovieSound = async () => {
+    const video = localMovieVideoRef.current;
+    if (!video) return;
+    video.muted = false;
+    video.volume = 1;
+    try {
+      await video.play();
+      setIsMuted(false);
+      setVolume(1);
+    } catch {
+      // Browser still blocks audible autoplay — keep the banner up.
+    }
+  };
+
+  /** Phase 6.10 audio fix — guest-side user gesture to enable movie sound. */
+  const enableGuestMovieSound = async () => {
+    const video = remoteMovieStageVideoRef.current;
+    if (!video) return;
+    video.muted = false;
+    video.volume = 1;
+    try {
+      await video.play();
+      setMovieSoundBlocked(false);
+      setIsMuted(false);
+      setVolume(1);
+    } catch {
+      // Still blocked — keep the banner up.
+    }
+  };
+
   // Device-change listener that clears "no camera" error if camera becomes available later
   const retryCameraRef = useRef(retryCamera);
   retryCameraRef.current = retryCamera;
@@ -446,6 +888,8 @@ export const RoomView: React.FC = () => {
     setVideoErrorInfo(null);
     setIsPlaying(false);
     setAutoplayBlocked(false);
+    setMovieSoundBlocked(false);
+    setMovieAudioWarning(null);
 
     if (currentRoom?.currentMedia?.url) {
       const videoUrl = currentRoom.currentMedia.url;
@@ -562,6 +1006,24 @@ export const RoomView: React.FC = () => {
 
   if (!currentRoom) return null;
 
+  // A raw Matroska source is never directly playable in browsers — the server
+  // only publishes the converted MP4. This guard keeps the player from ever
+  // showing the generic stream error for an MKV URL.
+  const isRawMkvUrl = (url: string): boolean => url.toLowerCase().endsWith('.mkv');
+
+  const renderPreparingOverlay = (title?: string) => (
+    <div className="absolute inset-0 z-30 bg-black/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center text-white space-y-3">
+      <div className="w-10 h-10 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
+      <div>
+        <p className="text-sm font-bold text-white font-heading">Preparing your movie for streaming…</p>
+        <p className="text-xs text-gray-300 max-w-sm mt-1">
+          {title ? `"${title}" was uploaded and is being converted for browser playback. ` : ''}
+          Playback starts automatically once it's ready — this can take a while for large files.
+        </p>
+      </div>
+    </div>
+  );
+
   const handleCopyCode = () => {
     navigator.clipboard.writeText(currentRoom.code);
     setCopiedCode(true);
@@ -578,11 +1040,12 @@ export const RoomView: React.FC = () => {
   // Video player methods (Host-authorized)
   const togglePlay = async () => {
     if (!isHost) return;
-    if (videoRef.current) {
+    const video = getStageVideo();
+    if (video) {
       const nextPlaying = !isPlaying;
       if (nextPlaying) {
         try {
-          await videoRef.current.play();
+          await video.play();
           setIsPlaying(true);
           setVideoError(false);
           setAutoplayBlocked(false);
@@ -596,20 +1059,21 @@ export const RoomView: React.FC = () => {
           }
         }
       } else {
-        videoRef.current.pause();
+        video.pause();
         setIsPlaying(false);
       }
       await setRoomPlayback({
         isPlaying: nextPlaying,
-        position: videoRef.current.currentTime,
+        position: video.currentTime,
       });
     }
   };
 
   const toggleMute = () => {
-    if (videoRef.current) {
+    const video = getStageVideo();
+    if (video) {
       const nextMute = !isMuted;
-      videoRef.current.muted = nextMute;
+      video.muted = nextMute;
       setIsMuted(nextMute);
     }
   };
@@ -617,14 +1081,15 @@ export const RoomView: React.FC = () => {
   const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = Number(e.target.value);
     setVolume(val);
-    if (videoRef.current) {
-      videoRef.current.volume = val;
+    const video = getStageVideo();
+    if (video) {
+      video.volume = val;
       if (val === 0) {
         setIsMuted(true);
-        videoRef.current.muted = true;
+        video.muted = true;
       } else if (isMuted) {
         setIsMuted(false);
-        videoRef.current.muted = false;
+        video.muted = false;
       }
     }
   };
@@ -632,8 +1097,9 @@ export const RoomView: React.FC = () => {
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!isHost) return;
     const time = Number(e.target.value);
-    if (videoRef.current) {
-      videoRef.current.currentTime = time;
+    const video = getStageVideo();
+    if (video) {
+      video.currentTime = time;
       setCurrentTime(time);
       setRoomPlayback({
         isPlaying,
@@ -656,13 +1122,14 @@ export const RoomView: React.FC = () => {
 
   // Picture in Picture
   const togglePiP = async () => {
-    if (!videoRef.current) return;
+    const video = getStageVideo();
+    if (!video) return;
     try {
       if (document.pictureInPictureElement) {
         await document.exitPictureInPicture();
         setIsPiP(false);
       } else if (document.pictureInPictureEnabled) {
-        await videoRef.current.requestPictureInPicture();
+        await video.requestPictureInPicture();
         setIsPiP(true);
       }
     } catch (err) {
@@ -745,7 +1212,7 @@ export const RoomView: React.FC = () => {
   };
 
   return (
-    <div className="h-[calc(100vh-80px)] min-h-[600px] flex flex-col bg-[var(--bg-surface-1)] border border-[var(--border-strong)] rounded-2xl overflow-hidden text-[var(--text-primary)] select-none shadow-2xl transition-colors duration-200">
+    <div className="w-full h-full min-h-screen flex flex-col bg-[var(--bg-surface-1)] overflow-hidden text-[var(--text-primary)] select-none transition-colors duration-200">
       {/* Media Device Error Notification Banner */}
       {mediaDiagnosticError ? (
         <div className="mx-4 mt-2 p-3 bg-rose-500/15 border border-rose-500/30 rounded-xl flex items-center justify-between text-xs text-rose-200 animate-fadeIn z-30 shadow-md">
@@ -897,6 +1364,48 @@ export const RoomView: React.FC = () => {
                   isFullscreen ? 'fixed inset-0 z-50 rounded-none border-none' : ''
                 }`}
               >
+                {/* Phase 6.10: the host's local movie source <video>. Always
+                    mounted (so the ref exists the moment a file is picked);
+                    it becomes the visible Watch stage once the movie is
+                    loading/active. Its stream is captured and shared over
+                    WebRTC — the file itself never leaves this device. */}
+                {isHost && (
+                  <video
+                    ref={localMovieVideoRef}
+                    autoPlay
+                    playsInline
+                    onClick={enableHostMovieSound}
+                    className={`${
+                      isHostMovieStageVisible
+                        ? 'relative w-full h-full object-contain z-10'
+                        : 'w-0 h-0 opacity-0 pointer-events-none absolute'
+                    }`}
+                    onLoadedMetadata={() => {
+                      const v = localMovieVideoRef.current;
+                      if (v) setDuration(v.duration || 0);
+                    }}
+                    onTimeUpdate={() => {
+                      const v = localMovieVideoRef.current;
+                      if (v) {
+                        setCurrentTime(v.currentTime);
+                        setDuration(v.duration || 0);
+                      }
+                    }}
+                    onEnded={() => {
+                      setIsPlaying(false);
+                      if (isHost) {
+                        setRoomPlayback({ isPlaying: false, position: 0 });
+                      }
+                    }}
+                    onError={() => {
+                      if (localMovieStatusRef.current === 'loading') {
+                        setLocalMovieError("This video format isn't supported by your browser.");
+                        setLocalMovieStatus('error');
+                      }
+                    }}
+                  />
+                )}
+
                 {isAnyScreenSharingActive ? (
                   /* Screen Share Stage View */
                   <div className="relative w-full h-full flex items-center justify-center bg-slate-950">
@@ -944,7 +1453,155 @@ export const RoomView: React.FC = () => {
                       </div>
                     )}
                   </div>
-                ) : currentRoom.currentMedia ? (
+                ) : isLocalMovieMedia ? (
+                  /* Phase 6.10 — Local Movie Stage. The host sees their own
+                     captured <video> (rendered above); guests see the host's
+                     movie stream arriving over WebRTC. No URL ever exists
+                     here — the file lives only on the host's device. */
+                  <div className="relative w-full h-full flex items-center justify-center bg-slate-950">
+                    {!isHost && !hasRemoteMovieStream && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center text-white space-y-2 bg-black/60 backdrop-blur-xs">
+                        <div className="w-6 h-6 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin mb-1" />
+                        <p className="text-xs text-gray-300">
+                          Connecting to {localMovieHostName}'s live movie stream...
+                        </p>
+                      </div>
+                    )}
+
+                    {!isHost && hasRemoteMovieStream && remoteMovieStream && (
+                      <video
+                        ref={remoteMovieStageVideoRef}
+                        autoPlay
+                        playsInline
+                        className="w-full h-full object-contain"
+                        onLoadedMetadata={() => {
+                          const v = remoteMovieStageVideoRef.current;
+                          if (v) {
+                            setDuration(v.duration || 0);
+                            console.log('[MOVIE AUDIO DEBUG] GUEST VIDEO ELEMENT', {
+                              ts: new Date().toISOString(),
+                              muted: v.muted,
+                              volume: v.volume,
+                              paused: v.paused,
+                              autoplay: v.autoplay,
+                              readyState: v.readyState,
+                              srcObject: v.srcObject ? `MediaStream(${v.srcObject.id})` : null,
+                              audioTracks: (v as any).audioTracks ? (v as any).audioTracks.length : 'n/a',
+                              videoTracks: (v as any).videoTracks ? (v as any).videoTracks.length : 'n/a',
+                            });
+                          }
+                        }}
+                        onTimeUpdate={() => {
+                          const v = remoteMovieStageVideoRef.current;
+                          if (v) {
+                            setCurrentTime(v.currentTime);
+                            setDuration(v.duration || 0);
+                          }
+                        }}
+                        onPlaying={() => {
+                          const v = remoteMovieStageVideoRef.current;
+                          if (v && !v.muted) setMovieSoundBlocked(false);
+                        }}
+                        onEnded={() => setIsPlaying(false)}
+                      />
+                    )}
+
+                    {/* Phase 6.10 audio fix — guest autoplay-with-sound blocked:
+                        the remote movie element is NEVER force-muted; instead
+                        a user-gesture control restores audio. */}
+                    {!isHost && hasRemoteMovieStream && movieSoundBlocked && (
+                      <div className="absolute top-14 left-1/2 -translate-x-1/2 z-40 bg-black/85 backdrop-blur-md border border-[var(--accent)]/50 text-white px-4 py-2 rounded-2xl shadow-2xl flex items-center gap-3">
+                        <AudioOn className="w-4 h-4 text-[var(--accent)] animate-pulse" />
+                        <span className="text-xs font-semibold">
+                          Movie sound is blocked by your browser — click to enable.
+                        </span>
+                        <button
+                          onClick={enableGuestMovieSound}
+                          className="px-3 py-1 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-xs font-bold rounded-xl cursor-pointer transition-colors shadow"
+                        >
+                          Enable Movie Sound
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Phase 6.10 audio fix — host: browser exposed no captured
+                        audio track (movie still shared video-only). */}
+                    {isHost && localMovieStatus === 'active' && movieAudioWarning && (
+                      <div className="absolute top-14 left-1/2 -translate-x-1/2 z-40 bg-amber-500/20 backdrop-blur-md border border-amber-500/50 text-amber-200 px-4 py-2 rounded-2xl shadow-2xl flex items-center gap-2.5">
+                        <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                        <span className="text-xs font-semibold">{movieAudioWarning}</span>
+                        <button onClick={() => setMovieAudioWarning(null)} className="text-amber-300 hover:text-white cursor-pointer">
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Phase 6.10 audio fix — host: the movie element ended up
+                        muted (autoplay fallback); a click or the control bar
+                        restores sound without touching the WebRTC track. */}
+                    {isHost && localMovieStatus === 'active' && isMuted && (
+                      <div className="absolute top-14 left-1/2 -translate-x-1/2 z-40 bg-black/85 backdrop-blur-md border border-[var(--accent)]/50 text-white px-4 py-2 rounded-2xl shadow-2xl flex items-center gap-3">
+                        <VolumeX className="w-4 h-4 text-[var(--status-error)]" />
+                        <span className="text-xs font-semibold">Movie sound is muted — click to enable.</span>
+                        <button
+                          onClick={enableHostMovieSound}
+                          className="px-3 py-1 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-xs font-bold rounded-xl cursor-pointer transition-colors shadow"
+                        >
+                          Enable Movie Sound
+                        </button>
+                      </div>
+                    )}
+
+                    {isHost && localMovieStatus === 'error' && (
+                      <div className="absolute inset-0 z-30 bg-black/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center text-white space-y-3">
+                        <AlertTriangle className="w-10 h-10 text-amber-400 mx-auto" />
+                        <div>
+                          <p className="text-sm font-bold text-white font-heading">
+                            This video format isn't supported by your browser.
+                          </p>
+                          <p className="text-xs text-gray-300 max-w-sm mt-1">
+                            {localMovieError || 'The selected container or codec cannot be played on this device.'}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-2 pt-1">
+                          <button
+                            onClick={() => setShowMediaPicker(true)}
+                            className="px-3.5 h-8 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-xs font-bold rounded-xl transition-all cursor-pointer shadow-md"
+                          >
+                            Choose Another Movie
+                          </button>
+                          <button
+                            onClick={() => {
+                              setLocalMovieError(null);
+                              setLocalMovieStatus('idle');
+                            }}
+                            className="px-3.5 h-8 bg-white/15 hover:bg-white/25 text-white text-xs font-bold rounded-xl border border-white/20 transition-all cursor-pointer"
+                          >
+                            Dismiss
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Subtle source indicator: guests see who is streaming. */}
+                    {!isHost && hasRemoteMovieStream && (
+                      <div className="absolute top-3 right-3 px-2.5 py-1 rounded-full bg-black/75 backdrop-blur-md border border-white/20 text-white text-[10px] font-mono font-bold flex items-center gap-1.5 shadow z-20">
+                        <Shield className="w-3 h-3 text-[var(--status-success)] shrink-0" />
+                        <span>Synced with Host</span>
+                      </div>
+                    )}
+
+                    {isHost && localMovieStatus === 'active' && (
+                      <button
+                        onClick={handleStopLocalMovie}
+                        className="absolute top-3 right-3 z-20 px-3 py-1.5 bg-rose-600/80 hover:bg-rose-600 text-white text-xs font-bold rounded-xl border border-white/20 shadow-lg cursor-pointer transition-colors"
+                        title="Stop streaming the local movie"
+                      >
+                        Stop Movie
+                      </button>
+                    )}
+                  </div>
+                ) : currentRoom.currentMedia && !isRawMkvUrl(currentRoom.currentMedia.url) ? (
                   <>
                     <video
                       ref={videoRef}
@@ -1114,6 +1771,32 @@ export const RoomView: React.FC = () => {
                       </div>
                     )}
                   </>
+                ) : currentRoom.currentMedia ? (
+                  /* A raw MKV should never reach <video src> — the server
+                     publishes the converted MP4 only. If a legacy path ever
+                     sets an MKV URL, show preparation status instead of the
+                     generic "Unable to Stream Video Source" error. */
+                  renderPreparingOverlay()
+                ) : mediaConversion?.status === 'processing' ? (
+                  renderPreparingOverlay(mediaConversion.title)
+                ) : mediaConversion?.status === 'failed' ? (
+                  <div className="absolute inset-0 z-30 bg-black/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center text-white space-y-3">
+                    <AlertTriangle className="w-10 h-10 text-rose-400 mx-auto" />
+                    <div>
+                      <p className="text-sm font-bold text-white font-heading">
+                        PraConnect couldn't prepare this video for browser playback.
+                      </p>
+                      <p className="text-xs text-gray-300 max-w-sm mt-1">
+                        The uploaded movie could not be converted on the server. Please try a different file (MP4, WebM, MOV, or MKV).
+                      </p>
+                    </div>
+                    <button
+                      onClick={clearMediaConversion}
+                      className="px-3.5 h-8 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-xs font-bold rounded-xl transition-all cursor-pointer shadow-md"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
                 ) : (
                   <div className="text-center p-6 text-white space-y-3">
                     <Tv className="w-12 h-12 text-[var(--accent)] mx-auto" />
@@ -1283,7 +1966,7 @@ export const RoomView: React.FC = () => {
                     )}
                   </div>
 
-                  {currentRoom.currentMedia && (
+                  {currentRoom.currentMedia && !isLocalMovieMedia && (
                     <div className="px-2.5 py-1 rounded-full bg-black/75 backdrop-blur-md border border-white/20 text-white text-[10px] font-mono font-bold">
                       {selectedQuality}
                     </div>
@@ -1951,79 +2634,49 @@ export const RoomView: React.FC = () => {
               </div>
             </div>
 
-            {/* Upload Error Banner */}
-            {uploadError && (
+            {/* Local Movie Error Banner */}
+            {localMovieError && (
               <div className="p-2.5 bg-rose-500/15 border border-rose-500/30 rounded-xl text-xs text-rose-300 flex items-center justify-between">
-                <span>{uploadError}</span>
-                <button onClick={() => setUploadError(null)} className="p-0.5 text-rose-300 hover:text-white cursor-pointer">
+                <span>{localMovieError}</span>
+                <button onClick={() => setLocalMovieError(null)} className="p-0.5 text-rose-300 hover:text-white cursor-pointer">
                   <X className="w-3.5 h-3.5" />
                 </button>
               </div>
             )}
 
-            {/* Persistent Video File Upload */}
+            {/* Phase 6.10: Play a Local Movie — shared peer-to-peer. The file
+                stays on the host's device; only lightweight metadata is sent
+                to the room. This flow NEVER uploads the file. */}
             <div className="pt-1">
+              <p className="text-[11px] font-bold text-[var(--text-tertiary)] uppercase tracking-wider mb-1.5">
+                Play a Local Movie
+              </p>
               <label
-                className={`w-full h-12 border border-dashed border-[var(--border-strong)] hover:border-[var(--accent)] bg-[var(--bg-canvas)] hover:bg-[var(--bg-surface-2)] rounded-xl flex items-center justify-center gap-2.5 text-xs font-bold text-[var(--text-secondary)] transition-all ${
-                  isUploadingMedia ? 'opacity-60 pointer-events-none' : 'cursor-pointer'
+                className={`w-full min-h-12 border border-dashed border-[var(--border-strong)] hover:border-[var(--accent)] bg-[var(--bg-canvas)] hover:bg-[var(--bg-surface-2)] rounded-xl flex items-center justify-center gap-2.5 px-3 text-xs font-bold text-[var(--text-secondary)] transition-all ${
+                  localMovieStatus === 'loading' ? 'opacity-60 pointer-events-none' : 'cursor-pointer'
                 }`}
-                onClick={() => {
-                  console.log('[Diagnostics] Upload button clicked - handler entered');
-                  console.warn('[Diagnostics] File input accept attribute (DOM, live):', mediaFileInputRef.current?.accept);
-                  console.warn('[Diagnostics] File input webkitdirectory (DOM, live):', mediaFileInputRef.current?.webkitdirectory);
-                }}
               >
-                {isUploadingMedia ? (
+                {localMovieStatus === 'loading' ? (
                   <>
                     <div className="w-4 h-4 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
-                    <span>Uploading movie to room storage...</span>
+                    <span>Preparing your local movie...</span>
                   </>
                 ) : (
                   <>
-                    <FileVideo className="w-4 h-4 text-[var(--accent)]" />
-                    <span>Upload Local Movie File (MP4, WebM, MOV)</span>
+                    <FileVideo className="w-4 h-4 text-[var(--accent)] shrink-0" />
+                    <span className="flex flex-col text-left leading-tight">
+                      <span className="text-xs font-bold text-[var(--text-primary)]">Play Local Movie</span>
+                      <span className="text-[10px] font-medium text-[var(--text-tertiary)]">
+                        Your video stays on your device and streams directly to your squad.
+                      </span>
+                    </span>
                     <input
                       ref={mediaFileInputRef}
                       type="file"
-                      accept="video/mp4,video/webm,video/quicktime,.mp4,.webm,.mov"
+                      accept={LOCAL_MOVIE_ACCEPT}
                       className="hidden"
-                      disabled={isUploadingMedia}
-                      onChange={async (e) => {
-                        const file = e.target.files?.[0];
-                        e.target.value = '';
-                        if (file) {
-                          console.log('[Diagnostics] [Client File Selection]:', {
-                            name: file.name,
-                            size: file.size,
-                            type: file.type,
-                            lastModified: file.lastModified,
-                          });
-
-                          const isVideoType = file.type.startsWith('video/');
-                          const allowedExtensions = ['.mp4', '.webm', '.mov'];
-                          const hasAllowedExtension = allowedExtensions.some((ext) => file.name.toLowerCase().endsWith(ext));
-
-                          if (!isVideoType || !hasAllowedExtension) {
-                            setUploadError('Please select a video file (MP4, WebM, or MOV).');
-                            return;
-                          }
-
-                          if (file.size === 0) {
-                            setUploadError('Selected file appears to be empty (0 bytes) — please ensure the file is completely saved on disk and try selecting it again.');
-                            return;
-                          }
-
-                          setUploadError(null);
-                          setIsUploadingMedia(true);
-                          const res = await uploadRoomMedia(file);
-                          setIsUploadingMedia(false);
-                          if (res.ok) {
-                            setShowMediaPicker(false);
-                          } else {
-                            setUploadError(res.error || 'Failed to upload video file.');
-                          }
-                        }
-                      }}
+                      disabled={localMovieStatus === 'loading'}
+                      onChange={handleLocalMovieFile}
                     />
                   </>
                 )}

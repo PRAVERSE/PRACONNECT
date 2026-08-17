@@ -5,6 +5,18 @@
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+/* Full-viewport root: the app shell (and full-bleed pages like the Room)
+   must be able to reach the viewport edges without any default margins. */
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  min-height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
 :root, [data-theme="dark"], .dark {
   color-scheme: dark;
   /* ── Core Design Tokens (monochrome — brightness & opacity only) ───────── */

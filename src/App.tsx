@@ -27,7 +27,10 @@ const MainContent: React.FC = () => {
 
   return (
     <main className="flex-1 overflow-y-auto min-w-0 w-full bg-[var(--bg-canvas)] text-[var(--text-primary)] relative z-10 transition-colors duration-200">
-      <div key={activeTab} className="animate-fade-in-up h-full w-full px-4 sm:px-8 md:px-16 py-8 md:py-10 md:pb-20">
+      <div
+        key={activeTab}
+        className={`animate-fade-in-up h-full w-full ${activeTab === 'room' ? '' : 'px-4 sm:px-8 md:px-16 py-8 md:py-10 md:pb-20'}`}
+      >
         {activeTab === 'dashboard' && <DashboardView />}
         {activeTab === 'explore' && <ExploreView />}
         {activeTab === 'games' && <GamesView />}
