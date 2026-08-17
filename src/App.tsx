@@ -46,7 +46,7 @@ const MainContent: React.FC = () => {
 };
 
 const AppShell: React.FC = () => {
-  const { notifications, markNotificationRead, joinRoom } = useApp();
+  const { notifications, markNotificationRead, joinRoom, startDm } = useApp();
   const [portalActive, setPortalActive] = useState(false);
   const [recapModalOpen, setRecapModalOpen] = useState(false);
 
@@ -71,6 +71,10 @@ const AppShell: React.FC = () => {
         notifications={notifications}
         onDismiss={(id) => markNotificationRead(id)}
         onAction={(item) => {
+          if (item.friendId) {
+            startDm(item.friendId);
+            return;
+          }
           if (item.roomCode) {
             setPortalActive(true);
             setTimeout(() => {

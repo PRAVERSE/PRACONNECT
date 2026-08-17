@@ -54,6 +54,29 @@ import {
 import { WebRTCManager } from '../webrtc/WebRTCManager';
 import { MediaDiagnosticError, logRoomEntryDeviceDiagnostics } from '../webrtc/mediaDeviceDiagnostics';
 import { fetchProfileStatsApi } from '../api/profile';
+import {
+  searchUsersApi,
+  sendFriendRequestApi,
+  fetchFriendsApi,
+  fetchFriendRequestsApi,
+  acceptFriendRequestApi,
+  rejectFriendRequestApi,
+  fetchConversationsApi,
+  fetchMessagesApi,
+  sendDirectMessageApi,
+  fetchWatchInvitesApi,
+  sendWatchInviteApi,
+  acceptWatchInviteApi,
+  declineWatchInviteApi,
+  connectUserEvents,
+  SocialUser,
+  FriendRequestItem,
+  WatchInviteItem,
+  ConversationSummary,
+  FriendListItem,
+  DirectMessageItem
+} from '../api/social';
+import { mapSearchResponse } from '../social/directory';
 
 interface AppContextType {
   activeTab: NavigationTab;
@@ -163,7 +186,32 @@ interface AppContextType {
   dmConversations: Record<string, DirectMessage[]>;
   sendDirectMessage: (friendId: string, text: string) => void;
   addFriend: (username: string) => void;
-  acceptFriendRequest: (friendId: string) => void;
+  acceptFriendRequest: (requestId: string) => void;
+  rejectFriendRequest: (requestId: string) => void;
+  friendRequests: { incoming: FriendRequestItem[]; outgoing: FriendRequestItem[] };
+  refreshSocial: () => Promise<void>;
+
+  // Watch invitations
+  watchInvites: WatchInviteItem[];
+  sendWatchInvite: (recipientUserId: string, roomId: string) => Promise<void>;
+  acceptWatchInvite: (inviteId: string) => Promise<boolean>;
+  declineWatchInvite: (inviteId: string) => void;
+
+  // Direct message conversations (server-backed)
+  conversations: ConversationSummary[];
+  openConversation: (friendId: string) => Promise<void>;
+  /** Open (or create) a DM with an accepted friend and jump to the Messages
+   *  page. The server remains authoritative: non-friends are rejected with
+   *  FRIENDSHIP_REQUIRED. */
+  startDm: (friendId: string) => void;
+
+  // Find Friends directory
+  searchResults: SocialUser[];
+  searchTotal: number;
+  searchNextOffset: number;
+  searchUsers: (query: string, offset?: number) => Promise<void>;
+  clearSearch: () => void;
+  sendFriendRequestToUser: (userId: string) => Promise<boolean>;
   
   // Notifications
   notifications: NotificationItem[];
@@ -248,6 +296,27 @@ function mapServerMemberToParticipant(m: ServerRoomMember, currentUserId: string
   };
 }
 
+function mapFriendListItemToFriend(item: FriendListItem): Friend {
+  return {
+    id: item.id,
+    name: item.name,
+    username: item.username,
+    avatar: item.avatar,
+    status: item.online ? 'online' : 'offline',
+    currentRoomCode: item.currentRoomCode ?? undefined,
+    currentRoomName: item.currentRoomName ?? undefined,
+  };
+}
+
+function mapDirectMessageItem(item: DirectMessageItem): DirectMessage {
+  return {
+    id: item.id,
+    senderId: item.senderId,
+    text: item.text,
+    timestamp: new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+  };
+}
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [activeTab, setActiveTab] = useState<NavigationTab>('dashboard');
   
@@ -291,6 +360,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Direct Messages State
   const [activeDMId, setActiveDMId] = useState<string | null>(null);
   const [dmConversations, setDmConversations] = useState<Record<string, DirectMessage[]>>({});
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+
+  // Social state (server-backed)
+  const [friendRequests, setFriendRequests] = useState<{
+    incoming: FriendRequestItem[];
+    outgoing: FriendRequestItem[];
+  }>({ incoming: [], outgoing: [] });
+  const [watchInvites, setWatchInvites] = useState<WatchInviteItem[]>([]);
+
+  // Find Friends directory
+  const [searchResults, setSearchResults] = useState<SocialUser[]>([]);
+  const [searchTotal, setSearchTotal] = useState(0);
+  const [searchNextOffset, setSearchNextOffset] = useState(0);
+  const searchQueryRef = useRef<string>('');
+  const searchRequestIdRef = useRef(0);
 
   // Room Specific State
   const [participants, setParticipants] = useState<Participant[]>([]);
@@ -573,6 +657,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setIsAuthenticated(false);
     setAuthState('unauthenticated');
     setRooms([]);
+    setFriends([]);
+    setFriendRequests({ incoming: [], outgoing: [] });
+    setWatchInvites([]);
+    setConversations([]);
+    setDmConversations({});
+    setActiveDMId(null);
+    clearSearch();
     setActiveTab('dashboard');
   };
 
@@ -957,35 +1048,299 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const sendDirectMessage = (friendId: string, text: string) => {
     if (!text.trim()) return;
-    const newMsg: DirectMessage = {
+    const optimistic: DirectMessage = {
       id: `dm-${Date.now()}`,
-      senderId: 'user',
+      senderId: currentUser?.id ?? 'user',
       text: text.trim(),
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     };
     setDmConversations((prev) => ({
       ...prev,
-      [friendId]: [...(prev[friendId] || []), newMsg]
+      [friendId]: [...(prev[friendId] || []), optimistic]
     }));
+    sendDirectMessageApi(friendId, text.trim()).then((res) => {
+      if (res.ok && res.data?.message) {
+        const serverMsg = mapDirectMessageItem(res.data.message);
+        setDmConversations((prev) => ({
+          ...prev,
+          [friendId]: (prev[friendId] || []).map((m) => (m.id === optimistic.id ? serverMsg : m))
+        }));
+        fetchConversationsApi().then((r) => {
+          if (r.ok && r.data) setConversations(r.data.conversations);
+        });
+      }
+    });
   };
 
-  const addFriend = (username: string) => {
-    if (!username.trim()) return;
-    const newFriend: Friend = {
-      id: `friend-${Date.now()}`,
-      name: username,
-      username: username.toLowerCase().replace(/\s+/g, ''),
-      avatar: username.charAt(0).toUpperCase(),
-      status: 'online'
+  /** Add a friend by @handle: resolves the username in the directory and sends a request. */
+  const addFriend = async (username: string) => {
+    const handle = username.trim().replace(/^@/, '');
+    if (!handle) return;
+    const res = await searchUsersApi(handle, 5, 0);
+    if (res.ok && res.data && res.data.users.length > 0) {
+      const exact = res.data.users.find((u) => u.username.toLowerCase() === handle.toLowerCase()) ?? res.data.users[0];
+      await sendFriendRequestToUser(exact.id);
+      refreshSocial();
+    }
+  };
+
+  const acceptFriendRequest = (requestId: string) => {
+    acceptFriendRequestApi(requestId).then(() => refreshSocial());
+  };
+
+  const rejectFriendRequest = (requestId: string) => {
+    rejectFriendRequestApi(requestId).then(() => refreshSocial());
+  };
+
+  /** Send a friend request to a directory user; returns whether the server accepted it. */
+  const sendFriendRequestToUser = async (userId: string): Promise<boolean> => {
+    const res = await sendFriendRequestApi(userId);
+    if (res.ok) {
+      refreshSocial();
+      return true;
+    }
+    return false;
+  };
+
+  /** Full social-state refresh: friends, requests, conversations, watch invites. */
+  const refreshSocial = useCallback(async () => {
+    const [friendsRes, requestsRes, conversationsRes, invitesRes] = await Promise.all([
+      fetchFriendsApi(),
+      fetchFriendRequestsApi(),
+      fetchConversationsApi(),
+      fetchWatchInvitesApi(),
+    ]);
+    if (friendsRes.ok && friendsRes.data) {
+      setFriends(friendsRes.data.friends.map(mapFriendListItemToFriend));
+    }
+    if (requestsRes.ok && requestsRes.data) {
+      setFriendRequests({
+        incoming: requestsRes.data.incoming,
+        outgoing: requestsRes.data.outgoing,
+      });
+    }
+    if (conversationsRes.ok && conversationsRes.data) {
+      setConversations(conversationsRes.data.conversations);
+    }
+    if (invitesRes.ok && invitesRes.data) {
+      setWatchInvites(invitesRes.data.invites);
+    }
+  }, []);
+
+  /** Load (or reload) message history for a conversation. */
+  const openConversation = useCallback(async (friendId: string) => {
+    const res = await fetchMessagesApi(friendId, 50);
+    if (res.ok && res.data) {
+      setDmConversations((prev) => ({
+        ...prev,
+        [friendId]: res.data!.messages.map(mapDirectMessageItem),
+      }));
+    }
+  }, []);
+
+  /**
+   * Start a DM with an accepted friend: jump to the Messages page, select the
+   * friend, and load/create the conversation through the existing server flow.
+   * If the friendship is not accepted, the server returns FRIENDSHIP_REQUIRED
+   * and no conversation is created.
+   */
+  const startDm = useCallback(
+    (friendId: string) => {
+      setActiveDMId(friendId);
+      void openConversation(friendId);
+      setActiveTab('messages');
+    },
+    [openConversation]
+  );
+
+  const sendWatchInvite = async (recipientUserId: string, roomId: string) => {
+    const res = await sendWatchInviteApi(recipientUserId, roomId);
+    if (res.ok && res.data) {
+      setWatchInvites((prev) => {
+        if (prev.some((i) => i.id === res.data!.invite.id)) return prev;
+        return [...prev, res.data!.invite];
+      });
+    }
+  };
+
+  const acceptWatchInvite = async (inviteId: string): Promise<boolean> => {
+    const res = await acceptWatchInviteApi(inviteId);
+    refreshSocial();
+    if (res.ok && res.data?.roomCode) {
+      return joinRoom(res.data.roomCode);
+    }
+    return false;
+  };
+
+  const declineWatchInvite = (inviteId: string) => {
+    declineWatchInviteApi(inviteId).then(() => refreshSocial());
+  };
+
+  /** Push an in-app notification toast/modal item. */
+  const pushNotification = useCallback((item: Omit<NotificationItem, 'id' | 'time' | 'read'>) => {
+    const now = new Date();
+    const notification: NotificationItem = {
+      ...item,
+      id: `notif-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      read: false,
     };
-    setFriends((prev) => [...prev, newFriend]);
-  };
+    setNotifications((prev) => [notification, ...prev].slice(0, 50));
+  }, []);
 
-  const acceptFriendRequest = (friendId: string) => {
-    setFriends((prev) =>
-      prev.map((f) => (f.id === friendId ? { ...f, requestPending: false, status: 'online' } : f))
-    );
-  };
+  // ─── User-scoped social event stream (SSE) ────────────────────────────────
+  const activeDMIdRef = useRef<string | null>(null);
+  activeDMIdRef.current = activeDMId;
+
+  useEffect(() => {
+    if (!isAuthenticated || !currentUser?.id) return;
+    refreshSocial();
+
+    const cleanupSse = connectUserEvents({
+      onEvent: (type, rawPayload) => {
+        const payload = rawPayload as any;
+        const myId = currentUser?.id;
+        const currentDMId = activeDMIdRef.current;
+
+        switch (type) {
+          case 'friend:request': {
+            const requester = payload?.requester as SocialUser | undefined;
+            if (requester) {
+              pushNotification({
+                title: 'New friend request',
+                message: `${requester.name} (@${requester.username}) sent you a friend request.`,
+                type: 'friend_request',
+              });
+            }
+            refreshSocial();
+            break;
+          }
+          case 'friend:accepted': {
+            const friend = payload?.friend as SocialUser | undefined;
+            if (friend) {
+              pushNotification({
+                title: 'Friend request accepted',
+                message: `You're now friends with ${friend.name} (@${friend.username}). You can message them now.`,
+                type: 'system',
+                friendId: friend.id,
+              });
+            }
+            refreshSocial();
+            break;
+          }
+          case 'watch:invite': {
+            const invite = payload?.invite as WatchInviteItem | undefined;
+            if (invite) {
+              setWatchInvites((prev) => {
+                if (prev.some((i) => i.id === invite!.id)) return prev;
+                return [...prev, invite!];
+              });
+              if (invite.roomAlive) {
+                pushNotification({
+                  title: 'Watch invitation',
+                  message: `${invite.sender.name} invited you to watch in "${invite.roomName}".`,
+                  type: 'invite',
+                  roomCode: invite.roomCode,
+                });
+              }
+            }
+            break;
+          }
+          case 'watch:invite:accepted':
+          case 'watch:invite:declined': {
+            const inviteId = payload?.inviteId as string | undefined;
+            const recipientId = payload?.recipientId as string | undefined;
+            if (inviteId) {
+              setWatchInvites((prev) =>
+                prev.map((i) =>
+                  i.id === inviteId
+                    ? { ...i, status: type === 'watch:invite:accepted' ? 'accepted' : 'declined' }
+                    : i
+                )
+              );
+            }
+            if (recipientId && recipientId !== myId) {
+              refreshSocial();
+            }
+            break;
+          }
+          case 'dm:new': {
+            const msg = payload?.message as DirectMessageItem | undefined;
+            if (msg) {
+              const myIdForDm = currentUser?.id;
+              const conversationKey =
+                msg.recipientId === myIdForDm ? msg.senderId : (msg.recipientId ?? msg.senderId);
+              setDmConversations((prev) => {
+                if (currentDMId === conversationKey) {
+                  return {
+                    ...prev,
+                    [conversationKey]: [...(prev[conversationKey] || []), mapDirectMessageItem(msg)],
+                  };
+                }
+                return prev;
+              });
+              fetchConversationsApi().then((res) => {
+                if (res.ok && res.data) setConversations(res.data.conversations);
+              });
+              const senderName = payload?.senderName as string | undefined;
+              if (msg.senderId !== myId) {
+                pushNotification({
+                  title: 'New direct message',
+                  message: `${senderName || 'A friend'} sent you a message.`,
+                  type: 'system',
+                });
+              }
+            }
+            break;
+          }
+        }
+      },
+    });
+
+    return () => {
+      cleanupSse();
+    };
+  }, [isAuthenticated, currentUser?.id, refreshSocial, pushNotification]);
+
+  // ─── Find Friends directory ───────────────────────────────────────────────
+  const searchUsers = useCallback(async (query: string, offset = 0) => {
+    const requestId = ++searchRequestIdRef.current;
+    searchQueryRef.current = query.trim();
+    console.log('[FRIENDS DEBUG] search request', { query, limit: 50, offset });
+    const res = await searchUsersApi(query, 50, offset);
+    if (requestId !== searchRequestIdRef.current) return; // stale response
+    if (!res.ok || !res.data) {
+      console.log('[FRIENDS DEBUG] search response failed', { ok: res.ok, error: res.error });
+      return;
+    }
+    const page = mapSearchResponse(res.data);
+    console.log('[FRIENDS DEBUG] search response', {
+      status: res.ok ? 200 : 0,
+      userCount: page.users.length,
+      total: page.total,
+      nextOffset: page.nextOffset,
+    });
+    if (offset === 0) {
+      setSearchResults(page.users);
+    } else {
+      setSearchResults((prev) => [...prev, ...page.users]);
+    }
+    setSearchTotal(page.total);
+    setSearchNextOffset(page.nextOffset);
+    console.log('[FRIENDS DEBUG] state updated', {
+      query: query.trim(),
+      count: page.users.length,
+      total: page.total,
+    });
+  }, []);
+
+  const clearSearch = useCallback(() => {
+    searchRequestIdRef.current++;
+    searchQueryRef.current = '';
+    setSearchResults([]);
+    setSearchTotal(0);
+    setSearchNextOffset(0);
+  }, []);
 
   const markNotificationRead = (id: string) => {
     setNotifications((prev) =>
@@ -1317,6 +1672,22 @@ participants,
         sendDirectMessage,
         addFriend,
         acceptFriendRequest,
+        rejectFriendRequest,
+        friendRequests,
+        refreshSocial,
+        watchInvites,
+        sendWatchInvite,
+        acceptWatchInvite,
+        declineWatchInvite,
+        conversations,
+        openConversation,
+        startDm,
+        searchResults,
+        searchTotal,
+        searchNextOffset,
+        searchUsers,
+        clearSearch,
+        sendFriendRequestToUser,
         notifications,
         markNotificationRead,
         clearAllNotifications,

@@ -170,6 +170,8 @@ export interface NotificationItem {
   read: boolean;
   type: 'invite' | 'friend_request' | 'system';
   roomCode?: string;
+  /** Peer user id for friend-accepted toasts — renders a "Message" action. */
+  friendId?: string;
 }
 
 export interface UserSettings {

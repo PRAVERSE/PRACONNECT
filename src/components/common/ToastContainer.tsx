@@ -91,6 +91,17 @@ const ToastItem: React.FC<{
             Join Watch Room Now &rarr;
           </button>
         )}
+        {toast.friendId && (
+          <button
+            onClick={() => {
+              onAction();
+              handleClose();
+            }}
+            className="mt-2 text-[11px] font-bold text-[var(--text-primary)] underline underline-offset-2 decoration-[var(--border-strong)] flex items-center gap-1 cursor-pointer"
+          >
+            Message &rarr;
+          </button>
+        )}
       </div>
 
       <button

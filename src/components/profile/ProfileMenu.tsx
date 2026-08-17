@@ -17,8 +17,13 @@ import { useApp } from '../../context/AppContext';
 import { NavigationTab } from '../../types';
 import { UserAvatar } from '../common/UserAvatar';
 import { SlidingTabs } from '../common/SlidingTabs';
+import { SocialUser } from '../../api/social';
+import {
+  directoryRelationship,
+  relationshipActions,
+} from '../../social/directory';
 
-const FRIENDS_TABS = ['Online', 'Offline', 'Requests', 'Suggestions'] as const;
+const FRIENDS_TABS = ['Online', 'Offline', 'Requests', 'Find Friends'] as const;
 type FriendsTab = (typeof FRIENDS_TABS)[number];
 
 interface ProfileMenuProps {
@@ -60,11 +65,19 @@ interface FriendsPanelBodyProps {
 const FriendsPanelBody: React.FC<FriendsPanelBodyProps> = ({ initialTab, onClose, onManageFull }) => {
   const {
     friends,
+    friendRequests,
     setActiveTab,
-    setActiveDMId,
+    startDm,
     addFriend,
     acceptFriendRequest,
-    joinRoom
+    rejectFriendRequest,
+    joinRoom,
+    searchResults,
+    searchTotal,
+    searchNextOffset,
+    searchUsers,
+    clearSearch,
+    sendFriendRequestToUser
   } = useApp();
 
   const [activeTabSection, setActiveTabSection] = useState<FriendsTab>(initialTab);
@@ -78,15 +91,20 @@ const FriendsPanelBody: React.FC<FriendsPanelBodyProps> = ({ initialTab, onClose
     setTimeout(() => setCopiedLink(false), 2000);
   };
 
+  const incomingRequests = friendRequests.incoming;
+  const outgoingRequests = friendRequests.outgoing;
+
   const matchesTab = (f: (typeof friends)[number], tab: FriendsTab) => {
-    if (tab === 'Online') return f.status === 'online' && !f.requestPending && !f.isSuggestion;
-    if (tab === 'Offline') return f.status === 'offline' && !f.requestPending && !f.isSuggestion;
-    if (tab === 'Requests') return Boolean(f.requestPending);
-    if (tab === 'Suggestions') return Boolean(f.isSuggestion);
+    if (tab === 'Online') return f.status === 'online';
+    if (tab === 'Offline') return f.status === 'offline';
     return true;
   };
 
-  const countFor = (tab: FriendsTab) => friends.filter((f) => matchesTab(f, tab)).length;
+  const countFor = (tab: FriendsTab) => {
+    if (tab === 'Requests') return incomingRequests.length;
+    if (tab === 'Online' || tab === 'Offline') return friends.filter((f) => matchesTab(f, tab)).length;
+    return 0;
+  };
 
   const filteredFriends = friends.filter((f) => {
     const matchesSearch =
@@ -101,9 +119,75 @@ const FriendsPanelBody: React.FC<FriendsPanelBodyProps> = ({ initialTab, onClose
       ? "No one's around yet."
       : activeTabSection === 'Requests'
       ? 'No pending friend requests.'
-      : activeTabSection === 'Suggestions'
-      ? 'No suggestions right now.'
+      : activeTabSection === 'Find Friends'
+      ? 'Find people to watch with.'
       : 'No offline friends.';
+
+  const incomingFrom = (userId: string) => incomingRequests.find((r) => r.user.id === userId);
+  const outgoingTo = (userId: string) => outgoingRequests.find((r) => r.user.id === userId);
+
+  const renderDirectoryRow = (user: SocialUser) => {
+    const relationship = directoryRelationship(user.id, friends, incomingRequests, outgoingRequests);
+    const actions = relationshipActions(relationship);
+    const incoming = relationship === 'incoming_pending' ? incomingFrom(user.id) : undefined;
+    const outgoing = relationship === 'outgoing_pending' ? outgoingTo(user.id) : undefined;
+    return (
+      <div
+        key={user.id}
+        className="flex items-center justify-between gap-2 px-2 py-2.5 rounded-xl hover:bg-[var(--bg-glass)] transition-colors"
+      >
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="relative shrink-0">
+            <UserAvatar
+              avatar={user.avatarUrl || user.name.charAt(0).toUpperCase()}
+              name={user.name}
+              className="w-9 h-9 font-bold text-xs"
+            />
+          </div>
+          <div className="min-w-0">
+            <div className="font-display text-xs font-semibold text-[var(--text-primary)] truncate">
+              {user.name}
+            </div>
+            <div className="text-[11px] text-[var(--text-secondary)] truncate">@{user.username}</div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1.5 shrink-0">
+          {actions.showMessage ? (
+            <>
+              <span className="btn-secondary text-[11px] px-3 py-1.5 opacity-60 cursor-default">
+                Friends
+              </span>
+              <button
+                onClick={() => startDm(user.id)}
+                className="btn-secondary text-[11px] px-3 py-1.5"
+              >
+                Message
+              </button>
+            </>
+          ) : actions.showAccept && incoming ? (
+            <button
+              onClick={() => acceptFriendRequest(incoming!.id)}
+              className="btn-primary text-[11px] px-3 py-1.5"
+            >
+              Accept
+            </button>
+          ) : actions.showRequested && outgoing ? (
+            <span className="btn-secondary text-[11px] px-3 py-1.5 opacity-60 cursor-default">
+              Requested
+            </span>
+          ) : actions.showAddFriend ? (
+            <button
+              onClick={() => sendFriendRequestToUser(user.id)}
+              className="btn-primary text-[11px] px-3 py-1.5"
+            >
+              Add
+            </button>
+          ) : null}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="flex-1 min-h-0 flex flex-col overflow-y-auto no-scrollbar">
@@ -112,9 +196,16 @@ const FriendsPanelBody: React.FC<FriendsPanelBodyProps> = ({ initialTab, onClose
         <div className="relative">
           <input
             type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search friends..."
+            value={activeTabSection === 'Find Friends' ? searchQuery : searchQuery}
+            onChange={(e) => {
+              const value = e.target.value;
+              setSearchQuery(value);
+              if (activeTabSection === 'Find Friends') {
+                searchUsers(value, 0);
+                if (!value.trim()) clearSearch();
+              }
+            }}
+            placeholder={activeTabSection === 'Find Friends' ? 'Search people or @username...' : 'Search friends...'}
             className="field w-full pl-10 pr-8 text-[13px] py-2"
             aria-label="Search friends"
           />
@@ -124,7 +215,10 @@ const FriendsPanelBody: React.FC<FriendsPanelBodyProps> = ({ initialTab, onClose
           />
           {searchQuery && (
             <button
-              onClick={() => setSearchQuery('')}
+              onClick={() => {
+                setSearchQuery('');
+                if (activeTabSection === 'Find Friends') clearSearch();
+              }}
               className="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] transition-colors rounded-full cursor-pointer"
               aria-label="Clear search query"
             >
@@ -171,9 +265,103 @@ const FriendsPanelBody: React.FC<FriendsPanelBodyProps> = ({ initialTab, onClose
         />
       </div>
 
-      {/* Friends List */}
+      {/* Content */}
       <div className="flex-1 min-h-0 px-2 py-2">
-        {filteredFriends.length > 0 ? (
+        {activeTabSection === 'Requests' ? (
+          incomingRequests.length > 0 || outgoingRequests.length > 0 ? (
+            <div className="flex flex-col">
+              {incomingRequests.map((req) => (
+                <div
+                  key={req.id}
+                  className="flex items-center justify-between gap-2 px-2 py-2.5 rounded-xl hover:bg-[var(--bg-glass)] transition-colors"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <UserAvatar
+                      avatar={req.user.avatarUrl || req.user.name.charAt(0).toUpperCase()}
+                      name={req.user.name}
+                      className="w-9 h-9 font-bold text-xs"
+                    />
+                    <div className="min-w-0">
+                      <div className="font-display text-xs font-semibold text-[var(--text-primary)] truncate">
+                        {req.user.name}
+                      </div>
+                      <div className="text-[11px] text-[var(--text-secondary)] truncate">
+                        @{req.user.username}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      onClick={() => rejectFriendRequest(req.id)}
+                      className="btn-secondary text-[11px] px-2.5 py-1.5"
+                    >
+                      Decline
+                    </button>
+                    <button
+                      onClick={() => acceptFriendRequest(req.id)}
+                      className="btn-primary text-[11px] px-3 py-1.5"
+                    >
+                      Accept
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {outgoingRequests.map((req) => (
+                <div
+                  key={req.id}
+                  className="flex items-center justify-between gap-2 px-2 py-2.5 rounded-xl hover:bg-[var(--bg-glass)] transition-colors"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <UserAvatar
+                      avatar={req.user.avatarUrl || req.user.name.charAt(0).toUpperCase()}
+                      name={req.user.name}
+                      className="w-9 h-9 font-bold text-xs"
+                    />
+                    <div className="min-w-0">
+                      <div className="font-display text-xs font-semibold text-[var(--text-primary)] truncate">
+                        {req.user.name}
+                      </div>
+                      <div className="text-[11px] text-[var(--text-secondary)] truncate">
+                        @{req.user.username} · requested
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="h-full min-h-[140px] flex flex-col items-center justify-center text-center px-6">
+              <Users className="w-7 h-7 text-[var(--text-tertiary)] mb-2.5" strokeWidth={1.5} aria-hidden="true" />
+              <p className="text-xs text-[var(--text-primary)] font-semibold mb-1">
+                No pending friend requests.
+              </p>
+            </div>
+          )
+        ) : activeTabSection === 'Find Friends' ? (
+          searchResults.length > 0 ? (
+            <div className="flex flex-col">
+              {searchResults.map(renderDirectoryRow)}
+              {searchNextOffset < searchTotal && (
+                <button
+                  onClick={() => searchUsers(searchQuery, searchNextOffset)}
+                  className="btn-secondary text-[11px] w-full mt-1"
+                >
+                  Load more ({searchTotal - searchNextOffset} left)
+                </button>
+              )}
+            </div>
+          ) : (
+            <div className="h-full min-h-[140px] flex flex-col items-center justify-center text-center px-6">
+              <Users className="w-7 h-7 text-[var(--text-tertiary)] mb-2.5" strokeWidth={1.5} aria-hidden="true" />
+              <p className="text-xs text-[var(--text-primary)] font-semibold mb-1">
+                {searchQuery ? `No people found for "${searchQuery}"` : emptyTitle}
+              </p>
+              <p className="text-[11px] text-[var(--text-secondary)] leading-relaxed max-w-[220px]">
+                Search the directory by name or @username.
+              </p>
+            </div>
+          )
+        ) : filteredFriends.length > 0 ? (
           <div className="flex flex-col">
             {filteredFriends.map((friend) => (
               <div
@@ -213,45 +401,26 @@ const FriendsPanelBody: React.FC<FriendsPanelBodyProps> = ({ initialTab, onClose
                 </div>
 
                 <div className="flex items-center gap-1.5 shrink-0">
-                  {activeTabSection === 'Requests' ? (
+                  {friend.currentRoomCode && (
                     <button
-                      onClick={() => acceptFriendRequest(friend.id)}
-                      className="btn-primary text-[11px] px-3 py-1.5"
+                      onClick={() => {
+                        joinRoom(friend.currentRoomCode!);
+                        onClose();
+                      }}
+                      className="btn-secondary text-[11px] px-2.5 py-1.5"
                     >
-                      Accept
+                      Join
                     </button>
-                  ) : activeTabSection === 'Suggestions' ? (
-                    <button
-                      onClick={() => addFriend(friend.name)}
-                      className="btn-primary text-[11px] px-3 py-1.5"
-                    >
-                      Add
-                    </button>
-                  ) : (
-                    <>
-                      {friend.currentRoomCode && (
-                        <button
-                          onClick={() => {
-                            joinRoom(friend.currentRoomCode!);
-                            onClose();
-                          }}
-                          className="btn-secondary text-[11px] px-2.5 py-1.5"
-                        >
-                          Join
-                        </button>
-                      )}
-                      <button
-                        onClick={() => {
-                          setActiveDMId(friend.id);
-                          setActiveTab('messages');
-                          onClose();
-                        }}
-                        className="btn-secondary text-[11px] px-2.5 py-1.5"
-                      >
-                        Message
-                      </button>
-                    </>
                   )}
+                  <button
+                    onClick={() => {
+                      startDm(friend.id);
+                      onClose();
+                    }}
+                    className="btn-secondary text-[11px] px-2.5 py-1.5"
+                  >
+                    Message
+                  </button>
                 </div>
               </div>
             ))}
@@ -269,7 +438,7 @@ const FriendsPanelBody: React.FC<FriendsPanelBodyProps> = ({ initialTab, onClose
             <p className="text-[11px] text-[var(--text-secondary)] leading-relaxed max-w-[220px]">
               {searchQuery
                 ? 'Try a different name or clear the search.'
-                : 'Share your invite link to build your circle.'}
+                : 'Use Find Friends to build your circle.'}
             </p>
           </div>
         )}
@@ -300,13 +469,13 @@ const FriendsPanelBody: React.FC<FriendsPanelBodyProps> = ({ initialTab, onClose
 };
 
 export const ProfileMenu: React.FC<ProfileMenuProps> = ({ open, onClose, anchorRef }) => {
-  const { userProfile, friends, setActiveTab, logout } = useApp();
+  const { userProfile, friendRequests, setActiveTab, logout } = useApp();
 
   const menuRef = useRef<HTMLDivElement>(null);
   const [section, setSection] = useState<'menu' | 'friends'>('menu');
   const [friendsTab, setFriendsTab] = useState<FriendsTab>('Online');
 
-  const pendingRequestCount = friends.filter((f) => f.requestPending).length;
+  const pendingRequestCount = friendRequests.incoming.length;
 
   useEffect(() => {
     if (open) setSection('menu');
@@ -408,7 +577,7 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ open, onClose, anchorR
             badge={pendingRequestCount}
             onClick={() => openFriends('Requests')}
           />
-          <MenuRow icon={UserPlus} label="Find Friends" onClick={() => openFriends('Suggestions')} />
+          <MenuRow icon={UserPlus} label="Find Friends" onClick={() => openFriends('Find Friends')} />
           <div className="my-1.5 mx-2 h-px bg-[var(--border-hairline)]" />
           <MenuRow icon={Settings} label="Settings" onClick={() => navigate('settings')} />
           <MenuRow icon={LogOut} label="Logout" onClick={handleLogout} />
