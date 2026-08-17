@@ -1,21 +1,18 @@
-import React from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Tv,
   Compass,
   Gamepad2,
-  Users,
   MessageSquare,
   Bell,
-  Settings,
   Radio,
-  LogIn,
-  LogOut,
   Play
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { NavigationTab } from '../types';
 import { UserAvatar } from './common/UserAvatar';
 import { Tooltip } from './common/Tooltip';
+import { ProfileMenu } from './profile/ProfileMenu';
 
 export const Sidebar: React.FC = () => {
   const {
@@ -25,16 +22,18 @@ export const Sidebar: React.FC = () => {
     notifications,
     setNotificationsOpen,
     userProfile,
-    isAuthenticated,
-    logout,
     friends,
   } = useApp();
+
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const avatarWrapRef = useRef<HTMLDivElement>(null);
 
   const unreadCount = notifications.filter((n) => !n.read).length;
   const messageUnreadCount = friends.reduce(
     (sum, f) => sum + (typeof f.unreadCount === 'number' ? f.unreadCount : 0),
     0
   );
+  const pendingRequestCount = friends.filter((f) => f.requestPending).length;
 
   const iconGlyphClass = 'w-5 h-5';
 
@@ -42,7 +41,6 @@ export const Sidebar: React.FC = () => {
     { id: 'dashboard', label: 'Home', icon: <Tv className={iconGlyphClass} strokeWidth={1.7} /> },
     { id: 'explore', label: 'Explore', icon: <Compass className={iconGlyphClass} strokeWidth={1.7} /> },
     { id: 'games', label: 'Games', icon: <Gamepad2 className={iconGlyphClass} strokeWidth={1.7} /> },
-    { id: 'friends', label: 'Friends', icon: <Users className={iconGlyphClass} strokeWidth={1.7} /> },
     { id: 'messages', label: 'Messages', icon: <MessageSquare className={iconGlyphClass} strokeWidth={1.7} /> }
   ];
 
@@ -143,58 +141,45 @@ export const Sidebar: React.FC = () => {
           </button>
         </Tooltip>
 
-        {/* Settings */}
-        <Tooltip label="Settings" side="right">
-          <button
-            onClick={() => setActiveTab('settings')}
-            aria-current={activeTab === 'settings' ? 'page' : undefined}
-            className={iconButtonClass}
-          >
-            {activePill(activeTab === 'settings')}
-            {hoverWash}
-            <span className={iconState(activeTab === 'settings')}>
-              <Settings className={iconGlyphClass} strokeWidth={1.7} />
-            </span>
-          </button>
-        </Tooltip>
-
-        {/* Auth / Log Out */}
-        {isAuthenticated ? (
-          <Tooltip label="Log out" side="right">
-            <button onClick={logout} className={iconButtonClass}>
-              {hoverWash}
-              <span className="nav-icon relative z-10">
-                <LogOut className={iconGlyphClass} strokeWidth={1.7} />
-              </span>
+        {/* Profile — single social/account entry point */}
+        <Tooltip
+          label={`${userProfile.name || 'Profile'} — @${userProfile.username || 'user'}${
+            pendingRequestCount > 0
+              ? ` · ${pendingRequestCount} pending request${pendingRequestCount > 1 ? 's' : ''}`
+              : ''
+          }`}
+          side="right"
+        >
+          <div ref={avatarWrapRef} className="relative">
+            <button
+              onClick={() => setProfileMenuOpen((o) => !o)}
+              aria-haspopup="dialog"
+              aria-expanded={profileMenuOpen}
+              aria-label="Open profile menu"
+              className="relative w-11 h-11 rounded-full flex items-center justify-center cursor-pointer transition-transform duration-200 hover:scale-105 active:scale-95 group"
+            >
+              <UserAvatar
+                avatar={userProfile.avatar}
+                name={userProfile.name}
+                className="w-11 h-11 font-bold text-sm shadow-[0_4px_16px_var(--emphasis-dim)]"
+              />
+              <span className="absolute -bottom-0.5 -right-0.5 w-3 h-3 bg-[var(--text-primary)] rounded-full border-2 border-[var(--bg)]" />
             </button>
-          </Tooltip>
-        ) : (
-          <Tooltip label="Sign in" side="right">
-            <button onClick={() => setActiveTab('auth')} className={iconButtonClass}>
-              {hoverWash}
-              <span className="nav-icon relative z-10">
-                <LogIn className={iconGlyphClass} strokeWidth={1.7} />
+            {pendingRequestCount > 0 && (
+              <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-[var(--emphasis)] text-[var(--bg)] text-[9px] font-mono font-bold flex items-center justify-center shadow-[0_0_8px_var(--emphasis-glow)]">
+                {pendingRequestCount}
               </span>
-            </button>
-          </Tooltip>
-        )}
-
-        {/* Profile */}
-        <Tooltip label={`${userProfile.name || 'Profile'} — @${userProfile.username || 'user'}`} side="right">
-          <button
-            onClick={() => setActiveTab('profile')}
-            className="relative w-11 h-11 rounded-full flex items-center justify-center cursor-pointer transition-transform duration-200 hover:scale-105 active:scale-95 group"
-            aria-label="Open profile"
-          >
-            <UserAvatar
-              avatar={userProfile.avatar}
-              name={userProfile.name}
-              className="w-11 h-11 font-bold text-sm shadow-[0_4px_16px_var(--emphasis-dim)]"
-            />
-            <span className="absolute -bottom-0.5 -right-0.5 w-3 h-3 bg-[var(--text-primary)] rounded-full border-2 border-[var(--bg)]" />
-          </button>
+            )}
+          </div>
         </Tooltip>
       </div>
+
+      {/* Profile popover — profile, friends, requests, find friends, settings, logout */}
+      <ProfileMenu
+        open={profileMenuOpen}
+        onClose={() => setProfileMenuOpen(false)}
+        anchorRef={avatarWrapRef}
+      />
     </aside>
   );
 };
