@@ -963,11 +963,45 @@ rooms.post('/:id/chat', async (c) => {
     senderAvatar: sender.avatarUrl || sender.name.charAt(0).toUpperCase() || 'U',
     text: body.text.trim(),
     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    reaction: typeof body.reaction === 'string' ? body.reaction : undefined,
   };
 
   emit(room.id, 'chat:message', message);
   return c.json({ message }, 201);
+});
+
+// ─── Room Reactions ───────────────────────────────────────────────────────────
+// Reactions are TRANSIENT by design: they are broadcast to live room members
+// over the ephemeral SSE channel but never persisted to roomEvents, so they
+// never enter chat history and are never replayed after a reconnect/reload.
+
+rooms.post('/:id/reaction', async (c) => {
+  const roomId = c.req.param('id');
+  const userId = c.get('userId');
+  const guard = activeMemberGuard(c, roomId, userId);
+  if (guard) return guard;
+
+  const reactionLimit = rateLimit(c, `reaction:${userId}:${roomId}`, 'reaction');
+  if (reactionLimit) return reactionLimit;
+
+  const body = await readJson(c);
+  const emoji = typeof body?.emoji === 'string' ? body.emoji.trim() : '';
+  if (!emoji || emoji.length > 16) {
+    return c.json(apiError('VALIDATION_ERROR', 'A valid emoji is required.'), 400);
+  }
+
+  const room = getRoomOrNull(roomId);
+  if (!room) return c.json(apiError('ROOM_NOT_FOUND', 'Room not found.'), 404);
+
+  const sender = (db.prepare('SELECT name FROM users WHERE id = ?').get(userId) as
+    | { name: string }
+    | undefined) ?? { name: 'User' };
+
+  emitEphemeral(room.id, 'reaction', {
+    fromUserId: userId,
+    senderName: sender.name,
+    emoji,
+  });
+  return c.json({ ok: true }, 200);
 });
 
 // ─── WebRTC Signaling ───────────────────────────────────────────────────────

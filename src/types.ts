@@ -82,7 +82,6 @@ export interface ChatMessage {
   text: string;
   timestamp: string;
   isSystem?: boolean;
-  reaction?: string;
 }
 
 export interface Friend {

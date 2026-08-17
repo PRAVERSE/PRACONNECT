@@ -25,6 +25,7 @@ const { rooms, handleMediaServing, uploadsDir } = await import('../routes/rooms'
 const { requireAuth } = await import('../middleware/auth');
 const { createSession, SESSION_COOKIE_NAME } = await import('../auth/session');
 const { cleanupEmptyRooms, ROOM_EMPTY_TTL_MS } = await import('../rooms/service');
+const { lastEventId } = await import('../rooms/realtime');
 const { setFfmpegAvailabilityForTesting } = await import('../uploads/transcode');
 
 // Deterministic upload tests: MKV is rejected with CONVERSION_UNAVAILABLE
@@ -758,6 +759,65 @@ test('active member can send room chat; non-member is rejected with 403', async 
   // Non-member tries to send chat
   const rejected = await call(tokens.c, 'POST', `/api/rooms/${roomId}/chat`, { text: 'Intruder' });
   assert.equal(rejected.status, 403);
+});
+
+test('active member can send a reaction; non-member is rejected with 403; empty emoji is 400', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Reaction Room' });
+  const createdData = (await json(created)).room as { id: string };
+  const roomId = createdData.id;
+  await call(tokens.b, 'POST', `/api/rooms/${roomId}/join`, {});
+
+  // Member sends a reaction
+  const reactRes = await call(tokens.a, 'POST', `/api/rooms/${roomId}/reaction`, { emoji: '🎉' });
+  assert.equal(reactRes.status, 200);
+  const body = (await json(reactRes)) as { ok: boolean };
+  assert.equal(body.ok, true);
+
+  // Missing / empty emoji is rejected
+  const badEmpty = await call(tokens.b, 'POST', `/api/rooms/${roomId}/reaction`, {});
+  assert.equal(badEmpty.status, 400);
+
+  // Non-member cannot send reactions
+  const rejected = await call(tokens.c, 'POST', `/api/rooms/${roomId}/reaction`, { emoji: '❤️' });
+  assert.equal(rejected.status, 403);
+});
+
+test('reactions are ephemeral — never persisted as chat messages or room events', async () => {
+  const created = await call(tokens.a, 'POST', '/api/rooms', { name: 'Ephemeral Reactions' });
+  const createdData = (await json(created)).room as { id: string };
+  const roomId = createdData.id;
+  await call(tokens.b, 'POST', `/api/rooms/${roomId}/join`, {});
+
+  // A real chat message is still persisted as before
+  const chatRes = await call(tokens.a, 'POST', `/api/rooms/${roomId}/chat`, { text: 'hello squad' });
+  assert.equal(chatRes.status, 201);
+  const cursor = lastEventId(roomId);
+  assert.ok(cursor > 0, 'chat should have persisted an event');
+
+  // Fire several reactions from both members
+  for (const emoji of ['🎉', '❤️', '😂', '👏']) {
+    const res = await call(tokens.a, 'POST', `/api/rooms/${roomId}/reaction`, { emoji });
+    assert.equal(res.status, 200);
+  }
+  const resB = await call(tokens.b, 'POST', `/api/rooms/${roomId}/reaction`, { emoji: '😮' });
+  assert.equal(resB.status, 200);
+
+  // Reactions must NOT persist: no new roomEvents at all, and no
+  // reaction / "reacted with" chat rows in the durable history.
+  assert.equal(lastEventId(roomId), cursor, 'reactions must not persist any room event');
+
+  const rows = db
+    .prepare('SELECT type, payloadJson FROM roomEvents WHERE roomId = ? ORDER BY id ASC')
+    .all(roomId) as { type: string; payloadJson: string }[];
+  assert.equal(rows.filter((r) => r.type === 'reaction').length, 0, 'no reaction rows may exist');
+
+  const chatRows = rows.filter((r) => r.type === 'chat:message');
+  assert.ok(chatRows.length >= 1, 'real chat still persists');
+  for (const row of chatRows) {
+    const payload = JSON.parse(row.payloadJson) as { text: string; reaction?: string };
+    assert.ok(!payload.text.includes('reacted with'), 'chat history must never contain reaction text');
+    assert.equal(payload.reaction, undefined, 'chat messages must not carry a reaction field');
+  }
 });
 
 test('active member can send WebRTC signal; non-member is rejected with 403', async () => {

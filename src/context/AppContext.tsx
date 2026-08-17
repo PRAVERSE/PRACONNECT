@@ -40,6 +40,7 @@ import {
   setScreenShareApi,
   setSelfDeviceStateApi,
   sendRoomChatApi,
+  sendRoomReactionApi,
   removeMemberApi,
   muteMemberApi,
   setMemberCameraApi,
@@ -836,17 +837,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     await sendRoomChatApi(currentRoom.id, text.trim());
   };
 
-  const sendReaction = (emoji: string, senderName?: string) => {
-    if (!currentRoom) return;
-    const name = senderName || userProfile.name || 'You';
-
-    // Broadcast through room chat
-    sendRoomChatApi(currentRoom.id, `${emoji} reacted with ${emoji}`, emoji).catch(() => {});
-
+  const pushFloatingReaction = useCallback((emoji: string, senderName: string) => {
     const newReaction: FloatingReaction = {
       id: `float-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
       emoji,
-      senderName: name,
+      senderName,
       x: Math.floor(12 + Math.random() * 76),
       rotation: Math.floor(-20 + Math.random() * 40),
       scale: parseFloat((0.95 + Math.random() * 0.45).toFixed(2)),
@@ -858,6 +853,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setTimeout(() => {
       setFloatingReactions((prev) => prev.filter((r) => r.id !== newReaction.id));
     }, 3000);
+  }, []);
+
+  const sendReaction = (emoji: string, senderName?: string) => {
+    if (!currentRoom) return;
+    const name = senderName || userProfile.name || 'You';
+
+    // Transient reaction signaling — a reaction is NEVER a chat message. It is
+    // broadcast ephemerally over SSE and must not pollute chat history.
+    sendRoomReactionApi(currentRoom.id, emoji).catch(() => {});
+
+    pushFloatingReaction(emoji, name);
   };
 
   const setRoomMedia = async (media: MediaTrack | null) => {
@@ -1184,6 +1190,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 if (prev.some((m) => m.id === msg.id)) return prev;
                 return [...prev, msg];
               });
+            }
+            break;
+          }
+
+          case 'reaction': {
+            const data = payload as { fromUserId?: string; senderName?: string; emoji?: string };
+            if (data && data.emoji && data.fromUserId && data.fromUserId !== uid) {
+              pushFloatingReaction(data.emoji, data.senderName || 'Someone');
             }
             break;
           }

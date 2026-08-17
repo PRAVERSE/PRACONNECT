@@ -24,7 +24,7 @@ for (const name of [
   'LOGIN', 'LOGINUSER', 'SIGNUP', 'SIGNUPEMAIL', 'VERIFYEMAIL', 'VERIFYEMAILEMAIL',
   'RESENDVERIFICATION', 'RESENDVERIFICATIONEMAIL', 'FORGOTPASSWORD', 'FORGOTPASSWORDEMAIL',
   'VERIFYPASSWORDRESET', 'VERIFYPASSWORDRESETEMAIL', 'RESETPASSWORD', 'RESETPASSWORDTOKEN',
-  'JOIN', 'JOINUSER', 'CHAT', 'SIGNAL',
+  'JOIN', 'JOINUSER', 'CHAT', 'REACTION', 'SIGNAL',
 ]) {
   process.env[`RATE_LIMIT_${name}_MAX`] = '3';
   process.env[`RATE_LIMIT_${name}_WINDOW_MS`] = '60000';
@@ -251,6 +251,18 @@ test('G: chat is rate-limited per user+room', async () => {
     assert.equal(res.status, 201, `chat ${i + 1} must succeed`);
   }
   const blocked = await call(tokens.a, 'POST', `/api/rooms/${roomId}/chat`, { text: 'spam' });
+  assert.equal(blocked.status, 429);
+});
+
+// ─── G2. Reaction flood ───────────────────────────────────────────────────────
+
+test('G2: reactions are rate-limited per user+room', async () => {
+  const roomId = await createRoom(tokens.a, 'Reaction Flood');
+  for (let i = 0; i < 3; i++) {
+    const res = await call(tokens.a, 'POST', `/api/rooms/${roomId}/reaction`, { emoji: '🎉' });
+    assert.equal(res.status, 200, `reaction ${i + 1} must succeed`);
+  }
+  const blocked = await call(tokens.a, 'POST', `/api/rooms/${roomId}/reaction`, { emoji: '🎉' });
   assert.equal(blocked.status, 429);
 });
 

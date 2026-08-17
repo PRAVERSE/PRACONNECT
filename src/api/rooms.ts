@@ -310,19 +310,40 @@ export async function setSelfDeviceStateApi(
 /** Send a room chat message */
 export async function sendRoomChatApi(
   roomId: string,
-  text: string,
-  reaction?: string
+  text: string
 ): Promise<RoomApiResponse<{ message: unknown }>> {
   try {
     const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({ text, reaction }),
+      body: JSON.stringify({ text }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       return { ok: false, error: data.error || { code: 'CHAT_FAILED', message: 'Failed to send message.' } };
+    }
+    return { ok: true, data };
+  } catch {
+    return { ok: false, error: { code: 'NETWORK_ERROR', message: 'Network connection failed.' } };
+  }
+}
+
+/**
+ * Send a transient room reaction. Reactions are broadcast ephemerally over
+ * SSE — they are never persisted to chat history / room events.
+ */
+export async function sendRoomReactionApi(roomId: string, emoji: string): Promise<RoomApiResponse<{ ok: boolean }>> {
+  try {
+    const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/reaction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ emoji }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      return { ok: false, error: data.error || { code: 'REACTION_FAILED', message: 'Failed to send reaction.' } };
     }
     return { ok: true, data };
   } catch {

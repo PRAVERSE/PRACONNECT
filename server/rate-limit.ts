@@ -45,6 +45,7 @@ export const LIMITS = {
   join: { max: 60, windowMs: 10 * 1000 }, // per IP
   joinUser: { max: 25, windowMs: 10 * 1000 }, // per user
   chat: { max: 30, windowMs: 10 * 1000 },
+  reaction: { max: 60, windowMs: 10 * 1000 }, // emoji bursts need a little headroom
   signal: { max: 200, windowMs: 10 * 1000 }, // WebRTC bursts need headroom
 } as const;
 
