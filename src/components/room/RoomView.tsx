@@ -35,8 +35,7 @@ import {
   GripVertical,
   Users,
   AlertTriangle,
-  Link,
-  FileVideo,
+  Library,
   UserX,
   Shield,
   MoreVertical,
@@ -44,9 +43,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { RoomFile, Participant } from '../../types';
-import { presetMediaTracks } from '../../data/mockData';
-import { isSupportedLocalMovie, LOCAL_MOVIE_ACCEPT } from '../../utils/mediaValidation';
-import { LocalMovieController, canBrowserPlay, captureStreamTrackCounts, movieSourceHasDecodedAudio } from '../../webrtc/localMovie';
+import { LocalMovieController } from '../../webrtc/localMovie';
 import { VoiceRing } from '../common/VoiceRing';
 import { AvatarStack } from '../common/AvatarStack';
 import { UserAvatar } from '../common/UserAvatar';
@@ -263,7 +260,6 @@ export const RoomView: React.FC = () => {
   // Video Player States & Advanced Controls
   const videoRef = useRef<HTMLVideoElement>(null);
   const playerContainerRef = useRef<HTMLDivElement>(null);
-  const mediaFileInputRef = useRef<HTMLInputElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState(0.8);
@@ -272,7 +268,6 @@ export const RoomView: React.FC = () => {
   const [videoError, setVideoError] = useState(false);
   const [videoErrorInfo, setVideoErrorInfo] = useState<{ title: string; message: string } | null>(null);
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
-  const [customUrlInput, setCustomUrlInput] = useState('');
 
   // Selected participant for host moderation popover
   const [modTargetUser, setModTargetUser] = useState<Participant | null>(null);
@@ -557,235 +552,7 @@ export const RoomView: React.FC = () => {
     };
   }, []);
 
-  /** Wait until the element has enough data to capture (or it errored). */
-  const waitForMovieReadiness = (video: HTMLVideoElement): Promise<void> =>
-    new Promise((resolve, reject) => {
-      if (video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
-        resolve();
-        return;
-      }
-      const cleanup = () => {
-        video.removeEventListener('canplay', onCanPlay);
-        video.removeEventListener('error', onError);
-      };
-      const onCanPlay = () => {
-        cleanup();
-        resolve();
-      };
-      const onError = () => {
-        cleanup();
-        reject(video.error || new Error('media-load-failed'));
-      };
-      video.addEventListener('canplay', onCanPlay);
-      video.addEventListener('error', onError);
-      setTimeout(() => {
-        if (video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
-          cleanup();
-          resolve();
-        }
-      }, 8000);
-    });
-
-  /**
-   * Phase 6.10 — host picks a local movie file.
-   * The file is NEVER uploaded: a blob URL is created locally, the <video>
-   * element is captured, and the captured stream is attached to the WebRTC
-   * peers. Only { mediaType: 'local-movie', title, mimeType, duration,
-   * sourceUserId } reaches the room.
-   */
-  const handleLocalMovieFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file) return;
-
-    if (!isSupportedLocalMovie(file)) {
-      setLocalMovieError('Please select a video file (MP4, WebM, MOV, MKV, AVI, or another supported container).');
-      setLocalMovieStatus('error');
-      return;
-    }
-    if (file.size === 0) {
-      setLocalMovieError('Selected file appears to be empty (0 bytes) — please ensure the file is completely saved on disk and try selecting it again.');
-      setLocalMovieStatus('error');
-      return;
-    }
-
-    setLocalMovieError(null);
-    setLocalMovieStatus('loading');
-    try {
-      const video = localMovieVideoRef.current;
-      if (!video) throw new Error('player-not-ready');
-      const capture = video.captureStream
-        ? () => video.captureStream()
-        : typeof (video as any).mozCaptureStream === 'function'
-        ? () => (video as any).mozCaptureStream()
-        : null;
-      if (!capture) {
-        setLocalMovieError("This browser doesn't support local movie sharing. Please use Chrome or Edge.");
-        setLocalMovieStatus('error');
-        return;
-      }
-
-      // Fast-fail when the browser already knows it cannot play the container.
-      if (canBrowserPlay(video, file.type) === 'no') {
-        setLocalMovieError("This video format isn't supported by your browser.");
-        setLocalMovieStatus('error');
-        return;
-      }
-
-      // Blob URL: exists ONLY in this browser tab; never broadcast, never sent
-      // to the server. Assigned to the element BEFORE the old URL is revoked
-      // by the controller, so the element never dangles.
-      const url = URL.createObjectURL(file);
-      video.src = url;
-      video.muted = false;
-      video.volume = 1;
-      await video.load();
-
-      // The file picker click counts as a user gesture, so unmuted autoplay
-      // is normally allowed — that keeps the captured audio track live.
-      // Phase 6.10 audio fix: the element must NOT stay permanently muted —
-      // a muted source element may not expose usable audio via captureStream.
-      // If the browser still blocks audible autoplay, the muted fallback is
-      // surfaced to the user ("Enable Movie Sound") instead of being silent.
-      try {
-        await video.play();
-        setIsMuted(false);
-        setVolume(1);
-      } catch {
-        video.muted = true;
-        setIsMuted(true);
-        try {
-          await video.play();
-        } catch {
-          // Still blocked — the host stage shows the enable-sound control.
-        }
-      }
-
-      await waitForMovieReadiness(video);
-
-      // Phase 6.10 audio fix — host source-video diagnostics BEFORE capture:
-      // proves whether the movie element itself was muted / blocked.
-      console.log('[LOCAL MOVIE] source video:', {
-        ts: new Date().toISOString(),
-        muted: video.muted,
-        volume: video.volume,
-        paused: video.paused,
-        readyState: video.readyState,
-        currentTime: video.currentTime,
-        duration: video.duration,
-        videoWidth: video.videoWidth,
-        videoHeight: video.videoHeight,
-        hasDecodedAudio: movieSourceHasDecodedAudio(video as any),
-      });
-      // Phase 6.10 audio trace (exact tag) — HOST SOURCE: proves whether the
-      // host <video> element itself was muted/paused/blocked BEFORE capture.
-      console.log('[MOVIE AUDIO DEBUG] HOST SOURCE', {
-        ts: new Date().toISOString(),
-        muted: video.muted,
-        volume: video.volume,
-        paused: video.paused,
-        readyState: video.readyState,
-        currentTime: video.currentTime,
-        duration: video.duration,
-        hasDecodedAudio: movieSourceHasDecodedAudio(video as any),
-      });
-
-      const stream = capture();
-      if (!stream || stream.getVideoTracks().length === 0) {
-        throw new Error('no-video-track');
-      }
-
-      // Phase 6.10 audio fix — capture-stream diagnostics: stream id, all
-      // track kinds, video/audio counts, and per-audio-track state.
-      const captureCounts = captureStreamTrackCounts(stream);
-      console.log('[LOCAL MOVIE] captureStream:', {
-        ts: new Date().toISOString(),
-        streamId: stream.id,
-        trackKinds: stream.getTracks().map((t) => t.kind),
-        videoTrackCount: captureCounts.videoTracks,
-        audioTrackCount: captureCounts.audioTracks,
-      });
-      // Phase 6.10 audio trace (exact tag) — HOST CAPTURE: the captured
-      // stream's video/audio track maps (incl. getSettings). audioTracks
-      // length is the decisive Case-A answer (0 here = captureStream exposed
-      // no audio; >=1 = the host side produced audio for WebRTC).
-      const movieTrackSettings = (t: MediaStreamTrack) => {
-        try {
-          return typeof t.getSettings === 'function' ? t.getSettings() : null;
-        } catch {
-          return null;
-        }
-      };
-      console.log('[MOVIE AUDIO DEBUG] HOST CAPTURE', {
-        ts: new Date().toISOString(),
-        streamId: stream.id,
-        videoTracks: stream.getVideoTracks().map((t) => ({
-          id: t.id,
-          kind: t.kind,
-          readyState: t.readyState,
-          enabled: t.enabled,
-          muted: t.muted,
-          label: t.label,
-          settings: movieTrackSettings(t),
-        })),
-        audioTracks: stream.getAudioTracks().map((t) => ({
-          id: t.id,
-          kind: t.kind,
-          readyState: t.readyState,
-          enabled: t.enabled,
-          muted: t.muted,
-          label: t.label,
-          settings: movieTrackSettings(t),
-        })),
-      });
-      for (const audioTrack of stream.getAudioTracks()) {
-        console.log('[LOCAL MOVIE AUDIO]', {
-          ts: new Date().toISOString(),
-          trackId: audioTrack.id,
-          kind: audioTrack.kind,
-          readyState: audioTrack.readyState,
-          enabled: audioTrack.enabled,
-          muted: audioTrack.muted,
-          label: audioTrack.label,
-        });
-      }
-
-      // Phase 6.10 audio fix — graceful 0-audio-track handling: keep sharing
-      // the video, but surface a diagnostic when the source clearly has audio
-      // while captureStream() exposed none. NEVER fall back to an upload.
-      if (captureCounts.audioTracks === 0 && movieSourceHasDecodedAudio(video as any)) {
-        setMovieAudioWarning("Your browser did not expose the movie's audio track for WebRTC sharing.");
-      }
-
-      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : undefined;
-      if (duration !== undefined) {
-        setDuration(duration);
-      }
-
-      const result = await localMovieControllerRef.current!.start(file, url, stream, {
-        duration,
-        sourceUserId: currentUser?.id,
-      });
-      if (!result.ok) {
-        URL.revokeObjectURL(url);
-        video.pause();
-        video.src = '';
-        setLocalMovieError('Could not start local movie sharing. Please try again.');
-        setLocalMovieStatus('error');
-        return;
-      }
-
-      setLocalMovieStatus('active');
-      setIsPlaying(true);
-      setShowMediaPicker(false);
-    } catch (err) {
-      console.warn('[MOVIE UI] local movie load failed:', err);
-      setLocalMovieError("This video format isn't supported by your browser.");
-      setLocalMovieStatus('error');
-    }
-  };
-
-  /** Host stops the local movie session (detach peers + clear room media). */
+/** Host stops the local movie session (detach peers + clear room media). */
   const handleStopLocalMovie = async () => {
     const controller = localMovieControllerRef.current;
     await controller?.stop();
@@ -2593,118 +2360,48 @@ export const RoomView: React.FC = () => {
               <button
                 onClick={() => setShowMediaPicker(false)}
                 className="p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] rounded-lg cursor-pointer"
+                aria-label="Close media picker"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {/* Custom URL Input */}
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-bold text-[var(--text-secondary)] uppercase tracking-wider flex items-center gap-1">
-                <Link className="w-3 h-3 text-[var(--accent)]" />
-                <span>Custom Direct Video URL</span>
-              </label>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  placeholder="Paste MP4 / WebM direct video link..."
-                  value={customUrlInput}
-                  onChange={(e) => setCustomUrlInput(e.target.value)}
-                  className="flex-1 h-9 px-3 bg-[var(--bg-canvas)] border border-[var(--border-subtle)] focus:border-[var(--accent)] rounded-xl text-xs text-[var(--text-primary)] outline-none transition-colors"
-                />
-                <button
-                  onClick={() => {
-                    if (customUrlInput.trim()) {
-                      setRoomMedia({
-                        title: 'Custom Direct Video Stream',
-                        url: customUrlInput.trim(),
-                        poster: 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=800&q=80',
-                        duration: 300,
-                        type: 'video'
-                      });
-                      setCustomUrlInput('');
-                      setShowMediaPicker(false);
-                    }
-                  }}
-                  disabled={!customUrlInput.trim()}
-                  className="px-3 h-9 bg-[var(--accent)] hover:bg-[var(--accent-hover)] disabled:opacity-50 text-white text-xs font-bold rounded-xl transition-all cursor-pointer shadow-xs"
-                >
-                  Load
-                </button>
-              </div>
-            </div>
+            {/* Option 1 — Screen Share */}
+            <button
+              onClick={() => {
+                toggleScreenShare();
+                setShowMediaPicker(false);
+              }}
+              className="w-full p-3.5 bg-[var(--bg-canvas)] hover:bg-[var(--bg-surface-2)] border border-[var(--border-subtle)] hover:border-[var(--accent)] rounded-xl text-left transition-all flex items-center gap-3 cursor-pointer group"
+              aria-label="Screen Share — share your screen with everyone in the room"
+            >
+              <span className="w-10 h-10 rounded-xl bg-[var(--accent-subtle)] text-[var(--accent)] flex items-center justify-center shrink-0">
+                <Monitor className="w-5 h-5" />
+              </span>
+              <span className="flex flex-col gap-0.5 min-w-0">
+                <span className="text-xs font-bold text-[var(--text-primary)]">Screen Share</span>
+                <span className="text-[11px] font-medium text-[var(--text-secondary)]">
+                  Share your screen with everyone in the room.
+                </span>
+              </span>
+            </button>
 
-            {/* Local Movie Error Banner */}
-            {localMovieError && (
-              <div className="p-2.5 bg-rose-500/15 border border-rose-500/30 rounded-xl text-xs text-rose-300 flex items-center justify-between">
-                <span>{localMovieError}</span>
-                <button onClick={() => setLocalMovieError(null)} className="p-0.5 text-rose-300 hover:text-white cursor-pointer">
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              </div>
-            )}
-
-            {/* Phase 6.10: Play a Local Movie — shared peer-to-peer. The file
-                stays on the host's device; only lightweight metadata is sent
-                to the room. This flow NEVER uploads the file. */}
-            <div className="pt-1">
-              <p className="text-[11px] font-bold text-[var(--text-tertiary)] uppercase tracking-wider mb-1.5">
-                Play a Local Movie
-              </p>
-              <label
-                className={`w-full min-h-12 border border-dashed border-[var(--border-strong)] hover:border-[var(--accent)] bg-[var(--bg-canvas)] hover:bg-[var(--bg-surface-2)] rounded-xl flex items-center justify-center gap-2.5 px-3 text-xs font-bold text-[var(--text-secondary)] transition-all ${
-                  localMovieStatus === 'loading' ? 'opacity-60 pointer-events-none' : 'cursor-pointer'
-                }`}
-              >
-                {localMovieStatus === 'loading' ? (
-                  <>
-                    <div className="w-4 h-4 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
-                    <span>Preparing your local movie...</span>
-                  </>
-                ) : (
-                  <>
-                    <FileVideo className="w-4 h-4 text-[var(--accent)] shrink-0" />
-                    <span className="flex flex-col text-left leading-tight">
-                      <span className="text-xs font-bold text-[var(--text-primary)]">Play Local Movie</span>
-                      <span className="text-[10px] font-medium text-[var(--text-tertiary)]">
-                        Your video stays on your device and streams directly to your squad.
-                      </span>
-                    </span>
-                    <input
-                      ref={mediaFileInputRef}
-                      type="file"
-                      accept={LOCAL_MOVIE_ACCEPT}
-                      className="hidden"
-                      disabled={localMovieStatus === 'loading'}
-                      onChange={handleLocalMovieFile}
-                    />
-                  </>
-                )}
-              </label>
-            </div>
-
-            {presetMediaTracks.length > 0 && (
-              <div className="pt-1 border-t border-[var(--border-subtle)]">
-                <p className="text-[11px] font-bold text-[var(--text-tertiary)] uppercase tracking-wider mb-2">
-                  Preset Stream Channels
-                </p>
-                <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                  {presetMediaTracks.map((media, idx) => (
-                    <button
-                      key={idx}
-                      onClick={() => {
-                        setRoomMedia(media);
-                        setShowMediaPicker(false);
-                      }}
-                      className="w-full p-2.5 bg-[var(--bg-canvas)] hover:bg-[var(--bg-surface-2)] border border-[var(--border-subtle)] hover:border-[var(--accent)] rounded-xl text-left transition-all flex items-center justify-between group cursor-pointer"
-                    >
-                      <span className="text-xs font-bold text-[var(--text-primary)] truncate">{media.title}</span>
-                      <Play className="w-3.5 h-3.5 text-[var(--accent)] shrink-0" />
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
+            {/* Option 2 — Media Library */}
+            <button
+              onClick={() => setShowMediaPicker(false)}
+              className="w-full p-3.5 bg-[var(--bg-canvas)] hover:bg-[var(--bg-surface-2)] border border-[var(--border-subtle)] hover:border-[var(--accent)] rounded-xl text-left transition-all flex items-center gap-3 cursor-pointer group"
+              aria-label="Media Library — choose a video from the PraConnect library"
+            >
+              <span className="w-10 h-10 rounded-xl bg-[var(--accent-subtle)] text-[var(--accent)] flex items-center justify-center shrink-0">
+                <Library className="w-5 h-5" />
+              </span>
+              <span className="flex flex-col gap-0.5 min-w-0">
+                <span className="text-xs font-bold text-[var(--text-primary)]">Media Library</span>
+                <span className="text-[11px] font-medium text-[var(--text-secondary)]">
+                  Choose a video from the PraConnect library.
+                </span>
+              </span>
+            </button>
 
             <button
               onClick={() => setShowMediaPicker(false)}
