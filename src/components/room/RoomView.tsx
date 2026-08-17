@@ -2,10 +2,6 @@ import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   Tv,
-  Gamepad2,
-  Palette,
-  FileText,
-  Folder,
   Mic,
   MicOff,
   Video,
@@ -25,12 +21,10 @@ import {
   Lock,
   Smile,
   X,
-  Vote,
   Maximize,
   Minimize,
   PictureInPicture,
   Settings,
-  Crown,
   Columns,
   GripVertical,
   Users,
@@ -47,7 +41,6 @@ import { LocalMovieController } from '../../webrtc/localMovie';
 import { VoiceRing } from '../common/VoiceRing';
 import { AvatarStack } from '../common/AvatarStack';
 import { UserAvatar } from '../common/UserAvatar';
-import { RoomVibes } from './RoomVibes';
 import { RoomPoll } from './RoomPoll';
 import { LiveBadge } from '../common/LiveBadge';
 
@@ -199,7 +192,6 @@ export const RoomView: React.FC = () => {
     currentRoom,
     leaveRoom,
     activeRoomTab,
-    setActiveRoomTab,
     participants,
     roomSseState,
     chatMessages,
@@ -1073,40 +1065,7 @@ export const RoomView: React.FC = () => {
           )}
         </div>
 
-        {/* Room View Tab Switcher */}
-        <div className="hidden lg:flex items-center gap-1 text-xs bg-[var(--bg-surface-2)] p-1 rounded-xl border border-[var(--border-subtle)]">
-          {(['Watch', 'Game', 'Board', 'Poll', 'Notes', 'Files'] as const).map((tab) => {
-            const icons = {
-              Watch: <Tv className="w-3.5 h-3.5" />,
-              Game: <Gamepad2 className="w-3.5 h-3.5" />,
-              Board: <Palette className="w-3.5 h-3.5" />,
-              Poll: <Vote className="w-3.5 h-3.5" />,
-              Notes: <FileText className="w-3.5 h-3.5" />,
-              Files: <Folder className="w-3.5 h-3.5" />
-            };
-
-            const isTabActive = activeRoomTab === tab;
-
-            return (
-              <button
-                key={tab}
-                onClick={() => setActiveRoomTab(tab)}
-                className={`px-3 py-1 font-bold transition-all rounded-lg flex items-center gap-1.5 cursor-pointer ${
-                  isTabActive
-                    ? 'bg-[var(--accent)] text-white shadow-xs'
-                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-surface-3)]'
-                }`}
-              >
-                {icons[tab]}
-                {tab}
-              </button>
-            );
-          })}
-        </div>
-
         <div className="flex items-center gap-2 shrink-0">
-          <RoomVibes currentVibe="Hype" onSelectVibe={() => {}} isHost={isHost} />
-
           <button
             onClick={leaveRoom}
             className="px-3 h-8 bg-[var(--status-error-bg)] text-[var(--status-error)] hover:bg-[var(--status-error)] hover:text-white border border-[var(--status-error)]/30 text-xs font-bold rounded-xl transition-all flex items-center gap-1.5 cursor-pointer shadow-xs"
@@ -1715,24 +1674,8 @@ export const RoomView: React.FC = () => {
                   </AnimatePresence>
                 )}
 
-                {/* Top Overlay Badges: Host Control Indicator & Quality Badge */}
+                {/* Top Overlay Badge: Stream Quality */}
                 <div className="absolute top-3 left-3 right-3 flex items-center justify-between pointer-events-none z-20">
-                  <div className={`px-3 py-1 rounded-full bg-black/75 backdrop-blur-md border border-white/20 text-white text-[10px] font-mono font-bold flex items-center gap-1.5 shadow transition-all ${
-                    isFullscreen && showFullscreenWebcam ? 'ml-52' : ''
-                  }`}>
-                    {isHost ? (
-                      <>
-                        <Crown className="w-3.5 h-3.5 text-[var(--accent)] shrink-0" />
-                        <span>Host Controls</span>
-                      </>
-                    ) : (
-                      <>
-                        <Shield className="w-3.5 h-3.5 text-[var(--status-success)] shrink-0" />
-                        <span>Synced with Host ({currentRoom.hostName})</span>
-                      </>
-                    )}
-                  </div>
-
                   {currentRoom.currentMedia && !isLocalMovieMedia && (
                     <div className="px-2.5 py-1 rounded-full bg-black/75 backdrop-blur-md border border-white/20 text-white text-[10px] font-mono font-bold">
                       {selectedQuality}
@@ -2275,21 +2218,6 @@ export const RoomView: React.FC = () => {
           title={cameraOn ? 'Turn Off Camera' : 'Turn On Camera'}
         >
           {cameraOn ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
-        </button>
-
-        <button
-          onClick={toggleScreenShare}
-          disabled={!isHost}
-          className={`w-9 h-9 rounded-xl flex items-center justify-center transition-all ${
-            !isHost
-              ? 'bg-[var(--bg-surface-2)] text-[var(--text-tertiary)] border border-[var(--border-subtle)] cursor-not-allowed opacity-60'
-              : screenShareOn
-              ? 'bg-[var(--accent)] text-white font-bold shadow-xs cursor-pointer'
-              : 'bg-[var(--bg-surface-2)] text-[var(--text-secondary)] border border-[var(--border-strong)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-surface-3)] cursor-pointer'
-          }`}
-          title={isHost ? (screenShareOn ? 'Stop Screen Share' : 'Share Screen') : 'Screen sharing is host-only'}
-        >
-          <Monitor className="w-4 h-4" />
         </button>
 
         {/* Quick Reaction Dock Button & Popover */}
