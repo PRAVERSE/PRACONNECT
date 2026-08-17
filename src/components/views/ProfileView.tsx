@@ -27,8 +27,14 @@ const useCountUp = (target: number, duration = 350) => {
 };
 
 export const ProfileView: React.FC = () => {
-  const { userProfile, updateProfile, rooms, friends, watchHistory } = useApp();
+  const { userProfile, updateProfile, rooms, friends, watchHistory, roomStats, refreshRoomStats } = useApp();
   const [editModalOpen, setEditModalOpen] = useState(false);
+
+  // Authoritative statistics come from durable server-side history — not from
+  // the active room list, which loses entries to the 5-minute cleanup.
+  useEffect(() => {
+    refreshRoomStats();
+  }, [refreshRoomStats]);
 
   // Form states
   const [name, setName] = useState(userProfile.name);
@@ -54,14 +60,47 @@ export const ProfileView: React.FC = () => {
     setEditModalOpen(false);
   };
 
-  const userRooms = rooms.filter(
-    (r) => (userProfile.username && r.hostName === userProfile.username) || (userProfile.name && r.hostName === userProfile.name)
-  );
   const activeFriends = friends.filter((f) => !f.requestPending && !f.isSuggestion);
 
-  const hostedRoomsCount = useCountUp(userRooms.length, 300);
-  const gamesPlayedCount = useCountUp(userProfile.gamesPlayed || 0, 400);
+  // Stats row values (server-authoritative, survive room cleanup).
+  const hostedRoomsCount = useCountUp(roomStats?.hostedRooms ?? 0, 300);
+  const watchedRoomsCount = useCountUp(roomStats?.joinedRooms ?? 0, 350);
+  const watchTimeCount = useCountUp(roomStats?.totalWatchSeconds ?? 0, 400);
   const activeFriendsCount = useCountUp(activeFriends.length, 300);
+
+  const formatWatchTime = (seconds: number) => {
+    if (seconds <= 0) return '0m';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m`;
+    return `${seconds}s`;
+  };
+
+  const formatRoomDate = (iso: string | null) => {
+    if (!iso) return '';
+    return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  };
+
+  // A historical entry is still ACTIVE (joinable) only while its room appears
+  // in the live room list without an emptySince marker. Expired rooms are
+  // shown as ENDED — never as joinable.
+  const activeRoomIds = new Set(rooms.filter((r) => !r.emptySince).map((r) => r.id));
+  const recentRooms = roomStats?.recentRooms ?? [];
+
+  // Watch history rendered from durable history (title/media fall back to the
+  // room name; the mock watchHistory list is kept as a legacy fallback).
+  const historyItems =
+    recentRooms.length > 0
+      ? recentRooms.map((r) => ({
+          id: r.id,
+          title: r.createdMediaTitle || r.roomName,
+          poster: '',
+          watchedAt: formatRoomDate(r.endedAt ?? r.createdAt),
+          roomName: r.roomName,
+          durationWatched: formatWatchTime(r.durationSeconds),
+        }))
+      : watchHistory;
 
   return (
     <div className="w-full min-w-0 text-[#EDEDEF] font-['Inter',sans-serif] select-none animate-fade-in-up px-5 md:px-10 pb-12">
@@ -104,14 +143,18 @@ export const ProfileView: React.FC = () => {
       </div>
 
       {/* ─── 2. STATS ROW ──────────────────────────────────────────────────── */}
-      <div className="grid grid-cols-3 gap-6 py-6 border-b border-white/[0.07] text-center w-full">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-6 py-6 border-b border-white/[0.07] text-center w-full">
         <div>
           <div className="font-['Sora',sans-serif] text-xl font-bold text-[#EDEDEF]">{hostedRoomsCount}</div>
           <div className="text-[11px] text-[#5C5C64] uppercase tracking-wider font-semibold mt-1">Hosted Rooms</div>
         </div>
         <div>
-          <div className="font-['Sora',sans-serif] text-xl font-bold text-[#EDEDEF]">{gamesPlayedCount}</div>
-          <div className="text-[11px] text-[#5C5C64] uppercase tracking-wider font-semibold mt-1">Games Played</div>
+          <div className="font-['Sora',sans-serif] text-xl font-bold text-[#EDEDEF]">{watchedRoomsCount}</div>
+          <div className="text-[11px] text-[#5C5C64] uppercase tracking-wider font-semibold mt-1">Watched Rooms</div>
+        </div>
+        <div>
+          <div className="font-['Sora',sans-serif] text-xl font-bold text-[#EDEDEF]">{formatWatchTime(watchTimeCount)}</div>
+          <div className="text-[11px] text-[#5C5C64] uppercase tracking-wider font-semibold mt-1">Watch Time</div>
         </div>
         <div>
           <div className="font-['Sora',sans-serif] text-xl font-bold text-[#EDEDEF]">{activeFriendsCount}</div>
@@ -119,31 +162,48 @@ export const ProfileView: React.FC = () => {
         </div>
       </div>
 
-      {/* ─── 3. USER HOSTED ROOMS ─────────────────────────────────────────── */}
+      {/* ─── 3. RECENT ROOMS (persistent history) ──────────────────────────── */}
       <div className="mt-10 w-full">
         <h2 className="text-[11px] font-bold tracking-widest uppercase text-[#9A9AA2] mb-4">
-          Hosted Rooms ({userRooms.length})
+          Recent Rooms ({recentRooms.length})
         </h2>
 
-        {userRooms.length > 0 ? (
+        {recentRooms.length > 0 ? (
           <div className="divide-y divide-white/[0.07] border-t border-b border-white/[0.07] w-full">
-            {userRooms.map((room) => (
-              <div key={room.id} className="py-4 flex items-center justify-between interactive-row px-2 rounded-xl">
-                <div>
-                  <div className="font-['Sora',sans-serif] text-sm font-semibold text-[#EDEDEF]">{room.name}</div>
-                  <div className="text-xs text-[#5C5C64] font-mono mt-0.5">{room.code}</div>
+            {recentRooms.map((room) => {
+              const isActive = activeRoomIds.has(room.roomId);
+              return (
+                <div key={room.id} className="py-4 flex items-center justify-between interactive-row px-2 rounded-xl">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="font-['Sora',sans-serif] text-sm font-semibold text-[#EDEDEF] truncate">
+                        {room.roomName}
+                      </div>
+                      <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-[#17171A] border border-white/[0.07] shrink-0">
+                        {room.role === 'host' ? 'HOSTED' : 'WATCHED'}
+                      </span>
+                    </div>
+                    <div className="text-xs text-[#5C5C64] font-mono mt-0.5 truncate">
+                      {room.roomCode} • {room.createdMediaTitle || room.category} • {formatWatchTime(room.durationSeconds)}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span
+                      className={`text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-full border border-white/[0.07] ${
+                        isActive ? 'bg-[#17171A] text-[#F6B8D0]' : 'text-[#5C5C64] bg-transparent'
+                      }`}
+                    >
+                      {isActive ? 'ACTIVE' : 'ENDED'}
+                    </span>
+                    <span className="text-xs text-[#5C5C64] font-mono">{formatRoomDate(room.endedAt ?? room.createdAt)}</span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-[11px] font-mono font-bold px-2.5 py-0.5 rounded-full bg-[#17171A] text-[#F6B8D0] border border-white/[0.07]">
-                    {room.status}
-                  </span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         ) : (
           <div className="py-6 text-xs text-[#5C5C64]">
-            No hosted rooms created yet.
+            No rooms hosted or watched yet.
           </div>
         )}
       </div>
@@ -151,12 +211,12 @@ export const ProfileView: React.FC = () => {
       {/* ─── 4. WATCH HISTORY ─────────────────────────────────────────────── */}
       <div className="mt-10 w-full">
         <h2 className="text-[11px] font-bold tracking-widest uppercase text-[#9A9AA2] mb-4">
-          Watch History ({watchHistory.length})
+          Watch History ({historyItems.length})
         </h2>
 
-        {watchHistory.length > 0 ? (
+        {historyItems.length > 0 ? (
           <div className="divide-y divide-white/[0.07] border-t border-b border-white/[0.07] w-full">
-            {watchHistory.map((item) => (
+            {historyItems.map((item) => (
               <div key={item.id} className="py-4 flex items-center justify-between gap-4 interactive-row px-2 rounded-xl">
                 <div className="flex items-center gap-3.5 min-w-0">
                   {item.poster ? (

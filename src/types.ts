@@ -16,10 +16,14 @@ export type RoomTab = 'Watch' | 'Game' | 'Board' | 'Notes' | 'Files';
 
 export interface MediaTrack {
   title: string;
-  url: string;
+  url?: string;
   poster?: string;
   duration?: number;
   type?: 'video' | 'stream';
+  /** 'local-movie' = shared peer-to-peer via WebRTC (never has a url); 'url' = direct URL; 'hosted' = server upload. */
+  mediaType?: 'local-movie' | 'url' | 'hosted' | string;
+  sourceUserId?: string;
+  mimeType?: string;
 }
 
 export interface RoomItem {
@@ -108,6 +112,34 @@ export interface WatchHistoryItem {
   watchedAt: string;
   roomName: string;
   durationWatched: string;
+}
+
+/** A single durable room session from the server (survives active-room cleanup). */
+export interface RoomHistoryEntry {
+  id: string;
+  roomId: string;
+  roomCode: string;
+  roomName: string;
+  role: 'host' | 'member';
+  hostUserId: string;
+  hostName: string;
+  category: RoomCategory;
+  createdAt: string;
+  emptySince: string | null;
+  endedAt: string | null;
+  durationSeconds: number;
+  participantCount: number;
+  maxParticipants: number;
+  createdMediaTitle: string | null;
+  createdMediaType: string | null;
+}
+
+/** Server-authoritative profile statistics (GET /api/profile/stats). */
+export interface RoomHistoryStats {
+  hostedRooms: number;
+  joinedRooms: number;
+  totalWatchSeconds: number;
+  recentRooms: RoomHistoryEntry[];
 }
 
 export interface DirectMessage {

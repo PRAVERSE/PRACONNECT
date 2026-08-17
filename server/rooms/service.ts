@@ -4,11 +4,29 @@
 
 import { db } from '../db/index';
 import { generateId } from '../auth/auth';
+import { deleteUploadFiles } from '../uploads/lifecycle';
+import {
+  createRoomHistory,
+  recordHistoryJoin,
+  recordHistoryLeave,
+  markRoomHistoryEnded,
+  resumeRoomHistory,
+  finalizeRoomHistory,
+  updateRoomHistoryMedia,
+} from './history';
 
 // Empty-room timeout: 5 minutes by default, overridable via ROOM_EMPTY_TTL_MS
 export const ROOM_EMPTY_TTL_MS = Math.max(
   1000,
   parseInt(process.env.ROOM_EMPTY_TTL_MS ?? '300000', 10) || 300000
+);
+
+// Hard participant ceiling (Phase 6.8): full-mesh WebRTC is not viable at 50
+// participants — every peer sends N video streams. The server clamps any
+// client-provided maxParticipants above this single authoritative limit.
+export const MAX_ROOM_PARTICIPANTS = Math.max(
+  2,
+  parseInt(process.env.MAX_ROOM_PARTICIPANTS ?? '12', 10) || 12
 );
 
 // ─── Row shapes ──────────────────────────────────────────────────────────────
@@ -121,7 +139,16 @@ export interface RoomPayload {
   maxParticipants: number;
   memberCount: number;
   status: string;
-  currentMedia: { title: string; url: string; poster?: string; duration?: number; type?: string } | null;
+  currentMedia: {
+    title: string;
+    url?: string;
+    poster?: string;
+    duration?: number;
+    type?: string;
+    mediaType?: string;
+    sourceUserId?: string;
+    mimeType?: string;
+  } | null;
   playback: { isPlaying: boolean; position: number; updatedAt: string };
   screenShareActive: boolean;
   description: string | null;
@@ -154,13 +181,21 @@ function parseMedia(json: string | null): RoomPayload['currentMedia'] {
   if (!json) return null;
   try {
     const m = JSON.parse(json);
-    if (!m || typeof m.url !== 'string') return null;
+    if (!m || typeof m !== 'object') return null;
+    // Local movies are shared peer-to-peer via WebRTC: the room carries only
+    // lightweight metadata and NEVER a URL (a blob:/file: URL is meaningless
+    // outside the host browser). Every other media type requires a URL.
+    const isLocalMovie = m.mediaType === 'local-movie';
+    if (!isLocalMovie && typeof m.url !== 'string') return null;
     return {
       title: typeof m.title === 'string' ? m.title : 'Untitled',
-      url: m.url,
+      url: isLocalMovie ? undefined : m.url,
       poster: typeof m.poster === 'string' ? m.poster : undefined,
       duration: typeof m.duration === 'number' ? m.duration : undefined,
       type: typeof m.type === 'string' ? m.type : undefined,
+      mediaType: typeof m.mediaType === 'string' ? m.mediaType : undefined,
+      sourceUserId: typeof m.sourceUserId === 'string' ? m.sourceUserId : undefined,
+      mimeType: typeof m.mimeType === 'string' ? m.mimeType : undefined,
     };
   } catch {
     return null;
@@ -260,7 +295,7 @@ export interface CreateRoomInput {
 export function createRoom(hostUserId: string, input: CreateRoomInput): RoomPayload {
   const name = input.name.trim();
   if (name.length < 1 || name.length > 100) throw RoomErrors.validation('Room name must be 1-100 characters.');
-  const max = Math.max(2, Math.min(50, Number(input.maxParticipants) || 8));
+  const max = Math.max(2, Math.min(MAX_ROOM_PARTICIPANTS, Number(input.maxParticipants) || 8));
   const privacy = input.privacy === 'private' ? 'private' : 'public';
   const category = ['Movie', 'Gaming', 'Study', 'Music', 'Other'].includes(input.category)
     ? input.category
@@ -281,6 +316,21 @@ export function createRoom(hostUserId: string, input: CreateRoomInput): RoomPayl
   ).run(generateId(), roomId, hostUserId, now);
 
   touchActivity(roomId);
+
+  // Phase 6.11: durable session record — survives the 5-minute active-room
+  // cleanup so hosted/joined/watch statistics are never lost.
+  createRoomHistory({
+    id: roomId,
+    name,
+    code,
+    hostUserId,
+    category,
+    maxParticipants: max,
+    currentMediaJson: null,
+    createdAt: now,
+    emptySince: null,
+  });
+
   return roomPayload(roomId, hostUserId)!;
 }
 
@@ -320,9 +370,15 @@ export function joinRoom(roomIdOrCode: string, userId: string): { ok: true; payl
     ).run(generateId(), room.id, userId, shouldBeHost ? 'host' : 'member', now);
   }
 
+  // Phase 6.11: record/reopen the durable participation. Reconnects and
+  // duplicate joins update the same row — never a new participation record.
+  recordHistoryJoin(room.id, userId, shouldBeHost ? 'host' : 'member', now);
+
   // Cancels empty-room cleanup.
   if (shouldBeHost) {
     db.prepare('UPDATE rooms SET hostUserId = ?, emptySince = NULL, lastActivityAt = ? WHERE id = ?').run(userId, now, room.id);
+    // The empty room was revived: undo the "ended" markers on its history row.
+    resumeRoomHistory(room.id);
   } else {
     db.prepare('UPDATE rooms SET emptySince = NULL, lastActivityAt = ? WHERE id = ?').run(now, room.id);
   }
@@ -342,6 +398,9 @@ export function leaveRoom(roomId: string, userId: string): { ok: true; payload: 
     now,
     member.id
   );
+
+  // Phase 6.11: close this user's participation interval in durable history.
+  recordHistoryLeave(roomId, userId, now);
 
   const remaining = activeMemberCount(roomId);
 
@@ -365,6 +424,9 @@ export function leaveRoom(roomId: string, userId: string): { ok: true; payload: 
 
   if (remaining === 0) {
     db.prepare('UPDATE rooms SET emptySince = ?, lastActivityAt = ? WHERE id = ?').run(now, now, roomId);
+    // Phase 6.11: the room is permanently ended at THIS moment — not at the
+    // later 5-minute cleanup — so the grace period never inflates duration.
+    markRoomHistoryEnded(roomId, now);
   } else {
     touchActivity(roomId);
   }
@@ -391,6 +453,8 @@ export function removeMember(
   db.prepare(
     'UPDATE roomMembers SET leftAt = ?, removedAt = ?, micOn = 0, cameraOn = 0, screenShareOn = 0 WHERE id = ?'
   ).run(now, now, target.id);
+  // Phase 6.11: a removed member's participation ended at the removal moment.
+  recordHistoryLeave(roomId, targetUserId, now);
   touchActivity(roomId);
   return { ok: true, payload: roomPayload(roomId, hostUserId)! };
 }
@@ -455,10 +519,13 @@ export function setSelfState(
 
 export interface MediaInput {
   title: string;
-  url: string;
+  url?: string;
   poster?: string;
   duration?: number;
   type?: string;
+  mediaType?: string;
+  sourceUserId?: string;
+  mimeType?: string;
 }
 
 export function setRoomMedia(
@@ -470,10 +537,24 @@ export function setRoomMedia(
   if (!room) return { ok: false, error: RoomErrors.notFound() };
   if (room.hostUserId !== hostUserId) return { ok: false, error: RoomErrors.notHost() };
 
+  // Phase 6.10: local movies carry only lightweight metadata — never binary
+  // data, blob URLs, or filesystem paths. Binary movie bytes flow directly
+  // host → peers over WebRTC and never touch the server.
   const json = media
-    ? JSON.stringify({ title: media.title, url: media.url, poster: media.poster, duration: media.duration, type: media.type })
+    ? JSON.stringify({
+        title: media.title,
+        url: media.url,
+        poster: media.poster,
+        duration: media.duration,
+        type: media.type,
+        mediaType: media.mediaType,
+        sourceUserId: media.mediaType === 'local-movie' ? room.hostUserId : media.sourceUserId,
+        mimeType: media.mimeType,
+      })
     : null;
   db.prepare('UPDATE rooms SET currentMediaJson = ?, lastActivityAt = ? WHERE id = ?').run(json, nowIso(), roomId);
+  // Phase 6.11: remember the first media published on the history row.
+  updateRoomHistoryMedia(roomId, json);
   return { ok: true, payload: roomPayload(roomId, hostUserId)! };
 }
 
@@ -538,21 +619,39 @@ export function setScreenShare(
 export function cleanupEmptyRooms(now = Date.now()): string[] {
   const cutoff = new Date(now - ROOM_EMPTY_TTL_MS).toISOString();
   const rows = db
-    .prepare('SELECT id FROM rooms WHERE emptySince IS NOT NULL AND emptySince < ?')
-    .all(cutoff) as { id: string }[];
+    .prepare('SELECT id, emptySince FROM rooms WHERE emptySince IS NOT NULL AND emptySince < ?')
+    .all(cutoff) as { id: string; emptySince: string }[];
 
-  const deleteRoom = db.prepare('DELETE FROM rooms WHERE id = ?');
-  const deleteEvents = db.prepare('DELETE FROM roomEvents WHERE roomId = ?');
-  const deleteMembers = db.prepare('DELETE FROM roomMembers WHERE roomId = ?');
-  const deleted: string[] = [];
+  // Atomic per-sweep transaction: a concurrent join either sees the intact
+  // room (and cancels cleanup) or the fully-deleted room (ROOM_NOT_FOUND) —
+  // never a partially deleted one. ON DELETE CASCADE removes roomMembers and
+  // uploads rows with the room; roomEvents has no FK and is deleted explicitly.
+  // Phase 6.11: durable history is finalized (never deleted) inside the same
+  // transaction — an orphaned open interval cannot leak past the sweep.
+  const runDelete = db.transaction((ids: { id: string; emptySince: string }[]): string[][] => {
+    const filenamesByRoom: string[][] = [];
+    for (const row of ids) {
+      finalizeRoomHistory(row.id, row.emptySince);
+      filenamesByRoom.push(
+        (
+          db.prepare('SELECT filename FROM uploads WHERE roomId = ?').all(row.id) as { filename: string }[]
+        ).map((r) => r.filename)
+      );
+      db.prepare('DELETE FROM roomEvents WHERE roomId = ?').run(row.id);
+      db.prepare('DELETE FROM rooms WHERE id = ?').run(row.id);
+    }
+    return filenamesByRoom;
+  });
 
-  for (const row of rows) {
-    deleteMembers.run(row.id);
-    deleteEvents.run(row.id);
-    deleteRoom.run(row.id);
-    deleted.push(row.id);
+  const filenamesByRoom = runDelete(rows);
+
+  // Filesystem side effects happen after the DB commit; failures (e.g. a
+  // Windows file lock) leave the file to the periodic orphan sweep.
+  for (const names of filenamesByRoom) {
+    if (names.length > 0) deleteUploadFiles(names);
   }
-  return deleted;
+
+  return rows.map((r) => r.id);
 }
 
 // ─── Membership verification for route guards ────────────────────────────────

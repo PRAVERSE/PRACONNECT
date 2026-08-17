@@ -17,7 +17,8 @@ import {
   RoomFile,
   FloatingReaction,
   ScheduledParty,
-  WatchHistoryItem
+  WatchHistoryItem,
+  RoomHistoryStats
 } from '../types';
 import {
   initialUserProfile,
@@ -51,6 +52,7 @@ import {
 } from '../api/rooms';
 import { WebRTCManager } from '../webrtc/WebRTCManager';
 import { MediaDiagnosticError, logRoomEntryDeviceDiagnostics } from '../webrtc/mediaDeviceDiagnostics';
+import { fetchProfileStatsApi } from '../api/profile';
 
 interface AppContextType {
   activeTab: NavigationTab;
@@ -72,6 +74,8 @@ interface AppContextType {
   refreshRooms: () => Promise<void>;
   participants: Participant[];
   roomSseState: RoomSseState;
+  mediaConversion: { status: 'processing' | 'failed' | 'ready' | string; title?: string } | null;
+  clearMediaConversion: () => void;
   updateParticipantRole: (participantId: string, role: 'host' | 'co-host' | 'viewer') => void;
   kickParticipant: (participantId: string) => void;
   chatMessages: ChatMessage[];
@@ -96,13 +100,19 @@ interface AppContextType {
     description?: string;
   }) => ScheduledParty;
   watchHistory: WatchHistoryItem[];
+
+  // Server-authoritative room statistics (persistent history)
+  roomStats: RoomHistoryStats | null;
+  refreshRoomStats: () => Promise<void>;
   
   // WebRTC Media Streams & Error
   localMediaStream: MediaStream | null;
   localScreenStream: MediaStream | null;
+  localMovieStream: MediaStream | null;
   remoteMediaStreams: Map<string, MediaStream>;
   remoteCameraStreams: Map<string, MediaStream>;
   remoteScreenStreams: Map<string, MediaStream>;
+  remoteMovieStreams: Map<string, MediaStream>;
   mediaErrorMessage: string | null;
   mediaDiagnosticError: MediaDiagnosticError | null;
   clearMediaError: () => void;
@@ -114,6 +124,7 @@ interface AppContextType {
     cameraAcquisitionInFlight: boolean;
     hasCameraStream: boolean;
     hasScreenStream: boolean;
+    hasMovieStream: boolean;
   } | null;
 
   // Controls
@@ -139,6 +150,10 @@ interface AppContextType {
   sendReaction: (emoji: string, senderName?: string) => void;
   setRoomMedia: (media: MediaTrack | null) => void;
   uploadRoomMedia: (file: File) => Promise<{ ok: boolean; error?: string }>;
+  /** Phase 6.10: start (stream + lightweight metadata) or stop (null) the
+   *  peer-to-peer local movie session. The file stays on the device; only
+   *  metadata — never a URL — reaches the server. */
+  setLocalMovieActive: (stream: MediaStream | null, metadata?: { title?: string; mimeType?: string; duration?: number; sourceUserId?: string }) => Promise<boolean>;
   
   // Friends & DMs
   friends: Friend[];
@@ -197,6 +212,9 @@ function mapServerRoomToItem(r: ServerRoom, currentUserId: string | null): RoomI
           poster: r.currentMedia.poster,
           duration: r.currentMedia.duration,
           type: (r.currentMedia.type as 'video' | 'stream') || 'video',
+          mediaType: r.currentMedia.mediaType,
+          sourceUserId: r.currentMedia.sourceUserId,
+          mimeType: r.currentMedia.mimeType,
         }
       : null,
     playback: r.playback,
@@ -245,8 +263,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const webrtcRef = useRef<WebRTCManager | null>(null);
   const [localMediaStream, setLocalMediaStream] = useState<MediaStream | null>(null);
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
+  const [localMovieStream, setLocalMovieStream] = useState<MediaStream | null>(null);
   const [remoteCameraStreams, setRemoteCameraStreams] = useState<Map<string, MediaStream>>(new Map());
   const [remoteScreenStreams, setRemoteScreenStreams] = useState<Map<string, MediaStream>>(new Map());
+  const [remoteMovieStreams, setRemoteMovieStreams] = useState<Map<string, MediaStream>>(new Map());
   const [mediaErrorMessage, setMediaErrorMessage] = useState<string | null>(null);
   const [mediaDiagnosticError, setMediaDiagnosticError] = useState<MediaDiagnosticError | null>(null);
   const clearMediaError = useCallback(() => {
@@ -270,6 +290,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Room Specific State
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [roomSseState, setRoomSseState] = useState<RoomSseState>('CLOSED');
+  const [mediaConversion, setMediaConversion] = useState<{
+    status: 'processing' | 'failed' | 'ready' | string;
+    title?: string;
+  } | null>(null);
+  const clearMediaConversion = useCallback(() => setMediaConversion(null), []);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [roomNotes, setRoomNotes] = useState<string>('');
   const [roomFiles, setRoomFiles] = useState<RoomFile[]>([]);
@@ -277,6 +302,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const [scheduledParties, setScheduledParties] = useState<ScheduledParty[]>(initialScheduledParties);
   const [watchHistory, setWatchHistory] = useState<WatchHistoryItem[]>(initialWatchHistory);
+  const [roomStats, setRoomStats] = useState<RoomHistoryStats | null>(null);
   const [scheduleModalOpen, setScheduleModalOpen] = useState<boolean>(false);
 
   // Synchronize authenticated user with profile
@@ -302,6 +328,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setRooms(serverRooms.map((r) => mapServerRoomToItem(r, currentUid)));
   }, [currentUser?.id]);
 
+  // Fetch authoritative profile statistics from durable room history. Called
+  // after every lifecycle mutation (create/join/leave/room end) so the
+  // profile/dashboard never waits for a page reload.
+  const refreshRoomStats = useCallback(async () => {
+    const res = await fetchProfileStatsApi();
+    if (res.stats) setRoomStats(res.stats);
+  }, []);
+
   // WebRTC Instance Lifecycle for Active Room
   useEffect(() => {
     if (!currentRoom?.id) {
@@ -309,8 +343,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       webrtcRef.current = null;
       setLocalMediaStream(null);
       setLocalScreenStream(null);
+      setLocalMovieStream(null);
       setRemoteCameraStreams(new Map());
       setRemoteScreenStreams(new Map());
+      setRemoteMovieStreams(new Map());
       return;
     }
 
@@ -324,7 +360,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       onLocalScreenStreamChange: (stream) => {
         setLocalScreenStream(stream ? new MediaStream(stream.getTracks()) : null);
       },
-      onRemoteStreamChange: (userId, cameraStream, screenStream) => {
+      onLocalMovieStreamChange: (stream) => {
+        setLocalMovieStream(stream ? new MediaStream(stream.getTracks()) : null);
+      },
+      onRemoteStreamChange: (userId, cameraStream, screenStream, movieStream) => {
         setRemoteCameraStreams((prev) => {
           const next = new Map(prev);
           if (cameraStream && cameraStream.getTracks().length > 0) {
@@ -346,6 +385,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 userId,
                 streamId: screenStream.id,
                 tracks: screenStream.getTracks().map((t) => `${t.kind}:${t.readyState}`),
+              });
+            }
+          } else {
+            next.delete(userId);
+          }
+          return next;
+        });
+
+        // Phase 6.10: movie streams are stored in their own map so the Watch
+        // stage can attach the host's movie to a dedicated <video> element.
+        setRemoteMovieStreams((prev) => {
+          const next = new Map(prev);
+          if (movieStream && movieStream.getTracks().length > 0) {
+            const isNew = !next.has(userId) || next.get(userId) !== movieStream;
+            next.set(userId, movieStream);
+            if (isNew) {
+              console.log('[MOVIE UI] movieStream received:', {
+                ts: new Date().toISOString(),
+                userId,
+                streamId: movieStream.id,
+                tracks: movieStream.getTracks().map((t) => `${t.kind}:${t.readyState}`),
               });
             }
           } else {
@@ -389,8 +449,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
       setLocalMediaStream(null);
       setLocalScreenStream(null);
+      setLocalMovieStream(null);
       setRemoteCameraStreams(new Map());
       setRemoteScreenStreams(new Map());
+      setRemoteMovieStreams(new Map());
     };
   }, [currentRoom?.id, currentUser?.id]);
 
@@ -483,8 +545,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   useEffect(() => {
     if (isAuthenticated) {
       refreshRooms();
+      refreshRoomStats();
     }
-  }, [isAuthenticated, refreshRooms]);
+  }, [isAuthenticated, refreshRooms, refreshRoomStats]);
 
   const login = (user: AuthUser) => {
     setCurrentUser(user);
@@ -493,6 +556,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     applyUserToProfile(user);
     setActiveTab('dashboard');
     refreshRooms();
+    refreshRoomStats();
   };
 
   const logout = async () => {
@@ -694,6 +758,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setScreenShareOn(currentUser?.id === serverRoom.hostUserId ? serverRoom.screenShareActive : false);
     setActiveTab('room');
     refreshRooms();
+    refreshRoomStats();
     return true;
   };
 
@@ -742,6 +807,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setScreenShareOn(false);
     setActiveTab('room');
     refreshRooms();
+    refreshRoomStats();
     return roomItem;
   };
 
@@ -755,8 +821,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setMicOn(false);
     setCameraOn(false);
     setScreenShareOn(false);
+    setMediaConversion(null);
     setActiveTab('dashboard');
     refreshRooms();
+    refreshRoomStats();
   };
 
   const sendRoomChatMessage = async (text: string) => {
@@ -803,7 +871,50 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setMediaErrorMessage(msg);
       return { ok: false, error: msg };
     }
+    if (res.data?.conversion) {
+      setMediaConversion({
+        status: res.data.conversion.status,
+        title: res.data.conversion.title,
+      });
+    }
     return { ok: true };
+  };
+
+  const setLocalMovieActive = async (
+    stream: MediaStream | null,
+    metadata?: { title?: string; mimeType?: string; duration?: number; sourceUserId?: string }
+  ): Promise<boolean> => {
+    if (!currentRoom || !currentRoom.isHost) return false;
+    const manager = webrtcRef.current;
+    if (!manager) return false;
+
+    if (!stream) {
+      // Stop: detach the movie senders (stops the captured tracks) and clear
+      // the room's local-movie metadata.
+      manager.setLocalMovieStream(null);
+      await setRoomMediaApi(currentRoom.id, null).catch(() => {});
+      return true;
+    }
+
+    // Start: attach the captured stream to every WebRTC peer (this is where
+    // the movie bytes flow: host → WebRTC → participants) and announce ONLY
+    // lightweight metadata — the file and its blob URL never leave the device.
+    if (!manager.setLocalMovieStream(stream)) {
+      return false;
+    }
+    const res = await setRoomMediaApi(currentRoom.id, {
+      title: metadata?.title?.trim() || 'Local movie',
+      mediaType: 'local-movie',
+      mimeType: metadata?.mimeType,
+      duration: metadata?.duration,
+      sourceUserId: currentUser?.id,
+    });
+    if (!res.ok) {
+      manager.setLocalMovieStream(null);
+      return false;
+    }
+    await setPlaybackApi(currentRoom.id, { isPlaying: true, position: 0 });
+    return true;
   };
 
   const setRoomPlayback = async (input: { isPlaying: boolean; position?: number }): Promise<boolean> => {
@@ -897,7 +1008,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setRoomSseState('CLOSED');
     setActiveTab('dashboard');
     refreshRooms();
-  }, [refreshRooms]);
+    refreshRoomStats();
+  }, [refreshRooms, refreshRoomStats]);
 
   useEffect(() => {
     if (!currentRoom?.id) return;
@@ -914,10 +1026,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             if (updated) {
               const item = mapServerRoomToItem(updated, uid);
               setCurrentRoom(item);
+              if (updated.currentMedia) {
+                // Media (re)published — any pending conversion is complete;
+                // the room now points at the browser-playable file (or, for
+                // local movies, at metadata-only state shared via WebRTC).
+                setMediaConversion(null);
+              }
               if (updated.members) {
                 setParticipants(updated.members.map((m) => mapServerMemberToParticipant(m, uid)));
               }
               setScreenShareOn(updated.hostUserId === uid ? updated.screenShareActive : false);
+            }
+            break;
+          }
+
+          case 'media:conversion': {
+            const status = payload.status as string;
+            const title = payload.title as string | undefined;
+            if (status === 'processing') {
+              setMediaConversion({ status, title });
+            } else if (status === 'ready') {
+              setMediaConversion(null);
+            } else if (status === 'failed') {
+              setMediaConversion({ status, title });
             }
             break;
           }
@@ -1116,6 +1247,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         refreshRooms,
 participants,
         roomSseState,
+        mediaConversion,
+        clearMediaConversion,
         updateParticipantRole,
         kickParticipant,
         chatMessages,
@@ -1131,11 +1264,15 @@ participants,
         scheduledParties,
         scheduleParty,
         watchHistory,
+        roomStats,
+        refreshRoomStats,
         localMediaStream,
         localScreenStream,
+        localMovieStream,
         remoteMediaStreams: remoteCameraStreams,
         remoteCameraStreams,
         remoteScreenStreams,
+        remoteMovieStreams,
         mediaErrorMessage,
         mediaDiagnosticError,
         clearMediaError,
@@ -1154,6 +1291,7 @@ participants,
         sendReaction,
         setRoomMedia,
         uploadRoomMedia,
+        setLocalMovieActive,
         friends,
         activeDMId,
         setActiveDMId,

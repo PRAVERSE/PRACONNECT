@@ -177,10 +177,74 @@ export const schema = `
     size      INTEGER NOT NULL,
     mimeType  TEXT,
     createdAt TEXT NOT NULL,
+    -- Phase 6.9: MKV source files are converted to a browser-playable MP4.
+    -- The playable file has its own row whose sourceFilename points at the
+    -- stored source, and the source row tracks the conversion lifecycle.
+    sourceFilename    TEXT,
+    playableFilename  TEXT,
+    conversionStatus  TEXT NOT NULL DEFAULT 'uploaded',
     FOREIGN KEY (roomId) REFERENCES rooms (id) ON DELETE CASCADE,
     FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE
   );
 
   CREATE INDEX IF NOT EXISTS idx_uploads_room
     ON uploads (roomId);
+
+  -- ─── Persistent room history / user statistics ─────────────────────────────
+  -- Active room state (rooms, roomMembers, roomEvents, uploads) is deleted by
+  -- the 5-minute empty-room cleanup. These tables are the durable record of
+  -- every room session and every participation, so profile/dashboard
+  -- statistics survive active-room cleanup. They intentionally have NO foreign
+  -- key to the rooms table - history must outlive the active room row. Room
+  -- ids are 32-hex random values (never reused), but each history row still
+  -- gets its own immutable history id.
+
+  CREATE TABLE IF NOT EXISTS roomHistory (
+    id                 TEXT PRIMARY KEY,
+    roomId             TEXT NOT NULL,
+    roomCode           TEXT NOT NULL,
+    roomName           TEXT NOT NULL,
+    hostUserId         TEXT NOT NULL,
+    category           TEXT NOT NULL DEFAULT 'Other',
+    createdAt          TEXT NOT NULL,
+    emptySince         TEXT,
+    endedAt            TEXT,
+    durationSeconds    INTEGER NOT NULL DEFAULT 0,
+    participantCount   INTEGER NOT NULL DEFAULT 0,
+    maxParticipants    INTEGER NOT NULL DEFAULT 8,
+    createdMediaTitle  TEXT,
+    createdMediaType   TEXT,
+    FOREIGN KEY (hostUserId) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_room_history_room
+    ON roomHistory (roomId);
+
+  CREATE INDEX IF NOT EXISTS idx_room_history_host
+    ON roomHistory (hostUserId);
+
+  CREATE TABLE IF NOT EXISTS roomHistoryMembers (
+    id              TEXT PRIMARY KEY,
+    historyId       TEXT NOT NULL,
+    roomId          TEXT NOT NULL,
+    userId          TEXT NOT NULL,
+    role            TEXT NOT NULL DEFAULT 'member',
+    joinedAt        TEXT NOT NULL,
+    leftAt          TEXT,
+    durationSeconds INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (historyId) REFERENCES roomHistory (id) ON DELETE CASCADE,
+    FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE,
+    -- One historical participation per user per room session: reconnects and
+    -- re-joins update the same row instead of duplicating it.
+    UNIQUE (historyId, userId)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_room_history_members_history
+    ON roomHistoryMembers (historyId);
+
+  CREATE INDEX IF NOT EXISTS idx_room_history_members_user
+    ON roomHistoryMembers (userId);
+
+  CREATE INDEX IF NOT EXISTS idx_room_history_members_room
+    ON roomHistoryMembers (roomId);
 `;
