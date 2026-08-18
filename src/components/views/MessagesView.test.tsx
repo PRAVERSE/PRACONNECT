@@ -27,8 +27,19 @@ test('A: Messages has a page header matching the Friends/Explore heading rhythm'
   const h1 = source.slice(h1Idx, source.indexOf('</h1>', h1Idx));
   assert.match(h1, /Messages/, 'heading copy must be "Messages"');
   assert.match(h1, /font-display font-bold tracking-\[-0.02em\]/, 'heading uses the PraConnect display type');
-  assert.match(source, /flex items-center justify-between gap-4 mb-6 shrink-0/, 'header row mirrors FriendsView layout');
+  assert.match(source, /flex items-start justify-between gap-4 pb-6 mb-0 border-b border-\[var\(--border-hairline\)\] shrink-0/, 'header row mirrors the Home/Explore/Settings page rhythm');
   assert.match(source, /New Message/, 'header offers the New Message action like Explore offers Create Room');
+});
+
+// ─── B. Horizontal header divider ────────────────────────────────────────────
+
+test('B: the page header ends in a single thin hairline divider', () => {
+  const headerIdx = source.indexOf('<header');
+  const headerEnd = source.indexOf('</header>', headerIdx);
+  const header = source.slice(headerIdx, headerEnd);
+  assert.match(header, /border-b border-\[var\(--border-hairline\)\]/, 'header ends with the thin hairline');
+  assert.match(header, /pb-6 mb-0/, 'spacing rhythm: pb-6, zero bottom margin');
+  assert.doesNotMatch(source, /h-px w-full bg-\[var\(--border-hairline\)\]/, 'no standalone divider div — the header line is the only divider');
 });
 
 // ─── B. Page-shell opt-out — Messages fills the full main height ────────────
@@ -60,7 +71,7 @@ test('B2: Messages root fills height, keeps page rhythm, has no bottom padding',
 });
 
 test('B3: header is shrink-0, workspace is flex-1 min-h-0, no height hacks', () => {
-  assert.match(source, /flex items-center justify-between gap-4 mb-6 shrink-0/, 'page header is shrink-0');
+  assert.match(source, /flex items-start justify-between gap-4 pb-6 mb-0 border-b border-\[var\(--border-hairline\)\] shrink-0/, 'page header is shrink-0');
   assert.match(source, /flex-1 min-h-0 w-full flex overflow-hidden/, 'workspace is flex-1 min-h-0');
   assert.doesNotMatch(source, /h-\[calc\(/, 'the calc height hack must not return');
   assert.doesNotMatch(source, /-mb-|-mt-/, 'no negative-margin height compensation');
@@ -91,17 +102,40 @@ test('D: separation is by surface contrast only — no vertical rule', () => {
   assert.doesNotMatch(asideTag, /border|rounded/, 'rail itself has no border or radius shell');
 });
 
+// ─── D2. No outer shadow ──────────────────────────────────────────────────────
+
+test('D2: no heavy shadows anywhere on the Messages page', () => {
+  assert.doesNotMatch(source, /shadow-xl|shadow-2xl/, 'no heavy card shadows');
+  const wrapIdx = source.indexOf('flex-1 min-h-0 w-full flex overflow-hidden');
+  const wrapTag = source.slice(wrapIdx, source.indexOf('>', wrapIdx));
+  assert.doesNotMatch(wrapTag, /shadow/, 'workspace wrapper has no shadow');
+});
+
 // ─── E. Conversation search remains ───────────────────────────────────────────
 
-test('E: the conversation search is the only one, inside the rail', () => {
+test('E: the conversation search is the only one, inside the rail, compact', () => {
   const asideStart = source.indexOf('<aside');
   const asideEnd = source.indexOf('</aside>');
   assert.ok(asideStart >= 0 && asideEnd > asideStart);
   const searchIdx = source.indexOf('placeholder="Search conversations..."');
   assert.ok(searchIdx > asideStart && searchIdx < asideEnd, 'search must live inside the conversation rail');
   assert.equal(source.indexOf('placeholder="Search conversations..."', searchIdx + 1), -1, 'no duplicate search bar');
-  const searchField = source.slice(searchIdx, searchIdx + 300);
-  assert.match(searchField, /field w-full pl-12 pr-10/, 'search uses the same .field sizing as Explore');
+  const searchField = source.slice(searchIdx - 200, searchIdx + 400);
+  assert.match(searchField, /max-w-\[420px\]/, 'search is compact — capped at 420px');
+  assert.match(searchField, /h-10/, 'search is compact — 40px tall');
+  assert.match(searchField, /rounded-xl/, 'search is compact — small radius, not a 24px panel');
+  assert.match(source, /shrink-0 px-1 pt-4 pb-3\.5 border-b border-\[var\(--border-hairline\)\]/, 'search section ends in a hairline');
+});
+
+// ─── F. Conversation rows are hairline-separated line rows, not cards ────────
+
+test('F: conversation rows are hairline-separated line rows, not cards', () => {
+  const rowIdx = source.indexOf('w-full px-1 py-3 flex items-center gap-3');
+  assert.ok(rowIdx >= 0, 'conversation row must exist');
+  const row = source.slice(rowIdx, rowIdx + 300);
+  assert.match(row, /border-b border-\[var\(--border-hairline\)\]/, 'every row ends in a thin hairline rule');
+  assert.match(source, /isSelected \? 'bg-\[var\(--bg-glass\)\]' : 'hover:bg-\[var\(--bg-glass\)\]'/, 'selected row uses the subtle glass wash, not a filled card');
+  assert.doesNotMatch(row, /rounded-xl|rounded-2xl|shadow/, 'rows have no card shell');
 });
 
 // ─── F. Chat header remains ───────────────────────────────────────────────────
@@ -165,15 +199,17 @@ test('J: the no-conversation-selected empty state is centered and restrained', (
 
 // ─── Rail + chat surface classes (design-system tokens only) ─────────────────
 
-test('layout: rail uses bg-surface-2 contrast, chat sits on the page canvas', () => {
+test('layout: rail and chat sit on ONE transparent page canvas — no panel blocks', () => {
   const asideStart = source.indexOf('<aside');
   const asideTag = source.slice(asideStart, source.indexOf('>', asideStart));
-  assert.match(asideTag, /bg-\[var\(--bg-surface-2\)\]/, 'rail uses the subtle darker surface');
+  assert.match(asideTag, /bg-transparent/, 'rail has NO background block — same canvas as the page');
+  assert.doesNotMatch(asideTag, /bg-\[var\(--bg-surface-1\)\]|bg-\[var\(--bg-surface-2\)\]|bg-\[var\(--bg-canvas\)\]/, 'rail is NOT a filled panel');
   assert.match(asideTag, /md:w-\[280px\] lg:w-\[320px\]/, 'rail narrows on tablet, fixed on desktop');
   assert.match(asideTag, /shrink-0/, 'rail must not shrink');
   const sectionIdx = source.indexOf('<section');
   const sectionTag = source.slice(sectionIdx, source.indexOf('>', sectionIdx));
-  assert.match(sectionTag, /bg-\[var\(--bg-canvas\)\]/, 'chat area blends with the page canvas');
+  assert.match(sectionTag, /bg-transparent/, 'chat area has NO background block — same canvas as the page');
+  assert.doesNotMatch(sectionTag, /bg-\[var\(--bg-canvas\)\]|bg-\[var\(--bg-surface-1\)\]|bg-\[var\(--bg-surface-2\)\]/, 'chat area is NOT a filled panel');
   assert.match(sectionTag, /flex-1 min-w-0 min-h-0/, 'chat area fills remaining space');
 });
 
@@ -190,9 +226,45 @@ test('K: messaging handlers remain unchanged', () => {
   assert.match(source, /activeFriend \? 'flex' : 'hidden md:flex'/, 'mobile list/detail navigation preserved');
 });
 
+// ─── L. Context menus remain wired ───────────────────────────────────────────
+
+test('L: message and conversation context menus remain wired', () => {
+  assert.match(source, /openMessageMenu\(msg, e\.clientX, e\.clientY\)/, 'message right-click opens the context menu');
+  assert.match(source, /openConversationMenu\(conv\.friendId, e\.clientX, e\.clientY\)/, 'conversation right-click opens the context menu');
+  assert.match(source, /messageLongPress\.onTouchStart\(e\)/, 'message long-press preserved');
+  assert.match(source, /conversationLongPress\.onTouchStart\(e\)/, 'conversation long-press preserved');
+  assert.match(source, /<ContextMenu/, 'ContextMenu component remains rendered');
+});
+
 // ─── Old oversized title/subtitle never returns ───────────────────────────────
 
 test('no-regression: the old "Direct Messages" heading and subtitle are gone', () => {
   assert.doesNotMatch(source, /Direct Messages/);
   assert.doesNotMatch(source, /Chat with friends, or invite them straight into your watch room\./);
+});
+
+// ─── No-regression: the chat-app box look is gone ────────────────────────────
+
+test('no-regression: no panel blocks, outer border, or card wrappers anywhere', () => {
+  assert.doesNotMatch(source, /bg-\[var\(--bg-surface-1\)\]|bg-\[var\(--bg-surface-2\)\]/, 'no surface block on the page');
+  assert.doesNotMatch(source, /bg-\[var\(--bg-canvas\)\]/, 'no second paint layer — one continuous canvas');
+  assert.doesNotMatch(source, /shadow-xl|shadow-2xl/, 'no heavy shadows');
+  const wrapIdx = source.indexOf('flex-1 min-h-0 w-full flex overflow-hidden');
+  const wrapTag = source.slice(wrapIdx, source.indexOf('>', wrapIdx));
+  assert.doesNotMatch(wrapTag, /rounded|border|shadow/, 'workspace wrapper has no radius, border, or shadow');
+  const sectionIdx = source.indexOf('<section');
+  const sectionTag = source.slice(sectionIdx, source.indexOf('>', sectionIdx));
+  assert.doesNotMatch(sectionTag, /rounded|border|shadow/, 'chat section has no radius, border, or shadow');
+  const asideStart = source.indexOf('<aside');
+  const asideTag = source.slice(asideStart, source.indexOf('>', asideStart));
+  assert.doesNotMatch(asideTag, /border|rounded|shadow/, 'rail has no border, radius, or shadow shell');
+});
+
+test('J2: the no-conversations empty state is centered text on the canvas — no panel', () => {
+  const emptyIdx = source.indexOf('No conversations yet');
+  assert.ok(emptyIdx >= 0, 'empty-state copy must exist');
+  const region = source.slice(emptyIdx - 500, emptyIdx + 300);
+  assert.match(region, /items-center justify-center/, 'empty state is centered');
+  assert.match(region, /Add friends from the Friends section to start chatting\./, 'empty-state guidance remains');
+  assert.doesNotMatch(region, /rounded-2xl|float-surface|shadow/, 'empty state has no card shell');
 });

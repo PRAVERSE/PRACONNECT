@@ -530,7 +530,7 @@ export const MessagesView: React.FC = () => {
     <div className="w-full h-full min-h-0 flex flex-col pt-8 md:pt-10 px-4 sm:px-8 md:px-16 text-[var(--text-primary)] font-['Inter',sans-serif] select-none">
       {/* ─── PAGE HEADER — same rhythm as Friends/Explore ──────────────────── */}
       <header
-        className={`flex items-center justify-between gap-4 mb-6 shrink-0 ${
+        className={`flex items-start justify-between gap-4 pb-6 mb-0 border-b border-[var(--border-hairline)] shrink-0 ${
           activeConversation ? 'hidden md:flex' : 'flex'
         }`}
         style={{ animation: 'rise 640ms var(--ease) both' }}
@@ -560,44 +560,39 @@ export const MessagesView: React.FC = () => {
         </button>
       </header>
 
-      {/* ─── Thin section divider, matching the rest of the app ─────────────── */}
-      <div
-        className={`h-px w-full bg-[var(--border-hairline)] shrink-0 ${
-          activeConversation ? 'hidden md:block' : 'block'
-        }`}
-      />
-
       {/* ─── MESSAGING WORKSPACE — fills the remaining page height ─────────── */}
       <div className="flex-1 min-h-0 w-full flex overflow-hidden">
-        {/* ─── LEFT: Conversation rail — quiet section, contrast not boxes ─── */}
+        {/* ─── LEFT: Conversation rail — same canvas as the page, no block ─── */}
         <aside
-          className={`w-full md:w-[280px] lg:w-[320px] shrink-0 h-full min-h-0 bg-[var(--bg-surface-2)] flex flex-col ${
+          className={`w-full md:w-[280px] lg:w-[320px] shrink-0 h-full min-h-0 bg-transparent flex flex-col ${
             activeConversation ? 'hidden md:flex' : 'flex'
           }`}
         >
           {!hasNoConversations && (
-            <div className="px-4 pt-4 pb-3 shrink-0 relative">
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search conversations..."
-                className="field w-full pl-12 pr-10"
-                aria-label="Search conversations"
-              />
-              <Search
-                className="w-4 h-4 text-[var(--text-tertiary)] absolute left-[18px] top-1/2 -translate-y-1/2 pointer-events-none"
-                aria-hidden="true"
-              />
-              {hasSearchQuery && (
-                <button
-                  onClick={() => setSearchQuery('')}
-                  className="absolute right-4 top-1/2 -translate-y-1/2 p-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] transition-colors rounded-full cursor-pointer"
-                  aria-label="Clear search query"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              )}
+            <div className="shrink-0 px-1 pt-4 pb-3.5 border-b border-[var(--border-hairline)]">
+              <div className="relative max-w-[420px]">
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search conversations..."
+                  className="w-full h-10 pl-12 pr-10 rounded-xl border-none bg-[var(--bg-glass)] text-[13px] text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] transition-shadow transition-colors focus:outline-none focus:shadow-[0_0_0_3px_var(--emphasis-dim)] focus:bg-[var(--bg-glass)]"
+                  aria-label="Search conversations"
+                />
+                <Search
+                  className="w-4 h-4 text-[var(--text-tertiary)] absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none"
+                  aria-hidden="true"
+                />
+                {hasSearchQuery && (
+                  <button
+                    onClick={() => setSearchQuery('')}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 p-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] transition-colors rounded-full cursor-pointer"
+                    aria-label="Clear search query"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
@@ -611,7 +606,7 @@ export const MessagesView: React.FC = () => {
                   No conversations yet
                 </h3>
                 <p className="text-xs text-[var(--text-secondary)] mb-5 leading-relaxed max-w-[220px]">
-                  Add friends from the Friends tab to start chatting.
+                  Add friends from the Friends section to start chatting.
                 </p>
                 <button
                   onClick={() => setActiveTab('friends')}
@@ -644,7 +639,7 @@ export const MessagesView: React.FC = () => {
                         c.username.toLowerCase().includes(searchQuery.toLowerCase())
                       );
                     })
-                    .map((conv, i) => {
+                    .map((conv) => {
                       const isSelected = conv.friendId === activeConversation?.friendId;
                       const lastMsg = conv.lastMessage;
                       const unread = conv.unreadCount ?? 0;
@@ -665,10 +660,8 @@ export const MessagesView: React.FC = () => {
                           onTouchEnd={conversationLongPress.onTouchEnd}
                           onTouchCancel={conversationLongPress.onTouchCancel}
                           onClickCapture={conversationLongPress.onClickCapture}
-                          className={`w-full px-4 py-3 flex items-center gap-3 text-left transition-colors cursor-pointer ${
-                            i > 0 ? 'border-t border-[var(--border-hairline)]' : ''
-                          } ${
-                            isSelected ? 'bg-[var(--emphasis-dim)]' : 'hover:bg-[var(--bg-glass)]'
+                          className={`w-full px-1 py-3 flex items-center gap-3 text-left transition-colors cursor-pointer border-b border-[var(--border-hairline)] ${
+                            isSelected ? 'bg-[var(--bg-glass)]' : 'hover:bg-[var(--bg-glass)]'
                           }`}
                         >
                           <div className="relative shrink-0">
@@ -730,7 +723,7 @@ export const MessagesView: React.FC = () => {
                         f.username.toLowerCase().includes(searchQuery.toLowerCase())
                       );
                     })
-                    .map((friend, i) => {
+                    .map((friend) => {
                       const isSelected = friend.id === activeConversation?.friendId;
                       return (
                         <button
@@ -749,10 +742,8 @@ export const MessagesView: React.FC = () => {
                           onTouchEnd={conversationLongPress.onTouchEnd}
                           onTouchCancel={conversationLongPress.onTouchCancel}
                           onClickCapture={conversationLongPress.onClickCapture}
-                          className={`w-full px-4 py-3 flex items-center gap-3 text-left transition-colors cursor-pointer ${
-                            i > 0 ? 'border-t border-[var(--border-hairline)]' : ''
-                          } ${
-                            isSelected ? 'bg-[var(--emphasis-dim)]' : 'hover:bg-[var(--bg-glass)]'
+                          className={`w-full px-1 py-3 flex items-center gap-3 text-left transition-colors cursor-pointer border-b border-[var(--border-hairline)] ${
+                            isSelected ? 'bg-[var(--bg-glass)]' : 'hover:bg-[var(--bg-glass)]'
                           }`}
                         >
                           <div className="relative shrink-0">
@@ -786,9 +777,9 @@ export const MessagesView: React.FC = () => {
           </div>
         </aside>
 
-        {/* ─── RIGHT: Chat area — page surface, no box ─────────────────────── */}
+        {/* ─── RIGHT: Chat area — same canvas as the page, no box ─────────── */}
         <section
-          className={`flex-1 min-w-0 min-h-0 bg-[var(--bg-canvas)] flex flex-col ${
+          className={`flex-1 min-w-0 min-h-0 bg-transparent flex flex-col ${
             activeFriend ? 'flex' : 'hidden md:flex'
           }`}
         >
