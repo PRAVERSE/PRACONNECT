@@ -84,8 +84,10 @@ export const ProfileView: React.FC = () => {
 
   // A historical entry is still ACTIVE (joinable) only while its room appears
   // in the live room list without an emptySince marker. Expired rooms are
-  // shown as ENDED — never as joinable.
-  const activeRoomIds = new Set(rooms.filter((r) => !r.emptySince).map((r) => r.id));
+  // shown as ENDED — never as joinable. Empty rooms inside the 5-minute
+  // rejoin window are still joinable, so they stay ACTIVE until the window
+  // closes (the server excludes expired rooms from the listing entirely).
+  const activeRoomIds = new Set(rooms.filter((r) => !r.emptySince || r.isRejoinable).map((r) => r.id));
   const recentRooms = roomStats?.recentRooms ?? [];
 
   // Watch history rendered from durable history (title/media fall back to the

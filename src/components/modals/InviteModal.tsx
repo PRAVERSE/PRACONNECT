@@ -1,11 +1,13 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
 import { UserAvatar } from '../common/UserAvatar';
+import { Loader } from 'lucide-react';
 
 export const InviteModal: React.FC = () => {
-  const { inviteModalOpen, setInviteModalOpen, currentRoom, friends } = useApp();
+  const { inviteModalOpen, setInviteModalOpen, currentRoom, friends, sendWatchInvite } = useApp();
   const [copied, setCopied] = useState(false);
   const [invitedFriends, setInvitedFriends] = useState<string[]>([]);
+  const [sendingId, setSendingId] = useState<string | null>(null);
 
   if (!inviteModalOpen || !currentRoom) return null;
 
@@ -17,7 +19,11 @@ export const InviteModal: React.FC = () => {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleSendInvite = (friendId: string) => {
+  const handleSendInvite = async (friendId: string) => {
+    if (sendingId) return;
+    setSendingId(friendId);
+    await sendWatchInvite(friendId, currentRoom.id);
+    setSendingId(null);
     setInvitedFriends((prev) => [...prev, friendId]);
   };
 
@@ -87,14 +93,17 @@ export const InviteModal: React.FC = () => {
 
                   <button
                     onClick={() => handleSendInvite(friend.id)}
-                    disabled={isInvited}
-                    className={`px-3.5 py-1.5 rounded-full text-xs font-semibold transition-colors cursor-pointer ${
+                    disabled={isInvited || Boolean(sendingId)}
+                    className={`px-3.5 py-1.5 rounded-full text-xs font-semibold transition-colors cursor-pointer flex items-center gap-1.5 ${
                       isInvited
                         ? 'bg-[var(--bg-glass)] text-[var(--text-tertiary)]'
                         : 'bg-[var(--emphasis)] text-[var(--bg)] hover:bg-[var(--emphasis-strong)]'
-                    }`}
+                    } disabled:opacity-60`}
                   >
-                    {isInvited ? 'Sent' : 'Invite'}
+                    {sendingId === friend.id ? (
+                      <Loader className="w-3 h-3 animate-spin" aria-hidden="true" />
+                    ) : null}
+                    {isInvited ? 'Invited' : 'Invite'}
                   </button>
                 </div>
               );

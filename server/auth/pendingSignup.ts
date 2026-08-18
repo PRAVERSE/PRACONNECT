@@ -2,7 +2,7 @@
 // Handles temporary unverified signup records in the pendingSignups table.
 // A PraConnect account is ONLY created in the users table after successful OTP verification.
 
-import { db } from '../db/index';
+import { db, bootstrapAdminRole } from '../db/index';
 import { generateId } from './auth';
 
 const OTP_EXPIRY_MS = 10 * 60 * 1000; // 10 minutes
@@ -187,5 +187,8 @@ export async function verifyPendingSignupOtp(
     return { ok: false, error: 'INVALID' };
   }
 
-  return { ok: true, user: createdUser };
+  bootstrapAdminRole();
+  const finalUser = (db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as UserRow | undefined) ?? createdUser;
+
+  return { ok: true, user: finalUser };
 }

@@ -11,6 +11,10 @@ export const schema = `
     avatarUrl    TEXT,
     emailVerified INTEGER NOT NULL DEFAULT 0,
     googleProviderId TEXT,
+    -- Phase A: admin role. Default is 'user' — only the server-side bootstrap
+    -- (ADMIN_EMAIL) promotes the designated owner account to 'admin'. A role
+    -- sent from the client is never accepted.
+    role         TEXT NOT NULL DEFAULT 'user',
     createdAt    TEXT NOT NULL,
     updatedAt    TEXT NOT NULL
   );
@@ -247,4 +251,278 @@ export const schema = `
 
   CREATE INDEX IF NOT EXISTS idx_room_history_members_room
     ON roomHistoryMembers (roomId);
+
+  -- ─── Social: friendships, direct messages, watch invites ─────────────────
+  -- One canonical row per relationship (never A->B + B->A duplicates). The
+  -- expression-based unique index enforces a single active row for the pair in
+  -- either direction — rejected rows are excluded so a fresh request is
+  -- possible after a rejection.
+
+  CREATE TABLE IF NOT EXISTS friendships (
+    id          TEXT PRIMARY KEY,
+    requesterId TEXT NOT NULL,
+    recipientId TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    createdAt   TEXT NOT NULL,
+    updatedAt   TEXT NOT NULL,
+    acceptedAt  TEXT,
+    FOREIGN KEY (requesterId) REFERENCES users (id) ON DELETE CASCADE,
+    FOREIGN KEY (recipientId) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_friendships_pair
+    ON friendships (
+      CASE WHEN requesterId < recipientId THEN requesterId ELSE recipientId END,
+      CASE WHEN requesterId < recipientId THEN recipientId ELSE requesterId END
+    )
+    WHERE status IN ('pending', 'accepted');
+
+  CREATE INDEX IF NOT EXISTS idx_friendships_requester
+    ON friendships (requesterId, status);
+
+  CREATE INDEX IF NOT EXISTS idx_friendships_recipient
+    ON friendships (recipientId, status);
+
+  CREATE TABLE IF NOT EXISTS directMessages (
+    id          TEXT PRIMARY KEY,
+    senderId    TEXT NOT NULL,
+    recipientId TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    createdAt   TEXT NOT NULL,
+    FOREIGN KEY (senderId) REFERENCES users (id) ON DELETE CASCADE,
+    FOREIGN KEY (recipientId) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_direct_messages_conversation
+    ON directMessages (senderId, recipientId, createdAt);
+
+  CREATE INDEX IF NOT EXISTS idx_direct_messages_recipient
+    ON directMessages (recipientId, createdAt);
+
+  CREATE TABLE IF NOT EXISTS watchInvites (
+    id             TEXT PRIMARY KEY,
+    senderUserId   TEXT NOT NULL,
+    recipientUserId TEXT NOT NULL,
+    roomId         TEXT NOT NULL,
+    roomCode       TEXT NOT NULL,
+    roomName       TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending',
+    createdAt      TEXT NOT NULL,
+    expiresAt      TEXT NOT NULL,
+    respondedAt    TEXT,
+    FOREIGN KEY (senderUserId) REFERENCES users (id) ON DELETE CASCADE,
+    FOREIGN KEY (recipientUserId) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_watch_invites_recipient
+    ON watchInvites (recipientUserId, status);
+
+  CREATE INDEX IF NOT EXISTS idx_watch_invites_sender
+    ON watchInvites (senderUserId, createdAt);
+
+  -- ─── Direct-message context features ───────────────────────────────────────
+  -- Per-user pin rows: a user can pin several messages in a conversation. The
+  -- UNIQUE(messageId, pinnedByUserId) pair prevents duplicate pins of the same
+  -- message by the same user. Pinned state is visible to both participants
+  -- (shared message state), like WhatsApp.
+
+  CREATE TABLE IF NOT EXISTS messagePins (
+    id             TEXT PRIMARY KEY,
+    messageId      TEXT NOT NULL,
+    conversationId TEXT NOT NULL,
+    pinnedByUserId TEXT NOT NULL,
+    createdAt      TEXT NOT NULL,
+    FOREIGN KEY (messageId) REFERENCES directMessages (id) ON DELETE CASCADE,
+    FOREIGN KEY (pinnedByUserId) REFERENCES users (id) ON DELETE CASCADE,
+    UNIQUE (messageId, pinnedByUserId)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_message_pins_message
+    ON messagePins (messageId);
+
+  CREATE INDEX IF NOT EXISTS idx_message_pins_conversation
+    ON messagePins (conversationId, pinnedByUserId);
+
+  -- Stars are strictly user-specific: only the starring user ever sees them.
+
+  CREATE TABLE IF NOT EXISTS starredMessages (
+    id        TEXT PRIMARY KEY,
+    userId    TEXT NOT NULL,
+    messageId TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE,
+    FOREIGN KEY (messageId) REFERENCES directMessages (id) ON DELETE CASCADE,
+    UNIQUE (userId, messageId)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_starred_messages_user
+    ON starredMessages (userId);
+
+  CREATE INDEX IF NOT EXISTS idx_starred_messages_message
+    ON starredMessages (messageId);
+
+  -- "Delete for me" is a per-user tombstone: shared rows are never destroyed,
+  -- each user's message queries exclude rows tombstoned for them.
+
+  CREATE TABLE IF NOT EXISTS messageDeletions (
+    id        TEXT PRIMARY KEY,
+    messageId TEXT NOT NULL,
+    userId    TEXT NOT NULL,
+    deletedAt TEXT NOT NULL,
+    FOREIGN KEY (messageId) REFERENCES directMessages (id) ON DELETE CASCADE,
+    FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE,
+    UNIQUE (messageId, userId)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_message_deletions_user
+    ON messageDeletions (userId);
+
+  CREATE INDEX IF NOT EXISTS idx_message_deletions_message
+    ON messageDeletions (messageId);
+
+  -- Per-user conversation preferences. conversationId is the canonical pair id
+  -- of the two participants (sorted-user ids joined with ':'), so both users
+  -- address the same conversation while every column stays user-specific.
+
+  CREATE TABLE IF NOT EXISTS conversationUserSettings (
+    userId            TEXT NOT NULL,
+    conversationId    TEXT NOT NULL,
+    archived          INTEGER NOT NULL DEFAULT 0,
+    pinned            INTEGER NOT NULL DEFAULT 0,
+    favourite         INTEGER NOT NULL DEFAULT 0,
+    locked            INTEGER NOT NULL DEFAULT 0,
+    lastReadAt        TEXT,
+    lastReadMessageId TEXT,
+    updatedAt         TEXT NOT NULL,
+    PRIMARY KEY (userId, conversationId),
+    FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_conv_user_settings_user
+    ON conversationUserSettings (userId);
+
+  CREATE INDEX IF NOT EXISTS idx_conv_user_settings_conversation
+    ON conversationUserSettings (conversationId);
+
+  -- Per-user application-level chat locks. Only a server-side hash of the PIN
+  -- is stored — never the plaintext PIN. This is app-level locking only.
+
+  CREATE TABLE IF NOT EXISTS chatLocks (
+    id             TEXT PRIMARY KEY,
+    userId         TEXT NOT NULL,
+    conversationId TEXT NOT NULL,
+    pinHash        TEXT NOT NULL,
+    createdAt      TEXT NOT NULL,
+    updatedAt      TEXT NOT NULL,
+    FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE,
+    UNIQUE (userId, conversationId)
+  );
+
+  -- "Delete chat" hides the conversation for the current user only.
+
+  CREATE TABLE IF NOT EXISTS conversationDeletions (
+    id             TEXT PRIMARY KEY,
+    userId         TEXT NOT NULL,
+    conversationId TEXT NOT NULL,
+    deletedAt      TEXT NOT NULL,
+    FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE,
+    UNIQUE (userId, conversationId)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_conversation_deletions_user
+    ON conversationDeletions (userId);
+
+  -- Private user-created custom conversation lists (owner-only visibility).
+
+  CREATE TABLE IF NOT EXISTS conversationLists (
+    id        TEXT PRIMARY KEY,
+    userId    TEXT NOT NULL,
+    name      TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_conversation_lists_user
+    ON conversationLists (userId);
+
+  CREATE TABLE IF NOT EXISTS conversationListMembers (
+    id             TEXT PRIMARY KEY,
+    listId         TEXT NOT NULL,
+    conversationId TEXT NOT NULL,
+    createdAt      TEXT NOT NULL,
+    FOREIGN KEY (listId) REFERENCES conversationLists (id) ON DELETE CASCADE,
+    UNIQUE (listId, conversationId)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_conversation_list_members_list
+    ON conversationListMembers (listId);
+
+  CREATE INDEX IF NOT EXISTS idx_conversation_list_members_conversation
+    ON conversationListMembers (conversationId);
+
+  -- ─── Phase B: Media Library ────────────────────────────────────────────────
+  -- Durable library items. The status column is the processing lifecycle
+  -- (draft/uploading/uploaded/processing/ready/failed) and published is a
+  -- SEPARATE visibility flag — normal users only ever see rows where
+  -- status='ready' AND published=1. storageKey is the retained ORIGINAL file
+  -- (only written when MEDIA_RETAIN_ORIGINAL is enabled), playableKey is the
+  -- FFmpeg-produced browser-ready MP4 that users stream and download, posterKey
+  -- is the generated thumbnail. All keys are server-generated opaque strings
+  -- (never client paths), binary bytes live only in MediaStorage. No
+  -- semicolons inside these comments (the startup schema splitter relies on
+  -- the semicolon as the statement terminator).
+
+  CREATE TABLE IF NOT EXISTS media (
+    id               TEXT PRIMARY KEY,
+    title            TEXT NOT NULL,
+    description      TEXT NOT NULL DEFAULT '',
+    originalFilename TEXT,
+    storageKey       TEXT,
+    playableKey      TEXT,
+    mimeType         TEXT,
+    sizeBytes        INTEGER NOT NULL DEFAULT 0,
+    durationSeconds  INTEGER,
+    posterKey        TEXT,
+    status           TEXT NOT NULL DEFAULT 'draft',
+    published        INTEGER NOT NULL DEFAULT 0,
+    downloadAllowed  INTEGER NOT NULL DEFAULT 1,
+    createdByUserId  TEXT NOT NULL,
+    createdAt        TEXT NOT NULL,
+    updatedAt        TEXT NOT NULL,
+    FOREIGN KEY (createdByUserId) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_media_visibility
+    ON media (published, status, createdAt DESC);
+
+  CREATE INDEX IF NOT EXISTS idx_media_creator
+    ON media (createdByUserId);
+
+  -- Phase C: resumable chunked upload sessions. One active session per media
+  -- item at a time. Chunk bytes live in MediaStorage under keys prefixed
+  -- 'chunk-<uploadId>-', and the DB row tracks progress so a client can resume
+  -- after a disconnect. Expired sessions are swept by the cleanup worker.
+  -- receivedChunks is the count of chunk objects currently in storage.
+
+  CREATE TABLE IF NOT EXISTS mediaUploadSessions (
+    id             TEXT PRIMARY KEY,
+    mediaId        TEXT NOT NULL,
+    totalBytes     INTEGER NOT NULL,
+    chunkSize      INTEGER NOT NULL,
+    chunkCount     INTEGER NOT NULL,
+    receivedBytes  INTEGER NOT NULL DEFAULT 0,
+    receivedChunks INTEGER NOT NULL DEFAULT 0,
+    status         TEXT NOT NULL DEFAULT 'active',
+    previousStatus TEXT,
+    expiresAt      TEXT NOT NULL,
+    createdAt      TEXT NOT NULL,
+    updatedAt      TEXT NOT NULL,
+    FOREIGN KEY (mediaId) REFERENCES media (id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_media_upload_sessions_media
+    ON mediaUploadSessions (mediaId);
+
+  CREATE INDEX IF NOT EXISTS idx_media_upload_sessions_expiry
+    ON mediaUploadSessions (status, expiresAt);
 `;

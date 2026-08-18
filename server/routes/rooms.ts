@@ -324,6 +324,43 @@ rooms.post('/:id/leave', (c) => {
 
 // ─── Host media / playback / screen share ────────────────────────────────────
 
+// Phase C: select a published Media Library item for the room. Only the host
+// may change room media; the media reference (mediaId + metadata) is stored in
+// room state — never a filesystem path. Every participant streams the playable
+// MP4 from the library through their own authenticated session, so video never
+// travels over WebRTC.
+rooms.post('/:id/media/library', async (c) => {
+  const roomId = c.req.param('id');
+  const userId = c.get('userId');
+  const guard = activeMemberGuard(c, roomId, userId);
+  if (guard) return guard;
+
+  const body = await readJson(c);
+  const mediaId = body && typeof body.mediaId === 'string' ? body.mediaId.trim() : '';
+  if (!mediaId) {
+    return c.json(apiError('VALIDATION_ERROR', 'mediaId is required.'), 400);
+  }
+
+  const { getPublishedMedia } = await import('../media/service');
+  const item = getPublishedMedia(mediaId);
+  if (!item) {
+    return c.json(apiError('NOT_FOUND', 'That media is not available in the library.'), 404);
+  }
+
+  const media: MediaInput = {
+    title: item.title,
+    mediaType: 'library',
+    mediaId: item.id,
+    duration: item.durationSeconds ?? undefined,
+    mimeType: item.mimeType ?? undefined,
+  };
+
+  const result = setRoomMedia(roomId, userId, media);
+  if (!result.ok) return sendResult(c, result);
+  emit(result.payload.id, 'room:update', { room: result.payload });
+  return c.json({ room: result.payload });
+});
+
 rooms.post('/:id/media', async (c) => {
   const roomId = c.req.param('id');
   const userId = c.get('userId');
@@ -537,7 +574,7 @@ rooms.post('/:id/media/upload', async (c) => {
       if (bodyBytes > bodyLimit) {
         return fail(413, 'PAYLOAD_TOO_LARGE', 'Upload body exceeds the allowed size.');
       }
-      headerBuf = headerBuf.length === 0 ? value : Buffer.concat([headerBuf, value]);
+      headerBuf = headerBuf.length === 0 ? Buffer.from(value) : Buffer.concat([headerBuf, value]);
       headerEnd = headerBuf.indexOf(PART_HEADER_END);
       if (headerEnd !== -1) break;
     }

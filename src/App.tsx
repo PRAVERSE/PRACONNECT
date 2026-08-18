@@ -6,6 +6,7 @@ import { ExploreView } from './components/views/ExploreView';
 import { GamesView } from './components/views/GamesView';
 import { FriendsView } from './components/views/FriendsView';
 import { MessagesView } from './components/views/MessagesView';
+import { MediaLibraryView } from './components/views/MediaLibraryView';
 import { SettingsView } from './components/views/SettingsView';
 import { ProfileView } from './components/views/ProfileView';
 import { AuthView } from './components/views/AuthView';
@@ -26,16 +27,17 @@ const MainContent: React.FC = () => {
   const { activeTab } = useApp();
 
   return (
-    <main className="flex-1 overflow-y-auto min-w-0 w-full bg-[var(--bg-canvas)] text-[var(--text-primary)] relative z-10 transition-colors duration-200">
+    <main className="flex-1 overflow-y-auto min-w-0 min-h-0 w-full bg-[var(--bg-canvas)] text-[var(--text-primary)] relative z-10 transition-colors duration-200">
       <div
         key={activeTab}
-        className={`animate-fade-in-up h-full w-full ${activeTab === 'room' ? '' : 'px-4 sm:px-8 md:px-16 py-8 md:py-10 md:pb-20'}`}
+        className={`animate-fade-in-up h-full w-full ${activeTab === 'room' || activeTab === 'messages' ? '' : 'px-4 sm:px-8 md:px-16 py-8 md:py-10 md:pb-20'}`}
       >
         {activeTab === 'dashboard' && <DashboardView />}
         {activeTab === 'explore' && <ExploreView />}
         {activeTab === 'games' && <GamesView />}
         {activeTab === 'friends' && <FriendsView />}
         {activeTab === 'messages' && <MessagesView />}
+        {activeTab === 'library' && <MediaLibraryView />}
         {activeTab === 'settings' && <SettingsView />}
         {activeTab === 'profile' && <ProfileView />}
         {activeTab === 'auth' && <AuthView />}
@@ -61,7 +63,7 @@ const AppShell: React.FC = () => {
   };
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-[var(--bg-canvas)] text-[var(--text-primary)] font-sans antialiased select-none relative transition-colors duration-200">
+    <div className="viewport-fill flex w-full overflow-hidden bg-[var(--bg-canvas)] text-[var(--text-primary)] font-sans antialiased select-none relative transition-colors duration-200">
       <AmbientBackground />
       <Sidebar />
       <MainContent />
@@ -114,7 +116,7 @@ const AuthGate: React.FC = () => {
 
   if (authState === 'loading') {
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-[var(--bg-canvas)] text-[var(--text-primary)] select-none">
+      <div className="viewport-fill flex w-full items-center justify-center bg-[var(--bg-canvas)] text-[var(--text-primary)] select-none">
         <div className="flex flex-col items-center gap-3 animate-fade-in">
           <div className="w-11 h-11 rounded-xl bg-[var(--emphasis)] text-[var(--bg)] flex items-center justify-center font-black text-2xl shadow-[0_0_15px_rgba(255,255,255,0.2)]">
             P

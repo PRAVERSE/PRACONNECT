@@ -127,3 +127,33 @@ export function directoryEmptyCopy(query: string, hasResults: boolean): string |
   }
   return hasResults ? null : 'No other PraConnect users found.';
 }
+
+// ─── Final minimal Friends UI: exactly two tabs ──────────────────────────────
+// The Friends experience is a two-section surface ONLY. Any future tab must be
+// added here so the structural tests keep the UI honest.
+
+export const FRIENDS_TABS = [
+  { id: 'friends', label: 'Friends' },
+  { id: 'find-friends', label: 'Find Friends' },
+] as const;
+
+export type FriendsTab = (typeof FRIENDS_TABS)[number]['id'];
+
+export interface DirectorySearchPlan {
+  query: string;
+  offset: number;
+  delayMs: number;
+}
+
+/**
+ * When should the directory search fire? The ONLY search surface is the Find
+ * Friends tab. An empty query is a real request: the server treats q="" as
+ * "first page of every registered user", so opening Find Friends immediately
+ * loads people (no typing required). Typed queries debounce and reset to page
+ * 1. The Friends tab never triggers a directory search.
+ */
+export function directorySearchRequest(tab: FriendsTab, query: string): DirectorySearchPlan | null {
+  if (tab !== 'find-friends') return null;
+  if (query.trim() === '') return { query: '', offset: 0, delayMs: 0 };
+  return { query, offset: 0, delayMs: 300 };
+}

@@ -1,30 +1,8 @@
-import React, { useEffect, useRef, useState } from 'react';
-import {
-  User,
-  Users,
-  Inbox,
-  UserPlus,
-  Settings,
-  LogOut,
-  X,
-  ChevronLeft,
-  Link as LinkIcon,
-  Check,
-  Search,
-  Maximize2
-} from 'lucide-react';
+import React, { useEffect, useRef } from 'react';
+import { User, Users, Settings, LogOut, X } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { NavigationTab } from '../../types';
 import { UserAvatar } from '../common/UserAvatar';
-import { SlidingTabs } from '../common/SlidingTabs';
-import { SocialUser } from '../../api/social';
-import {
-  directoryRelationship,
-  relationshipActions,
-} from '../../social/directory';
-
-const FRIENDS_TABS = ['Online', 'Offline', 'Requests', 'Find Friends'] as const;
-type FriendsTab = (typeof FRIENDS_TABS)[number];
 
 interface ProfileMenuProps {
   open: boolean;
@@ -35,11 +13,10 @@ interface ProfileMenuProps {
 interface MenuRowProps {
   icon: React.ElementType;
   label: string;
-  badge?: number;
   onClick: () => void;
 }
 
-const MenuRow: React.FC<MenuRowProps> = ({ icon: Icon, label, badge, onClick }) => (
+const MenuRow: React.FC<MenuRowProps> = ({ icon: Icon, label, onClick }) => (
   <button
     onClick={onClick}
     className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-[13px] font-medium text-[var(--text-primary)] hover:bg-[var(--bg-glass)] transition-colors cursor-pointer text-left"
@@ -48,438 +25,13 @@ const MenuRow: React.FC<MenuRowProps> = ({ icon: Icon, label, badge, onClick }) 
       <Icon className="w-4 h-4 text-[var(--text-secondary)]" strokeWidth={1.7} aria-hidden="true" />
     </span>
     <span className="flex-1 min-w-0 truncate">{label}</span>
-    {typeof badge === 'number' && badge > 0 && (
-      <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-[var(--emphasis)] text-[var(--bg)] text-[10px] font-mono font-bold flex items-center justify-center shadow-[0_0_8px_var(--emphasis-glow)]">
-        {badge}
-      </span>
-    )}
   </button>
 );
 
-interface FriendsPanelBodyProps {
-  initialTab: FriendsTab;
-  onClose: () => void;
-  onManageFull: () => void;
-}
-
-const FriendsPanelBody: React.FC<FriendsPanelBodyProps> = ({ initialTab, onClose, onManageFull }) => {
-  const {
-    friends,
-    friendRequests,
-    setActiveTab,
-    startDm,
-    addFriend,
-    acceptFriendRequest,
-    rejectFriendRequest,
-    joinRoom,
-    searchResults,
-    searchTotal,
-    searchNextOffset,
-    searchUsers,
-    clearSearch,
-    sendFriendRequestToUser
-  } = useApp();
-
-  const [activeTabSection, setActiveTabSection] = useState<FriendsTab>(initialTab);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [addInput, setAddInput] = useState('');
-  const [copiedLink, setCopiedLink] = useState(false);
-
-  const handleCopyInviteLink = () => {
-    navigator.clipboard.writeText(`${window.location.origin}/invite/praconnect`);
-    setCopiedLink(true);
-    setTimeout(() => setCopiedLink(false), 2000);
-  };
-
-  const incomingRequests = friendRequests.incoming;
-  const outgoingRequests = friendRequests.outgoing;
-
-  const matchesTab = (f: (typeof friends)[number], tab: FriendsTab) => {
-    if (tab === 'Online') return f.status === 'online';
-    if (tab === 'Offline') return f.status === 'offline';
-    return true;
-  };
-
-  const countFor = (tab: FriendsTab) => {
-    if (tab === 'Requests') return incomingRequests.length;
-    if (tab === 'Online' || tab === 'Offline') return friends.filter((f) => matchesTab(f, tab)).length;
-    return 0;
-  };
-
-  const filteredFriends = friends.filter((f) => {
-    const matchesSearch =
-      searchQuery === '' ||
-      f.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      f.username.toLowerCase().includes(searchQuery.toLowerCase());
-    return matchesSearch && matchesTab(f, activeTabSection);
-  });
-
-  const emptyTitle =
-    activeTabSection === 'Online'
-      ? "No one's around yet."
-      : activeTabSection === 'Requests'
-      ? 'No pending friend requests.'
-      : activeTabSection === 'Find Friends'
-      ? 'Find people to watch with.'
-      : 'No offline friends.';
-
-  const incomingFrom = (userId: string) => incomingRequests.find((r) => r.user.id === userId);
-  const outgoingTo = (userId: string) => outgoingRequests.find((r) => r.user.id === userId);
-
-  const renderDirectoryRow = (user: SocialUser) => {
-    const relationship = directoryRelationship(user.id, friends, incomingRequests, outgoingRequests);
-    const actions = relationshipActions(relationship);
-    const incoming = relationship === 'incoming_pending' ? incomingFrom(user.id) : undefined;
-    const outgoing = relationship === 'outgoing_pending' ? outgoingTo(user.id) : undefined;
-    return (
-      <div
-        key={user.id}
-        className="flex items-center justify-between gap-2 px-2 py-2.5 rounded-xl hover:bg-[var(--bg-glass)] transition-colors"
-      >
-        <div className="flex items-center gap-3 min-w-0">
-          <div className="relative shrink-0">
-            <UserAvatar
-              avatar={user.avatarUrl || user.name.charAt(0).toUpperCase()}
-              name={user.name}
-              className="w-9 h-9 font-bold text-xs"
-            />
-          </div>
-          <div className="min-w-0">
-            <div className="font-display text-xs font-semibold text-[var(--text-primary)] truncate">
-              {user.name}
-            </div>
-            <div className="text-[11px] text-[var(--text-secondary)] truncate">@{user.username}</div>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-1.5 shrink-0">
-          {actions.showMessage ? (
-            <>
-              <span className="btn-secondary text-[11px] px-3 py-1.5 opacity-60 cursor-default">
-                Friends
-              </span>
-              <button
-                onClick={() => startDm(user.id)}
-                className="btn-secondary text-[11px] px-3 py-1.5"
-              >
-                Message
-              </button>
-            </>
-          ) : actions.showAccept && incoming ? (
-            <button
-              onClick={() => acceptFriendRequest(incoming!.id)}
-              className="btn-primary text-[11px] px-3 py-1.5"
-            >
-              Accept
-            </button>
-          ) : actions.showRequested && outgoing ? (
-            <span className="btn-secondary text-[11px] px-3 py-1.5 opacity-60 cursor-default">
-              Requested
-            </span>
-          ) : actions.showAddFriend ? (
-            <button
-              onClick={() => sendFriendRequestToUser(user.id)}
-              className="btn-primary text-[11px] px-3 py-1.5"
-            >
-              Add
-            </button>
-          ) : null}
-        </div>
-      </div>
-    );
-  };
-
-  return (
-    <div className="flex-1 min-h-0 flex flex-col overflow-y-auto no-scrollbar">
-      {/* Search + Add Friend */}
-      <div className="px-4 pt-3 space-y-2.5 shrink-0">
-        <div className="relative">
-          <input
-            type="text"
-            value={activeTabSection === 'Find Friends' ? searchQuery : searchQuery}
-            onChange={(e) => {
-              const value = e.target.value;
-              setSearchQuery(value);
-              if (activeTabSection === 'Find Friends') {
-                searchUsers(value, 0);
-                if (!value.trim()) clearSearch();
-              }
-            }}
-            placeholder={activeTabSection === 'Find Friends' ? 'Search people or @username...' : 'Search friends...'}
-            className="field w-full pl-10 pr-8 text-[13px] py-2"
-            aria-label="Search friends"
-          />
-          <Search
-            className="w-3.5 h-3.5 text-[var(--text-tertiary)] absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none"
-            aria-hidden="true"
-          />
-          {searchQuery && (
-            <button
-              onClick={() => {
-                setSearchQuery('');
-                if (activeTabSection === 'Find Friends') clearSearch();
-              }}
-              className="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] transition-colors rounded-full cursor-pointer"
-              aria-label="Clear search query"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
-          )}
-        </div>
-
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (addInput.trim()) {
-              addFriend(addInput.trim());
-              setAddInput('');
-            }
-          }}
-          className="flex gap-2"
-        >
-          <input
-            type="text"
-            value={addInput}
-            onChange={(e) => setAddInput(e.target.value)}
-            placeholder="Add @handle..."
-            className="field flex-1 min-w-0 text-[13px] py-2"
-            aria-label="Friend handle to add"
-          />
-          <button
-            type="submit"
-            disabled={!addInput.trim()}
-            className="btn-primary text-xs px-3 py-2 shrink-0 disabled:opacity-40"
-          >
-            <UserPlus className="w-3.5 h-3.5" aria-hidden="true" />
-            <span className="hidden sm:inline">Add</span>
-          </button>
-        </form>
-      </div>
-
-      {/* Tabs */}
-      <div className="px-4 mt-3 border-b border-[var(--border-hairline)] shrink-0">
-        <SlidingTabs
-          items={FRIENDS_TABS.map((t) => ({ id: t, label: t, count: countFor(t) }))}
-          activeId={activeTabSection}
-          onChange={(id) => setActiveTabSection(id as FriendsTab)}
-        />
-      </div>
-
-      {/* Content */}
-      <div className="flex-1 min-h-0 px-2 py-2">
-        {activeTabSection === 'Requests' ? (
-          incomingRequests.length > 0 || outgoingRequests.length > 0 ? (
-            <div className="flex flex-col">
-              {incomingRequests.map((req) => (
-                <div
-                  key={req.id}
-                  className="flex items-center justify-between gap-2 px-2 py-2.5 rounded-xl hover:bg-[var(--bg-glass)] transition-colors"
-                >
-                  <div className="flex items-center gap-3 min-w-0">
-                    <UserAvatar
-                      avatar={req.user.avatarUrl || req.user.name.charAt(0).toUpperCase()}
-                      name={req.user.name}
-                      className="w-9 h-9 font-bold text-xs"
-                    />
-                    <div className="min-w-0">
-                      <div className="font-display text-xs font-semibold text-[var(--text-primary)] truncate">
-                        {req.user.name}
-                      </div>
-                      <div className="text-[11px] text-[var(--text-secondary)] truncate">
-                        @{req.user.username}
-                      </div>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <button
-                      onClick={() => rejectFriendRequest(req.id)}
-                      className="btn-secondary text-[11px] px-2.5 py-1.5"
-                    >
-                      Decline
-                    </button>
-                    <button
-                      onClick={() => acceptFriendRequest(req.id)}
-                      className="btn-primary text-[11px] px-3 py-1.5"
-                    >
-                      Accept
-                    </button>
-                  </div>
-                </div>
-              ))}
-              {outgoingRequests.map((req) => (
-                <div
-                  key={req.id}
-                  className="flex items-center justify-between gap-2 px-2 py-2.5 rounded-xl hover:bg-[var(--bg-glass)] transition-colors"
-                >
-                  <div className="flex items-center gap-3 min-w-0">
-                    <UserAvatar
-                      avatar={req.user.avatarUrl || req.user.name.charAt(0).toUpperCase()}
-                      name={req.user.name}
-                      className="w-9 h-9 font-bold text-xs"
-                    />
-                    <div className="min-w-0">
-                      <div className="font-display text-xs font-semibold text-[var(--text-primary)] truncate">
-                        {req.user.name}
-                      </div>
-                      <div className="text-[11px] text-[var(--text-secondary)] truncate">
-                        @{req.user.username} · requested
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="h-full min-h-[140px] flex flex-col items-center justify-center text-center px-6">
-              <Users className="w-7 h-7 text-[var(--text-tertiary)] mb-2.5" strokeWidth={1.5} aria-hidden="true" />
-              <p className="text-xs text-[var(--text-primary)] font-semibold mb-1">
-                No pending friend requests.
-              </p>
-            </div>
-          )
-        ) : activeTabSection === 'Find Friends' ? (
-          searchResults.length > 0 ? (
-            <div className="flex flex-col">
-              {searchResults.map(renderDirectoryRow)}
-              {searchNextOffset < searchTotal && (
-                <button
-                  onClick={() => searchUsers(searchQuery, searchNextOffset)}
-                  className="btn-secondary text-[11px] w-full mt-1"
-                >
-                  Load more ({searchTotal - searchNextOffset} left)
-                </button>
-              )}
-            </div>
-          ) : (
-            <div className="h-full min-h-[140px] flex flex-col items-center justify-center text-center px-6">
-              <Users className="w-7 h-7 text-[var(--text-tertiary)] mb-2.5" strokeWidth={1.5} aria-hidden="true" />
-              <p className="text-xs text-[var(--text-primary)] font-semibold mb-1">
-                {searchQuery ? `No people found for "${searchQuery}"` : emptyTitle}
-              </p>
-              <p className="text-[11px] text-[var(--text-secondary)] leading-relaxed max-w-[220px]">
-                Search the directory by name or @username.
-              </p>
-            </div>
-          )
-        ) : filteredFriends.length > 0 ? (
-          <div className="flex flex-col">
-            {filteredFriends.map((friend) => (
-              <div
-                key={friend.id}
-                className="flex items-center justify-between gap-2 px-2 py-2.5 rounded-xl hover:bg-[var(--bg-glass)] transition-colors"
-              >
-                <div className="flex items-center gap-3 min-w-0">
-                  <div className="relative shrink-0">
-                    <UserAvatar
-                      avatar={friend.avatar}
-                      name={friend.name}
-                      className="w-9 h-9 font-bold text-xs"
-                    />
-                    <span
-                      className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full ring-2 ring-[var(--bg-elevated)] ${
-                        friend.status === 'online'
-                          ? 'bg-[var(--text-primary)] live-dot shadow-[0_0_6px_var(--emphasis-glow)]'
-                          : 'bg-[var(--text-tertiary)]'
-                      }`}
-                    />
-                  </div>
-
-                  <div className="min-w-0">
-                    <div className="font-display text-xs font-semibold text-[var(--text-primary)] truncate">
-                      {friend.name}
-                    </div>
-                    <div className="text-[11px] text-[var(--text-secondary)] truncate">
-                      {friend.currentRoomName ? (
-                        <span className="text-[var(--text-primary)] font-medium">
-                          In {friend.currentRoomName}
-                        </span>
-                      ) : (
-                        <span>@{friend.username}</span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-1.5 shrink-0">
-                  {friend.currentRoomCode && (
-                    <button
-                      onClick={() => {
-                        joinRoom(friend.currentRoomCode!);
-                        onClose();
-                      }}
-                      className="btn-secondary text-[11px] px-2.5 py-1.5"
-                    >
-                      Join
-                    </button>
-                  )}
-                  <button
-                    onClick={() => {
-                      startDm(friend.id);
-                      onClose();
-                    }}
-                    className="btn-secondary text-[11px] px-2.5 py-1.5"
-                  >
-                    Message
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="h-full min-h-[140px] flex flex-col items-center justify-center text-center px-6">
-            <Users
-              className="w-7 h-7 text-[var(--text-tertiary)] mb-2.5"
-              strokeWidth={1.5}
-              aria-hidden="true"
-            />
-            <p className="text-xs text-[var(--text-primary)] font-semibold mb-1">
-              {searchQuery ? `No friends found for "${searchQuery}"` : emptyTitle}
-            </p>
-            <p className="text-[11px] text-[var(--text-secondary)] leading-relaxed max-w-[220px]">
-              {searchQuery
-                ? 'Try a different name or clear the search.'
-                : 'Use Find Friends to build your circle.'}
-            </p>
-          </div>
-        )}
-      </div>
-
-      {/* Footer — invite link + full directory */}
-      <div className="px-4 py-3 border-t border-[var(--border-hairline)] shrink-0 flex flex-col gap-2">
-        <button onClick={handleCopyInviteLink} className="btn-secondary text-xs w-full">
-          {copiedLink ? (
-            <>
-              <Check className="w-3.5 h-3.5 text-[var(--text-primary)]" aria-hidden="true" />
-              <span className="text-[var(--text-primary)]">Link Copied!</span>
-            </>
-          ) : (
-            <>
-              <LinkIcon className="w-3.5 h-3.5" aria-hidden="true" />
-              <span>Copy Invite Link</span>
-            </>
-          )}
-        </button>
-        <button onClick={onManageFull} className="btn-secondary text-xs w-full">
-          <Maximize2 className="w-3.5 h-3.5" aria-hidden="true" />
-          <span>Open Full Friends Directory</span>
-        </button>
-      </div>
-    </div>
-  );
-};
-
 export const ProfileMenu: React.FC<ProfileMenuProps> = ({ open, onClose, anchorRef }) => {
-  const { userProfile, friendRequests, setActiveTab, logout } = useApp();
+  const { userProfile, setActiveTab, logout } = useApp();
 
   const menuRef = useRef<HTMLDivElement>(null);
-  const [section, setSection] = useState<'menu' | 'friends'>('menu');
-  const [friendsTab, setFriendsTab] = useState<FriendsTab>('Online');
-
-  const pendingRequestCount = friendRequests.incoming.length;
-
-  useEffect(() => {
-    if (open) setSection('menu');
-  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -507,11 +59,6 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ open, onClose, anchorR
     onClose();
   };
 
-  const openFriends = (tab: FriendsTab) => {
-    setFriendsTab(tab);
-    setSection('friends');
-  };
-
   const handleLogout = () => {
     onClose();
     logout();
@@ -528,35 +75,19 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ open, onClose, anchorR
     >
       {/* Header */}
       <div className="flex items-center gap-3 px-4 py-3 border-b border-[var(--border-hairline)] shrink-0">
-        {section === 'menu' ? (
-          <>
-            <UserAvatar
-              avatar={userProfile.avatar}
-              name={userProfile.name}
-              className="w-10 h-10 font-bold text-sm"
-            />
-            <div className="min-w-0 flex-1">
-              <div className="font-display text-[13px] font-semibold truncate">
-                {userProfile.name}
-              </div>
-              <div className="text-[11px] text-[var(--text-secondary)] truncate">
-                @{userProfile.username}
-              </div>
-            </div>
-          </>
-        ) : (
-          <>
-            <button
-              onClick={() => setSection('menu')}
-              className="p-1.5 -ml-1.5 rounded-full text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-glass)] transition-colors cursor-pointer"
-              aria-label="Back to profile menu"
-            >
-              <ChevronLeft className="w-4 h-4" />
-            </button>
-            <div className="font-display text-[13px] font-semibold">Friends</div>
-            <div className="flex-1" />
-          </>
-        )}
+        <UserAvatar
+          avatar={userProfile.avatar}
+          name={userProfile.name}
+          className="w-10 h-10 font-bold text-sm"
+        />
+        <div className="min-w-0 flex-1">
+          <div className="font-display text-[13px] font-semibold truncate">
+            {userProfile.name}
+          </div>
+          <div className="text-[11px] text-[var(--text-secondary)] truncate">
+            @{userProfile.username}
+          </div>
+        </div>
 
         <button
           onClick={onClose}
@@ -567,28 +98,13 @@ export const ProfileMenu: React.FC<ProfileMenuProps> = ({ open, onClose, anchorR
         </button>
       </div>
 
-      {section === 'menu' ? (
-        <div className="flex flex-col gap-0.5 p-1.5 overflow-y-auto no-scrollbar">
-          <MenuRow icon={User} label="Profile" onClick={() => navigate('profile')} />
-          <MenuRow icon={Users} label="Friends" onClick={() => openFriends('Online')} />
-          <MenuRow
-            icon={Inbox}
-            label="Requests"
-            badge={pendingRequestCount}
-            onClick={() => openFriends('Requests')}
-          />
-          <MenuRow icon={UserPlus} label="Find Friends" onClick={() => openFriends('Find Friends')} />
-          <div className="my-1.5 mx-2 h-px bg-[var(--border-hairline)]" />
-          <MenuRow icon={Settings} label="Settings" onClick={() => navigate('settings')} />
-          <MenuRow icon={LogOut} label="Logout" onClick={handleLogout} />
-        </div>
-      ) : (
-        <FriendsPanelBody
-          initialTab={friendsTab}
-          onClose={onClose}
-          onManageFull={() => navigate('friends')}
-        />
-      )}
+      <div className="flex flex-col gap-0.5 p-1.5 overflow-y-auto no-scrollbar">
+        <MenuRow icon={User} label="Profile" onClick={() => navigate('profile')} />
+        <MenuRow icon={Users} label="Friends" onClick={() => navigate('friends')} />
+        <div className="my-1.5 mx-2 h-px bg-[var(--border-hairline)]" />
+        <MenuRow icon={Settings} label="Settings" onClick={() => navigate('settings')} />
+        <MenuRow icon={LogOut} label="Logout" onClick={handleLogout} />
+      </div>
     </div>
   );
 };

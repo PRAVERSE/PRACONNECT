@@ -50,3 +50,31 @@ export async function optionalAuth(c: Context, next: Next): Promise<void> {
   }
   await next();
 }
+
+/**
+ * requireAdmin — requires a valid session (like requireAuth) AND
+ * role === 'admin' on the verified user row. The role is always read from the
+ * database via the session lookup — anything the client claims (headers,
+ * cookies, or a body like { role: "admin" }) is ignored. Returns 401 when
+ * unauthenticated and 403 when the authenticated user is not an admin.
+ */
+export async function requireAdmin(c: Context, next: Next): Promise<Response | void> {
+  const token = getSessionToken(c);
+  if (!token) {
+    return c.json(apiError('UNAUTHENTICATED', 'Authentication required.'), 401);
+  }
+
+  const result = await getSessionUser(token);
+  if (!result) {
+    return c.json(apiError('UNAUTHENTICATED', 'Session expired or invalid.'), 401);
+  }
+
+  if (result.user.role !== 'admin') {
+    return c.json(apiError('FORBIDDEN', 'Admin access required.'), 403);
+  }
+
+  c.set('userId', result.user.id);
+  c.set('user', sanitizeUser(result.user as unknown as Record<string, unknown>));
+
+  await next();
+}

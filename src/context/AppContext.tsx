@@ -18,7 +18,8 @@ import {
   FloatingReaction,
   ScheduledParty,
   WatchHistoryItem,
-  RoomHistoryStats
+  RoomHistoryStats,
+  MediaItem,
 } from '../types';
 import {
   initialUserProfile,
@@ -36,6 +37,7 @@ import {
   joinRoomApi,
   leaveRoomApi,
   setRoomMediaApi,
+  setRoomLibraryMediaApi,
   setPlaybackApi,
   setScreenShareApi,
   setSelfDeviceStateApi,
@@ -74,9 +76,34 @@ import {
   WatchInviteItem,
   ConversationSummary,
   FriendListItem,
-  DirectMessageItem
+  DirectMessageItem,
+  ConversationList,
+  forwardMessageApi,
+  pinMessageApi,
+  unpinMessageApi,
+  starMessageApi,
+  unstarMessageApi,
+  fetchPinnedMessagesApi,
+  deleteMessageForMeApi,
+  deleteMessageForEveryoneApi,
+  setConversationArchivedApi,
+  setConversationPinnedApi,
+  setConversationFavouriteApi,
+  markConversationReadApi,
+  markConversationUnreadApi,
+  clearChatApi,
+  deleteChatApi,
+  setChatLockPinApi,
+  unlockChatApi,
+  verifyChatLockApi,
+  fetchConversationListsApi,
+  createConversationListApi,
+  deleteConversationListApi,
+  addConversationToListApi,
+  removeConversationFromListApi
 } from '../api/social';
 import { mapSearchResponse } from '../social/directory';
+import { conversationKeyFor } from '../utils/contextMenu';
 
 interface AppContextType {
   activeTab: NavigationTab;
@@ -86,6 +113,11 @@ interface AppContextType {
   authState: 'loading' | 'authenticated' | 'unauthenticated';
   isAuthenticated: boolean;
   currentUser: AuthUser | null;
+  /** Phase A: true when the authenticated session user has role 'admin'.
+   *  Derived only from currentUser.role — never from email or local input.
+   *  Real authorization is enforced server-side (requireAdmin) in Phase B;
+   *  this flag only controls what the UI renders. */
+  isAdmin: boolean;
   login: (user: AuthUser) => void;
   logout: () => void;
   refreshAuth: () => Promise<void>;
@@ -173,6 +205,9 @@ interface AppContextType {
   sendRoomChatMessage: (text: string) => void;
   sendReaction: (emoji: string, senderName?: string) => void;
   setRoomMedia: (media: MediaTrack | null) => void;
+  /** Phase C: host selects a published Media Library item (mediaId reference —
+   *  participants stream the playable MP4 from the library server-side). */
+  setRoomLibraryMedia: (mediaId: string) => Promise<{ ok: boolean; error?: string }>;
   uploadRoomMedia: (file: File) => Promise<{ ok: boolean; error?: string }>;
   /** Phase 6.10: start (stream + lightweight metadata) or stop (null) the
    *  peer-to-peer local movie session. The file stays on the device; only
@@ -199,11 +234,47 @@ interface AppContextType {
 
   // Direct message conversations (server-backed)
   conversations: ConversationSummary[];
-  openConversation: (friendId: string) => Promise<void>;
+  openConversation: (friendId: string) => Promise<boolean>;
   /** Open (or create) a DM with an accepted friend and jump to the Messages
    *  page. The server remains authoritative: non-friends are rejected with
    *  FRIENDSHIP_REQUIRED. */
   startDm: (friendId: string) => void;
+
+  // DM context actions (message menu)
+  /** Ids of the pinned messages per conversation (shared with the peer). */
+  pinnedMessageIds: Record<string, string[]>;
+  sendReply: (friendId: string, text: string, replyToMessageId: string) => void;
+  sendForward: (messageId: string, toFriendId: string) => Promise<boolean>;
+  pinMessage: (messageId: string) => Promise<boolean>;
+  unpinMessage: (messageId: string) => Promise<boolean>;
+  starMessage: (messageId: string) => Promise<boolean>;
+  unstarMessage: (messageId: string) => Promise<boolean>;
+  deleteMessageForMe: (messageId: string) => Promise<boolean>;
+  deleteMessageForEveryone: (messageId: string) => Promise<boolean>;
+
+  // Conversation context actions (per-user settings)
+  setConversationArchived: (friendId: string, archived: boolean) => Promise<boolean>;
+  setConversationPinned: (friendId: string, pinned: boolean) => Promise<boolean>;
+  setConversationFavourite: (friendId: string, favourite: boolean) => Promise<boolean>;
+  markConversationRead: (friendId: string) => Promise<boolean>;
+  markConversationUnread: (friendId: string) => Promise<boolean>;
+  clearChat: (friendId: string) => Promise<boolean>;
+  deleteChat: (friendId: string) => Promise<boolean>;
+
+  // Chat locks (session-scope verification lives client-side; the PIN hash
+  // and the locked flag are server-authoritative)
+  setChatLockPin: (friendId: string, pin: string) => Promise<boolean>;
+  unlockChat: (friendId: string, pin: string) => Promise<boolean>;
+  verifyChatLock: (friendId: string, pin: string) => Promise<boolean>;
+  isChatVerified: (friendId: string) => boolean;
+
+  // Private conversation lists
+  conversationLists: ConversationList[];
+  refreshConversationLists: () => Promise<void>;
+  createConversationList: (name: string) => Promise<boolean>;
+  deleteConversationList: (listId: string) => Promise<boolean>;
+  addConversationToList: (listId: string, friendId: string) => Promise<boolean>;
+  removeConversationFromList: (listId: string, friendId: string) => Promise<boolean>;
 
   // Find Friends directory
   searchResults: SocialUser[];
@@ -314,6 +385,12 @@ function mapDirectMessageItem(item: DirectMessageItem): DirectMessage {
     senderId: item.senderId,
     text: item.text,
     timestamp: new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    createdAt: item.createdAt,
+    replyToMessageId: item.replyToMessageId,
+    forwardedFromMessageId: item.forwardedFromMessageId,
+    deletedForEveryone: Boolean(item.deletedForEveryone),
+    replyTo: item.replyTo ?? null,
+    forwardedFrom: item.forwardedFrom ?? null,
   };
 }
 
@@ -324,6 +401,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [authState, setAuthState] = useState<'loading' | 'authenticated' | 'unauthenticated'>('loading');
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+
+  // Phase A: the UI role flag comes exclusively from the authenticated session
+  // user — never from an email match or any client-supplied value.
+  const isAdmin = currentUser?.role === 'admin';
 
   const [rooms, setRooms] = useState<RoomItem[]>([]);
   const [currentRoom, setCurrentRoom] = useState<RoomItem | null>(null);
@@ -361,6 +442,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [activeDMId, setActiveDMId] = useState<string | null>(null);
   const [dmConversations, setDmConversations] = useState<Record<string, DirectMessage[]>>({});
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [pinnedMessageIds, setPinnedMessageIds] = useState<Record<string, string[]>>({});
+  /** Conversation keys verified with a PIN this session (6h server window). */
+  const [verifiedChatKeys, setVerifiedChatKeys] = useState<Set<string>>(new Set());
+  const [conversationLists, setConversationLists] = useState<ConversationList[]>([]);
 
   // Social state (server-backed)
   const [friendRequests, setFriendRequests] = useState<{
@@ -611,6 +696,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     try {
       const res = await getCurrentUser();
       if (res.authenticated && res.user) {
+        // Dev diagnostic — traces the role chain; never logs password/token/session.
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('[AUTH ROLE] AppContext refreshAuth', {
+            authenticated: res.authenticated,
+            email: res.user.email,
+            role: res.user.role,
+            isAdmin: res.user.role === 'admin',
+          });
+        }
         setCurrentUser(res.user);
         setIsAuthenticated(true);
         setAuthState('authenticated');
@@ -639,6 +733,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [isAuthenticated, refreshRooms, refreshRoomStats]);
 
   const login = (user: AuthUser) => {
+    // Dev diagnostic — traces role from login API response.
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[AUTH ROLE] AppContext login', {
+        email: user.email,
+        role: user.role,
+        isAdmin: user.role === 'admin',
+      });
+    }
     setCurrentUser(user);
     setIsAuthenticated(true);
     setAuthState('authenticated');
@@ -662,6 +764,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setWatchInvites([]);
     setConversations([]);
     setDmConversations({});
+    setPinnedMessageIds({});
+    setVerifiedChatKeys(new Set());
+    setConversationLists([]);
     setActiveDMId(null);
     clearSearch();
     setActiveTab('dashboard');
@@ -962,6 +1067,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     await setRoomMediaApi(currentRoom.id, media);
   };
 
+  /** Phase C: host selects a published Media Library item for the room. The
+   *  room stores only a mediaId reference — every participant streams the
+   *  playable MP4 from the library through their own authenticated session,
+   *  never over WebRTC. */
+  const setRoomLibraryMedia = async (mediaId: string): Promise<{ ok: boolean; error?: string }> => {
+    if (!currentRoom || !currentRoom.isHost) {
+      return { ok: false, error: 'Only the room host can change media.' };
+    }
+    const res = await setRoomLibraryMediaApi(currentRoom.id, mediaId);
+    if (!res.ok) {
+      const msg = res.error?.message || 'Could not select that media.';
+      setMediaErrorMessage(msg);
+      return { ok: false, error: msg };
+    }
+    return { ok: true };
+  };
+
   const uploadRoomMedia = async (file: File): Promise<{ ok: boolean; error?: string }> => {
     if (!currentRoom || !currentRoom.isHost) {
       return { ok: false, error: 'Only the room host can upload media.' };
@@ -1046,7 +1168,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setRoomFiles((prev) => [file, ...prev]);
   };
 
-  const sendDirectMessage = (friendId: string, text: string) => {
+  const sendDirectMessage = (friendId: string, text: string, replyToMessageId?: string | null) => {
     if (!text.trim()) return;
     const optimistic: DirectMessage = {
       id: `dm-${Date.now()}`,
@@ -1058,7 +1180,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ...prev,
       [friendId]: [...(prev[friendId] || []), optimistic]
     }));
-    sendDirectMessageApi(friendId, text.trim()).then((res) => {
+    sendDirectMessageApi(friendId, text.trim(), replyToMessageId ? { replyToMessageId } : undefined).then((res) => {
       if (res.ok && res.data?.message) {
         const serverMsg = mapDirectMessageItem(res.data.message);
         setDmConversations((prev) => ({
@@ -1102,13 +1224,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return false;
   };
 
-  /** Full social-state refresh: friends, requests, conversations, watch invites. */
+  /** Full social-state refresh: friends, requests, conversations, watch invites, lists. */
   const refreshSocial = useCallback(async () => {
-    const [friendsRes, requestsRes, conversationsRes, invitesRes] = await Promise.all([
+    const [friendsRes, requestsRes, conversationsRes, invitesRes, listsRes] = await Promise.all([
       fetchFriendsApi(),
       fetchFriendRequestsApi(),
       fetchConversationsApi(),
       fetchWatchInvitesApi(),
+      fetchConversationListsApi(),
     ]);
     if (friendsRes.ok && friendsRes.data) {
       setFriends(friendsRes.data.friends.map(mapFriendListItemToFriend));
@@ -1125,9 +1248,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (invitesRes.ok && invitesRes.data) {
       setWatchInvites(invitesRes.data.invites);
     }
+    if (listsRes.ok && listsRes.data) {
+      setConversationLists(listsRes.data.lists);
+    }
   }, []);
 
-  /** Load (or reload) message history for a conversation. */
+  /** Load (or reload) message history + pinned messages for a conversation.
+   *  Resolves false when the conversation is locked and the PIN has not been
+   *  verified this session (LOCK_REQUIRED) — the caller should offer the
+   *  lock dialog. */
   const openConversation = useCallback(async (friendId: string) => {
     const res = await fetchMessagesApi(friendId, 50);
     if (res.ok && res.data) {
@@ -1135,7 +1264,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...prev,
         [friendId]: res.data!.messages.map(mapDirectMessageItem),
       }));
+      const pinned = await fetchPinnedMessagesApi(friendId);
+      if (pinned.ok && pinned.data) {
+        setPinnedMessageIds((prev) => ({
+          ...prev,
+          [friendId]: pinned.data!.messages.map((m) => m.id),
+        }));
+      }
+      return true;
     }
+    return false;
   }, []);
 
   /**
@@ -1152,6 +1290,212 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     },
     [openConversation]
   );
+
+  // ─── DM context actions (message menu) ─────────────────────────────────────
+
+  /** Refresh the conversation list from the server (source of truth after
+   *  any per-user setting mutation). */
+  const refreshConversationList = useCallback(() => {
+    fetchConversationsApi().then((res) => {
+      if (res.ok && res.data) setConversations(res.data.conversations);
+    });
+  }, []);
+
+  const sendReply = (friendId: string, text: string, replyToMessageId: string) => {
+    sendDirectMessage(friendId, text, replyToMessageId);
+  };
+
+  const sendForward = useCallback(async (messageId: string, toFriendId: string) => {
+    const res = await forwardMessageApi(messageId, toFriendId);
+    if (res.ok) {
+      fetchConversationsApi().then((r) => {
+        if (r.ok && r.data) setConversations(r.data.conversations);
+      });
+    }
+    return res.ok;
+  }, []);
+
+  const pinMessage = useCallback(async (messageId: string) => {
+    const res = await pinMessageApi(messageId);
+    return res.ok;
+  }, []);
+
+  const unpinMessage = useCallback(async (messageId: string) => {
+    const res = await unpinMessageApi(messageId);
+    return res.ok;
+  }, []);
+
+  const starMessage = useCallback(async (messageId: string) => {
+    const res = await starMessageApi(messageId);
+    return res.ok;
+  }, []);
+
+  const unstarMessage = useCallback(async (messageId: string) => {
+    const res = await unstarMessageApi(messageId);
+    return res.ok;
+  }, []);
+
+  const deleteMessageForMe = useCallback(async (messageId: string) => {
+    const res = await deleteMessageForMeApi(messageId);
+    if (res.ok) {
+      setDmConversations((prev: Record<string, DirectMessage[]>) => {
+        const next: Record<string, DirectMessage[]> = {};
+        for (const [friendId, messages] of Object.entries(prev)) {
+          next[friendId] = messages.filter((m) => m.id !== messageId);
+        }
+        return next;
+      });
+      refreshConversationList();
+    }
+    return res.ok;
+  }, [refreshConversationList]);
+
+  const deleteMessageForEveryone = useCallback(async (messageId: string) => {
+    const res = await deleteMessageForEveryoneApi(messageId);
+    if (res.ok) {
+      setDmConversations((prev: Record<string, DirectMessage[]>) => {
+        const next: Record<string, DirectMessage[]> = {};
+        for (const [friendId, messages] of Object.entries(prev)) {
+          next[friendId] = messages.map((m) =>
+            m.id === messageId
+              ? { ...m, text: '', deletedForEveryone: true, replyToMessageId: null, forwardedFromMessageId: null, replyTo: null, forwardedFrom: null }
+              : m
+          );
+        }
+        return next;
+      });
+      refreshConversationList();
+    }
+    return res.ok;
+  }, [refreshConversationList]);
+
+  // ─── Conversation context actions (per-user settings) ──────────────────────
+
+  const setConversationArchived = useCallback(async (friendId: string, archived: boolean) => {
+    const res = await setConversationArchivedApi(friendId, archived);
+    refreshConversationList();
+    return res.ok;
+  }, [refreshConversationList]);
+
+  const setConversationPinned = useCallback(async (friendId: string, pinned: boolean) => {
+    const res = await setConversationPinnedApi(friendId, pinned);
+    refreshConversationList();
+    return res.ok;
+  }, [refreshConversationList]);
+
+  const setConversationFavourite = useCallback(async (friendId: string, favourite: boolean) => {
+    const res = await setConversationFavouriteApi(friendId, favourite);
+    refreshConversationList();
+    return res.ok;
+  }, [refreshConversationList]);
+
+  const markConversationRead = useCallback(async (friendId: string) => {
+    const res = await markConversationReadApi(friendId);
+    refreshConversationList();
+    return res.ok;
+  }, [refreshConversationList]);
+
+  const markConversationUnread = useCallback(async (friendId: string) => {
+    const res = await markConversationUnreadApi(friendId);
+    refreshConversationList();
+    return res.ok;
+  }, [refreshConversationList]);
+
+  const clearChat = useCallback(async (friendId: string) => {
+    const res = await clearChatApi(friendId);
+    if (res.ok) {
+      setDmConversations((prev) => ({ ...prev, [friendId]: [] }));
+      refreshConversationList();
+    }
+    return res.ok;
+  }, [refreshConversationList]);
+
+  const deleteChat = useCallback(async (friendId: string) => {
+    const res = await deleteChatApi(friendId);
+    if (res.ok) {
+      setDmConversations((prev) => {
+        const next = { ...prev };
+        delete next[friendId];
+        return next;
+      });
+      setPinnedMessageIds((prev) => {
+        const next = { ...prev };
+        delete next[friendId];
+        return next;
+      });
+      refreshConversationList();
+    }
+    return res.ok;
+  }, [refreshConversationList]);
+
+  // ─── Chat locks ────────────────────────────────────────────────────────────
+
+  const setChatLockPin = useCallback(async (friendId: string, pin: string) => {
+    const res = await setChatLockPinApi(friendId, pin);
+    if (res.ok) {
+      setVerifiedChatKeys((prev) => new Set(prev).add(conversationKeyFor(friendId, currentUser?.id ?? '')));
+      refreshConversationList();
+    }
+    return res.ok;
+  }, [currentUser?.id, refreshConversationList]);
+
+  const unlockChat = useCallback(async (friendId: string, pin: string) => {
+    const res = await unlockChatApi(friendId, pin);
+    if (res.ok) {
+      setVerifiedChatKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(conversationKeyFor(friendId, currentUser?.id ?? ''));
+        return next;
+      });
+      refreshConversationList();
+    }
+    return res.ok;
+  }, [currentUser?.id, refreshConversationList]);
+
+  const verifyChatLock = useCallback(async (friendId: string, pin: string) => {
+    const res = await verifyChatLockApi(friendId, pin);
+    if (res.ok) {
+      setVerifiedChatKeys((prev) => new Set(prev).add(conversationKeyFor(friendId, currentUser?.id ?? '')));
+      await openConversation(friendId);
+    }
+    return res.ok;
+  }, [currentUser?.id, openConversation]);
+
+  const isChatVerified = useCallback(
+    (friendId: string) => verifiedChatKeys.has(conversationKeyFor(friendId, currentUser?.id ?? '')),
+    [verifiedChatKeys, currentUser?.id]
+  );
+
+  // ─── Private conversation lists ────────────────────────────────────────────
+
+  const refreshConversationLists = useCallback(async () => {
+    const res = await fetchConversationListsApi();
+    if (res.ok && res.data) setConversationLists(res.data.lists);
+  }, []);
+
+  const createConversationList = useCallback(async (name: string) => {
+    const res = await createConversationListApi(name);
+    if (res.ok) await refreshConversationLists();
+    return res.ok;
+  }, [refreshConversationLists]);
+
+  const deleteConversationList = useCallback(async (listId: string) => {
+    const res = await deleteConversationListApi(listId);
+    if (res.ok) await refreshConversationLists();
+    return res.ok;
+  }, [refreshConversationLists]);
+
+  const addConversationToList = useCallback(async (listId: string, friendId: string) => {
+    const res = await addConversationToListApi(listId, friendId);
+    if (res.ok) await refreshConversationLists();
+    return res.ok;
+  }, [refreshConversationLists]);
+
+  const removeConversationFromList = useCallback(async (listId: string, friendId: string) => {
+    const res = await removeConversationFromListApi(listId, friendId);
+    if (res.ok) await refreshConversationLists();
+    return res.ok;
+  }, [refreshConversationLists]);
 
   const sendWatchInvite = async (recipientUserId: string, roomId: string) => {
     const res = await sendWatchInviteApi(recipientUserId, roomId);
@@ -1291,6 +1635,57 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 });
               }
             }
+            break;
+          }
+          case 'dm:deleted': {
+            const deleted = payload?.message as { id?: string; senderId?: string; deletedForEveryone?: boolean } | undefined;
+            if (deleted?.id) {
+              setDmConversations((prev: Record<string, DirectMessage[]>) => {
+                const next: Record<string, DirectMessage[]> = {};
+                for (const [friendId, messages] of Object.entries(prev)) {
+                  next[friendId] = messages.map((m) =>
+                    m.id === deleted.id
+                      ? { ...m, text: '', deletedForEveryone: true, replyToMessageId: null, forwardedFromMessageId: null, replyTo: null, forwardedFrom: null }
+                      : m
+                  );
+                }
+                return next;
+              });
+              setPinnedMessageIds((prev: Record<string, string[]>) => {
+                const next: Record<string, string[]> = {};
+                for (const [friendId, ids] of Object.entries(prev)) {
+                  next[friendId] = ids.filter((id) => id !== deleted.id);
+                }
+                return next;
+              });
+              fetchConversationsApi().then((res) => {
+                if (res.ok && res.data) setConversations(res.data.conversations);
+              });
+            }
+            break;
+          }
+          case 'dm:pinned':
+          case 'dm:unpinned': {
+            const pin = payload as { messageId?: string; friendId?: string } | undefined;
+            if (pin?.messageId && pin.friendId) {
+              setPinnedMessageIds((prev) => {
+                const existing = prev[pin.friendId!] ?? [];
+                const has = existing.includes(pin.messageId!);
+                if (type === 'dm:pinned' && !has) {
+                  return { ...prev, [pin.friendId!]: [...existing, pin.messageId!] };
+                }
+                if (type === 'dm:unpinned' && has) {
+                  return { ...prev, [pin.friendId!]: existing.filter((id) => id !== pin.messageId) };
+                }
+                return prev;
+              });
+            }
+            break;
+          }
+          case 'conversation:updated': {
+            fetchConversationsApi().then((res) => {
+              if (res.ok && res.data) setConversations(res.data.conversations);
+            });
             break;
           }
         }
@@ -1610,6 +2005,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         authState,
         isAuthenticated,
         currentUser,
+        isAdmin,
         login,
         logout,
         refreshAuth,
@@ -1663,6 +2059,7 @@ participants,
         sendRoomChatMessage,
         sendReaction,
         setRoomMedia,
+        setRoomLibraryMedia,
         uploadRoomMedia,
         setLocalMovieActive,
         friends,
@@ -1682,6 +2079,32 @@ participants,
         conversations,
         openConversation,
         startDm,
+        pinnedMessageIds,
+        sendReply,
+        sendForward,
+        pinMessage,
+        unpinMessage,
+        starMessage,
+        unstarMessage,
+        deleteMessageForMe,
+        deleteMessageForEveryone,
+        setConversationArchived,
+        setConversationPinned,
+        setConversationFavourite,
+        markConversationRead,
+        markConversationUnread,
+        clearChat,
+        deleteChat,
+        setChatLockPin,
+        unlockChat,
+        verifyChatLock,
+        isChatVerified,
+        conversationLists,
+        refreshConversationLists,
+        createConversationList,
+        deleteConversationList,
+        addConversationToList,
+        removeConversationFromList,
         searchResults,
         searchTotal,
         searchNextOffset,

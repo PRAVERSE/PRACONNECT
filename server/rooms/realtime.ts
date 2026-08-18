@@ -300,3 +300,81 @@ export function openEventStream(
 export function connectedClientCount(roomId: string): number {
   return clients.get(roomId)?.size ?? 0;
 }
+
+// ─── Room event retention (Phase 6.8) ─────────────────────────────────────────
+// Chat messages and room state changes are persisted as roomEvents rows and
+// broadcast over SSE; without a retention policy an abusive room could grow
+// that table without bound. Cleanup is age-based with a per-room safety cap,
+// and never removes events still needed by the active replay window.
+
+/** Maximum persisted events kept per room (safety cap; always >= replay window + 1). */
+export const ROOM_EVENTS_MAX_PER_ROOM = Math.max(
+  REPLAY_WINDOW + 1,
+  parseInt(process.env.ROOM_EVENTS_MAX_PER_ROOM ?? '2000', 10) || 2000
+);
+
+/** Events older than this are eligible for age-based deletion (default: 24h). */
+export const ROOM_EVENTS_RETENTION_MS = Math.max(
+  0,
+  parseInt(process.env.ROOM_EVENTS_RETENTION_MS ?? '86400000', 10) || 86400000
+);
+
+/** Always keep this many newest events per room so the replay window survives. */
+const ROOM_EVENTS_KEEP_NEWEST = REPLAY_WINDOW + 100;
+
+export interface RoomEventCleanupResult {
+  roomsProcessed: number;
+  deleted: number;
+}
+
+/**
+ * Trim old roomEvents per room. Options override the environment defaults and
+ * are injectable for deterministic tests. Bounded by `maxRooms` per sweep.
+ */
+export function cleanupRoomEvents(
+  now = Date.now(),
+  options: { maxPerRoom?: number; retentionMs?: number; maxRooms?: number } = {}
+): RoomEventCleanupResult {
+  const maxPerRoom = Math.max(REPLAY_WINDOW + 1, options.maxPerRoom ?? ROOM_EVENTS_MAX_PER_ROOM);
+  const retentionMs = options.retentionMs ?? ROOM_EVENTS_RETENTION_MS;
+  const maxRooms = options.maxRooms ?? 1000;
+  const cutoff = new Date(now - retentionMs).toISOString();
+
+  const roomRows = db.prepare('SELECT DISTINCT roomId FROM roomEvents').all() as { roomId: string }[];
+  let deleted = 0;
+  let roomsProcessed = 0;
+
+  for (const { roomId } of roomRows) {
+    if (roomsProcessed >= maxRooms) break;
+    roomsProcessed += 1;
+    const countRow = db.prepare('SELECT COUNT(*) AS n FROM roomEvents WHERE roomId = ?').get(roomId) as { n: number };
+    if (countRow.n === 0) continue;
+
+    // Safety cap: keep only the newest maxPerRoom events for this room.
+    const excess = countRow.n - maxPerRoom;
+    if (excess > 0) {
+      const capInfo = db
+        .prepare(
+          `DELETE FROM roomEvents WHERE roomId = ? AND id IN (
+             SELECT id FROM roomEvents WHERE roomId = ? ORDER BY id ASC LIMIT ?
+           )`
+        )
+        .run(roomId, roomId, excess);
+      deleted += capInfo.changes;
+    }
+
+    // Age-based retention: drop events older than the cutoff unless they are
+    // within the active replay window (the newest REPLAY_WINDOW + 100 events
+    // always survive, so Last-Event-ID replay is never broken).
+    const ageInfo = db
+      .prepare(
+        `DELETE FROM roomEvents WHERE roomId = ? AND createdAt < ? AND id NOT IN (
+           SELECT id FROM roomEvents WHERE roomId = ? ORDER BY id DESC LIMIT ?
+         )`
+      )
+      .run(roomId, cutoff, roomId, ROOM_EVENTS_KEEP_NEWEST);
+    deleted += ageInfo.changes;
+  }
+
+  return { roomsProcessed, deleted };
+}

@@ -346,7 +346,7 @@ export const AuthView: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen w-full flex flex-col justify-between items-center py-8 px-4 text-[var(--text-primary)] bg-[var(--bg-canvas)] select-none">
+    <div className="viewport-min-fill w-full flex flex-col justify-between items-center py-8 px-4 text-[var(--text-primary)] bg-[var(--bg-canvas)] select-none">
       <div className="w-full max-w-md my-auto flex flex-col items-center">
         {/* Top Logo & Brand */}
         <div className="flex items-center gap-3 mb-6">

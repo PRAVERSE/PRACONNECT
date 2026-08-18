@@ -4,6 +4,7 @@ export type NavigationTab =
   | 'games'
   | 'friends'
   | 'messages'
+  | 'library'
   | 'settings'
   | 'profile'
   | 'room'
@@ -20,8 +21,10 @@ export interface MediaTrack {
   poster?: string;
   duration?: number;
   type?: 'video' | 'stream';
-  /** 'local-movie' = shared peer-to-peer via WebRTC (never has a url); 'url' = direct URL; 'hosted' = server upload. */
-  mediaType?: 'local-movie' | 'url' | 'hosted' | string;
+  /** 'local-movie' = shared peer-to-peer via WebRTC (never has a url); 'library' = admin media library (mediaId, streamed from the server by every participant); 'url' = direct URL; 'hosted' = server upload. */
+  mediaType?: 'local-movie' | 'library' | 'url' | 'hosted' | string;
+  /** Admin library reference — present when mediaType === 'library'. */
+  mediaId?: string;
   sourceUserId?: string;
   mimeType?: string;
 }
@@ -149,11 +152,30 @@ export interface RoomHistoryStats {
   recentRooms: RoomHistoryEntry[];
 }
 
+/** Preview of the message this message replies to / forwards from (the body
+ *  is never shipped for messages deleted for everyone or deleted for me). */
+export interface MessageOriginPreview {
+  text: string;
+  senderId: string;
+  createdAt: string;
+  deleted: boolean;
+}
+
 export interface DirectMessage {
   id: string;
   senderId: string;
   text: string;
   timestamp: string;
+  /** Server ISO timestamp — the info dialog formats from this, not the
+   *  locale-display `timestamp`. */
+  createdAt?: string;
+  replyToMessageId?: string | null;
+  forwardedFromMessageId?: string | null;
+  /** Set when the sender deleted the message for everyone (body already
+   *  stripped server-side — never trust text for deleted messages). */
+  deletedForEveryone?: boolean;
+  replyTo?: MessageOriginPreview | null;
+  forwardedFrom?: MessageOriginPreview | null;
 }
 
 export interface DMConversation {
@@ -224,5 +246,74 @@ export interface FloatingReaction {
   rotation: number;
   scale: number;
   timestamp: number;
+}
+
+// ─── Phase B: Media Library ─────────────────────────────────────────────────
+// Typed, metadata-only structures. Binary video data never lives in these UI
+// objects — bytes live in server-side MediaStorage and arrive via the
+// authorized download endpoint.
+
+/** Server-reported processing lifecycle of a library item. */
+export type MediaStatus = 'draft' | 'uploading' | 'uploaded' | 'processing' | 'ready' | 'failed';
+
+export interface MediaItem {
+  id: string;
+  title: string;
+  description: string;
+  /** Poster image URL (null/'' = placeholder thumbnail). */
+  posterUrl: string | null;
+  /** Duration in seconds (null until Phase C metadata extraction). */
+  duration: number | null;
+  sizeBytes: number;
+  /** Video container/codec format, e.g. 'video/mp4'. */
+  mimeType: string | null;
+  status: MediaStatus;
+  published: boolean;
+  downloadAllowed: boolean;
+  createdAt: string;
+  /** Original client filename (display only — never a path). */
+  originalFilename: string | null;
+  createdByUserId: string;
+  creatorName?: string;
+  /** Admin-only storage bookkeeping (never shipped to normal users). */
+  storageKey?: string | null;
+  /** Admin-only: key of the playable MP4 produced by the FFmpeg pipeline. */
+  playableKey?: string | null;
+}
+
+/** Resumable chunked upload session (Phase C). */
+export interface MediaUploadSession {
+  id: string;
+  mediaId: string;
+  totalBytes: number;
+  chunkSize: number;
+  chunkCount: number;
+  receivedBytes: number;
+  receivedChunks: number;
+  status: 'active' | 'completed';
+  missingChunks?: number[];
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MediaPage {
+  items: MediaItem[];
+  total: number;
+  page: number;
+  pageSize: number;
+  hasMore: boolean;
+}
+
+/** Phase A UI state machine for the Media Library page. */
+export type MediaLibraryState = 'loading' | 'ready' | 'empty' | 'error';
+
+/** Payload for the upload form (metadata create + file). */
+export interface MediaUploadInput {
+  title: string;
+  description: string;
+  file: File | null;
+  downloadAllowed: boolean;
+  published: boolean;
 }
 

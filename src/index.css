@@ -12,9 +12,37 @@ body,
 #root {
   width: 100%;
   height: 100%;
-  min-height: 100%;
   margin: 0;
   padding: 0;
+}
+
+/* Dynamic viewport support — track the VISIBLE area (mobile address-bar
+   collapse, desktop toolbars) so the app always fills exactly what is on
+   screen instead of a static 100vh that can overshoot on mobile.
+   `viewport-fill` is for fixed shells (exact height, internal scroll);
+   `viewport-min-fill` is for pages that may scroll (min-height only). */
+.viewport-fill {
+  height: 100vh;
+}
+
+.viewport-min-fill {
+  min-height: 100vh;
+}
+
+@supports (height: 100dvh) {
+  html,
+  body,
+  #root {
+    min-height: 100dvh;
+  }
+
+  .viewport-fill {
+    height: 100dvh;
+  }
+
+  .viewport-min-fill {
+    min-height: 100dvh;
+  }
 }
 
 :root, [data-theme="dark"], .dark {
@@ -484,6 +512,11 @@ h1, h2, h3, h4, .font-heading {
 @keyframes fade-in {
   0% { opacity: 0; }
   100% { opacity: 1; }
+}
+
+@keyframes drawer-in {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
 }
 
 @keyframes ambient-float-1 {

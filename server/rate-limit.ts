@@ -47,6 +47,18 @@ export const LIMITS = {
   chat: { max: 30, windowMs: 10 * 1000 },
   reaction: { max: 60, windowMs: 10 * 1000 }, // emoji bursts need a little headroom
   signal: { max: 200, windowMs: 10 * 1000 }, // WebRTC bursts need headroom
+  // Social (per authenticated user unless noted)
+  userSearch: { max: 60, windowMs: 60 * 1000 }, // directory lookups
+  friendRequest: { max: 20, windowMs: 60 * 1000 }, // per target user pair
+  dmSend: { max: 60, windowMs: 60 * 1000 },
+  watchInvite: { max: 20, windowMs: 60 * 1000 },
+  // DM context features (per authenticated user)
+  dmForward: { max: 30, windowMs: 60 * 1000 },
+  dmDelete: { max: 60, windowMs: 60 * 1000 },
+  dmPin: { max: 60, windowMs: 60 * 1000 },
+  dmStar: { max: 60, windowMs: 60 * 1000 },
+  dmConversationSettings: { max: 90, windowMs: 60 * 1000 },
+  dmLock: { max: 10, windowMs: 60 * 1000 }, // PIN attempts are deliberately tight
 } as const;
 
 export type LimitName = keyof typeof LIMITS;

@@ -166,6 +166,7 @@ export interface RoomPayload {
     duration?: number;
     type?: string;
     mediaType?: string;
+    mediaId?: string;
     sourceUserId?: string;
     mimeType?: string;
   } | null;
@@ -204,16 +205,22 @@ function parseMedia(json: string | null): RoomPayload['currentMedia'] {
     if (!m || typeof m !== 'object') return null;
     // Local movies are shared peer-to-peer via WebRTC: the room carries only
     // lightweight metadata and NEVER a URL (a blob:/file: URL is meaningless
-    // outside the host browser). Every other media type requires a URL.
+    // outside the host browser). Library media (mediaType 'library') carries
+    // only a mediaId — every participant streams the playable MP4 from the
+    // media library through their own authenticated session, never through
+    // WebRTC. Every other media type requires a URL.
     const isLocalMovie = m.mediaType === 'local-movie';
-    if (!isLocalMovie && typeof m.url !== 'string') return null;
+    const isLibrary = m.mediaType === 'library';
+    if (!isLocalMovie && !isLibrary && typeof m.url !== 'string') return null;
+    if (isLibrary && typeof m.mediaId !== 'string') return null;
     return {
       title: typeof m.title === 'string' ? m.title : 'Untitled',
-      url: isLocalMovie ? undefined : m.url,
+      url: isLocalMovie || isLibrary ? undefined : m.url,
       poster: typeof m.poster === 'string' ? m.poster : undefined,
       duration: typeof m.duration === 'number' ? m.duration : undefined,
       type: typeof m.type === 'string' ? m.type : undefined,
       mediaType: typeof m.mediaType === 'string' ? m.mediaType : undefined,
+      mediaId: typeof m.mediaId === 'string' ? m.mediaId : undefined,
       sourceUserId: typeof m.sourceUserId === 'string' ? m.sourceUserId : undefined,
       mimeType: typeof m.mimeType === 'string' ? m.mimeType : undefined,
     };
@@ -574,6 +581,7 @@ export interface MediaInput {
   duration?: number;
   type?: string;
   mediaType?: string;
+  mediaId?: string;
   sourceUserId?: string;
   mimeType?: string;
 }
@@ -598,6 +606,7 @@ export function setRoomMedia(
         duration: media.duration,
         type: media.type,
         mediaType: media.mediaType,
+        mediaId: media.mediaId,
         sourceUserId: media.mediaType === 'local-movie' ? room.hostUserId : media.sourceUserId,
         mimeType: media.mimeType,
       })

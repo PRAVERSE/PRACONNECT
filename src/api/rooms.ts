@@ -23,8 +23,10 @@ export interface ServerRoomMedia {
   poster?: string;
   duration?: number;
   type?: string;
-  /** 'local-movie' = shared peer-to-peer via WebRTC (url is always absent); 'url' = direct URL; 'hosted' = server upload. */
-  mediaType?: 'local-movie' | 'url' | 'hosted' | string;
+  /** 'local-movie' = shared peer-to-peer via WebRTC (url is always absent); 'library' = admin media library (mediaId set, streamed from the server); 'url' = direct URL; 'hosted' = server upload. */
+  mediaType?: 'local-movie' | 'library' | 'url' | 'hosted' | string;
+  /** Admin library reference — present when mediaType === 'library'. */
+  mediaId?: string;
   sourceUserId?: string;
   mimeType?: string;
 }
@@ -191,6 +193,30 @@ export async function setRoomMediaApi(
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       return { ok: false, error: data.error || { code: 'MEDIA_FAILED', message: 'Failed to update media.' } };
+    }
+    return { ok: true, data: data.room };
+  } catch {
+    return { ok: false, error: { code: 'NETWORK_ERROR', message: 'Network connection failed.' } };
+  }
+}
+
+/** Host only: select a published Media Library item for the room. The room
+ *  stores a mediaId reference — every participant streams the playable MP4
+ *  from the library; video never travels over WebRTC. */
+export async function setRoomLibraryMediaApi(
+  roomId: string,
+  mediaId: string
+): Promise<RoomApiResponse<ServerRoom>> {
+  try {
+    const res = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/media/library`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ mediaId }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      return { ok: false, error: data.error || { code: 'MEDIA_FAILED', message: 'Failed to select media.' } };
     }
     return { ok: true, data: data.room };
   } catch {

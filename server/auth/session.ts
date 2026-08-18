@@ -58,6 +58,7 @@ interface UserRow {
   email: string;
   avatarUrl: string | null;
   emailVerified: number;
+  role: string;
   createdAt: string;
 }
 

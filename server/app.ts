@@ -10,6 +10,12 @@ import path from 'node:path';
 import { auth } from './routes/auth';
 import { rooms, handleMediaServing } from './routes/rooms';
 import { profile } from './routes/profile';
+import { users } from './routes/users';
+import { friends } from './routes/friends';
+import { messages } from './routes/messages';
+import { invites } from './routes/invites';
+import { media } from './routes/media';
+import { adminMedia } from './routes/adminMedia';
 import { requireAuth } from './middleware/auth';
 import { db } from './db/index';
 import { isApiPath, resolveStaticFile, serveStaticFile } from './static';
@@ -54,6 +60,12 @@ export function createApp(options: CreateAppOptions = {}): Hono {
   app.route('/api/auth', auth);
   app.route('/api/rooms', rooms);
   app.route('/api/profile', profile);
+  app.route('/api/users', users);
+  app.route('/api/friends', friends);
+  app.route('/api/messages', messages);
+  app.route('/api/watch-invites', invites);
+  app.route('/api/media', media);
+  app.route('/api/admin/media', adminMedia);
 
   // Uploaded media: authenticated + room-membership authorized (Phase 6.2).
   app.use('/api/uploads/*', requireAuth);

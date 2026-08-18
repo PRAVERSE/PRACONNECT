@@ -4,6 +4,7 @@ import {
   Compass,
   Gamepad2,
   MessageSquare,
+  Library,
   Bell,
   Radio,
   Play
@@ -23,6 +24,7 @@ export const Sidebar: React.FC = () => {
     setNotificationsOpen,
     userProfile,
     friends,
+    friendRequests,
   } = useApp();
 
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
@@ -33,7 +35,7 @@ export const Sidebar: React.FC = () => {
     (sum, f) => sum + (typeof f.unreadCount === 'number' ? f.unreadCount : 0),
     0
   );
-  const pendingRequestCount = friends.filter((f) => f.requestPending).length;
+  const pendingRequestCount = friendRequests.incoming.length;
 
   const iconGlyphClass = 'w-5 h-5';
 
@@ -41,7 +43,8 @@ export const Sidebar: React.FC = () => {
     { id: 'dashboard', label: 'Home', icon: <Tv className={iconGlyphClass} strokeWidth={1.7} /> },
     { id: 'explore', label: 'Explore', icon: <Compass className={iconGlyphClass} strokeWidth={1.7} /> },
     { id: 'games', label: 'Games', icon: <Gamepad2 className={iconGlyphClass} strokeWidth={1.7} /> },
-    { id: 'messages', label: 'Messages', icon: <MessageSquare className={iconGlyphClass} strokeWidth={1.7} /> }
+    { id: 'messages', label: 'Messages', icon: <MessageSquare className={iconGlyphClass} strokeWidth={1.7} /> },
+    { id: 'library', label: 'Media Library', icon: <Library className={iconGlyphClass} strokeWidth={1.7} /> }
   ];
 
   const iconButtonClass =
@@ -66,7 +69,7 @@ export const Sidebar: React.FC = () => {
     isActive ? 'nav-icon nav-icon--active relative z-10' : 'nav-icon relative z-10';
 
   return (
-    <aside className="h-screen w-[84px] bg-[var(--bg)] border-r border-[var(--border-hairline)] text-[var(--text-primary)] flex flex-col items-center py-4 select-none shrink-0 z-30">
+    <aside className="h-full w-[84px] bg-[var(--bg)] border-r border-[var(--border-hairline)] text-[var(--text-primary)] flex flex-col items-center py-4 select-none shrink-0 z-30">
       {/* Brand */}
       <Tooltip label="PraConnect Home" side="right">
         <button

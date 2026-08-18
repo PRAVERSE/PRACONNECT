@@ -13,7 +13,7 @@
 //     empty-room TTL always wins.
 
 import { db } from '../db/index';
-import { generateId } from '../auth/auth';
+import { generateId, hashPassword, verifyPassword } from '../auth/auth';
 import { nowIso } from '../rooms/time';
 import { getRoomOrNull, isRoomMember, isRoomExpired } from '../rooms/service';
 
@@ -35,6 +35,13 @@ const Errors = {
   roomGone: (): SocialError => ({ code: 'ROOM_GONE', message: 'This watch room has ended.' }),
   roomMembership: (): SocialError => ({ code: 'ROOM_MEMBERSHIP_REQUIRED', message: 'You must be in the room to invite others to it.' }),
   validation: (message: string): SocialError => ({ code: 'VALIDATION_ERROR', message }),
+  conversationNotFound: (): SocialError => ({ code: 'CONVERSATION_NOT_FOUND', message: 'Conversation not found.' }),
+  messageNotFound: (): SocialError => ({ code: 'MESSAGE_NOT_FOUND', message: 'Message not found.' }),
+  messageForbidden: (): SocialError => ({ code: 'MESSAGE_FORBIDDEN', message: 'You are not allowed to do that to this message.' }),
+  deleteWindowExpired: (): SocialError => ({ code: 'DELETE_WINDOW_EXPIRED', message: 'This message can no longer be deleted for everyone.' }),
+  lockRequired: (): SocialError => ({ code: 'LOCK_REQUIRED', message: 'This conversation is locked.' }),
+  lockInvalid: (): SocialError => ({ code: 'LOCK_INVALID', message: 'Incorrect PIN.' }),
+  listNotFound: (): SocialError => ({ code: 'LIST_NOT_FOUND', message: 'List not found.' }),
 };
 
 // ─── Public user shape (never emails, hashes, or internal columns) ──────────
@@ -75,6 +82,11 @@ interface DirectMessageRow {
   recipientId: string;
   text: string;
   createdAt: string;
+  replyToMessageId: string | null;
+  forwardedFromMessageId: string | null;
+  deletedForEveryone: number;
+  deletedAt: string | null;
+  deletedByUserId: string | null;
 }
 
 interface WatchInviteRow {
@@ -369,11 +381,23 @@ export function listFriendRequests(userId: string): {
 
 // ─── Direct messages ─────────────────────────────────────────────────────────
 
+/** Canonical conversation id for a pair: sorted user ids joined with ':'. */
+export function conversationIdFor(a: string, b: string): string {
+  return a < b ? `${a}:${b}` : `${b}:${a}`;
+}
+
 export interface DirectMessage {
   id: string;
   senderId: string;
   text: string;
   createdAt: string;
+  replyToMessageId?: string | null;
+  forwardedFromMessageId?: string | null;
+  deletedForEveryone?: boolean;
+  /** The replied-to message quoted under this one (joined server-side). */
+  replyTo?: { id: string; text: string; senderId: string; deleted: boolean } | null;
+  /** The original message this one was forwarded from (joined server-side). */
+  forwardedFrom?: { id: string; text: string; senderId: string; deleted: boolean } | null;
 }
 
 export interface ConversationSummary {
@@ -383,13 +407,71 @@ export interface ConversationSummary {
   avatar: string;
   online: boolean;
   lastMessage: { text: string; senderId: string; createdAt: string } | null;
+  /** Per-user conversation preferences (server-authoritative). */
+  archived?: boolean;
+  pinned?: boolean;
+  favourite?: boolean;
+  locked?: boolean;
+  unreadCount?: number;
+}
+
+/** The original text of a message is NEVER revealed after delete-for-everyone. */
+function messageTextFor(row: DirectMessageRow): string {
+  return row.deletedForEveryone ? '' : row.text;
+}
+
+/** Join the replied-to / forwarded-from origin message for quoting. */
+function originPreview(row: { id: string; text: string; senderId: string; deletedForEveryone: number; createdAt: string } | undefined, deletedForMe: boolean):
+  { id: string; text: string; senderId: string; deleted: boolean } | null {
+  if (!row) return null;
+  const deleted = deletedForMe || Boolean(row.deletedForEveryone);
+  return {
+    id: row.id ?? '',
+    text: row.deletedForEveryone ? '' : row.text,
+    senderId: row.senderId,
+    deleted,
+  };
+}
+
+/**
+ * Load a message the acting user can see, if any. `isDeletedForMe` controls
+ * whether delete-for-me tombstones also exclude the row (listing) or only mark
+ * it (info previews).
+ */
+export interface MessageAccess {
+  ok: true;
+  message: DirectMessageRow;
+  /** The peer participant (the other person in the conversation). */
+  peerId: string;
+  conversationId: string;
+}
+export type MessageAccessResult = MessageAccess | { ok: false; error: SocialError };
+
+function getMessageRow(id: string): DirectMessageRow | undefined {
+  return db.prepare('SELECT * FROM directMessages WHERE id = ?').get(id) as DirectMessageRow | undefined;
+}
+
+export { getMessageRow };
+
+/** A message the user is a participant of — in an ACCEPTED-friendship
+ *  conversation. Never trusts client-supplied owner ids. */
+export function getMessageAccess(userId: string, messageId: string): MessageAccessResult {
+  const row = getMessageRow(messageId);
+  if (!row) return { ok: false, error: Errors.messageNotFound() };
+  const isParticipant = row.senderId === userId || row.recipientId === userId;
+  if (!isParticipant) return { ok: false, error: Errors.messageNotFound() };
+  const peerId = row.senderId === userId ? row.recipientId : row.senderId;
+  if (!isAcceptedFriendship(userId, peerId)) return { ok: false, error: Errors.notFriends() };
+  return { ok: true, message: row, peerId, conversationId: conversationIdFor(userId, peerId) };
 }
 
 /** Accepted-friends-only conversation list. Historical messages from a
  *  relationship that is no longer accepted are never surfaced here — a
  *  stranger (or a user with a pending/rejected friendship) must not be able to
  *  infer a conversation existed. Sending is separately enforced in
- *  sendDirectMessage / listDirectMessages. */
+ *  sendDirectMessage / listDirectMessages. Conversations deleted for the
+ *  current user are hidden; per-user settings (pinned/archived/favourite/
+ *  locked/unread) ride along. Pinned conversations sort above the rest. */
 export function listConversations(userId: string): ConversationSummary[] {
   const peerRows = db
     .prepare(
@@ -403,30 +485,60 @@ export function listConversations(userId: string): ConversationSummary[] {
     if (!isAcceptedFriendship(userId, peerId)) continue;
     const peer = getUserById(peerId);
     if (!peer) continue;
+    const conversationId = conversationIdFor(userId, peerId);
+    const hidden = db.prepare('SELECT 1 FROM conversationDeletions WHERE userId = ? AND conversationId = ?').get(userId, conversationId);
+    if (hidden) continue;
+
     const last = db
       .prepare(
-        `SELECT text, senderId, createdAt FROM directMessages
+        `SELECT text, senderId, createdAt, deletedForEveryone FROM directMessages
          WHERE (senderId = ? AND recipientId = ?) OR (senderId = ? AND recipientId = ?)
          ORDER BY createdAt DESC LIMIT 1`
       )
-      .get(userId, peerId, peerId, userId) as Pick<DirectMessageRow, 'text' | 'senderId' | 'createdAt'> | undefined;
+      .get(userId, peerId, peerId, userId) as Pick<DirectMessageRow, 'text' | 'senderId' | 'createdAt' | 'deletedForEveryone'> | undefined;
     const presence = db
       .prepare(
         `SELECT 1 FROM roomMembers m JOIN rooms r ON r.id = m.roomId
          WHERE m.userId = ? AND m.leftAt IS NULL AND r.emptySince IS NULL LIMIT 1`
       )
       .get(peerId);
+
+    const settings = db
+      .prepare('SELECT * FROM conversationUserSettings WHERE userId = ? AND conversationId = ?')
+      .get(userId, conversationId) as ConversationSettingsRow | undefined;
+
+    const unread = (db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM directMessages
+         WHERE senderId = ? AND recipientId = ? AND deletedForEveryone = 0
+           AND (? IS NULL OR createdAt > ?)`
+      )
+      .get(peerId, userId, settings?.lastReadAt ?? null, settings?.lastReadAt ?? null) as { n: number }).n;
+
     summaries.push({
       friendId: peerId,
       name: peer.name,
       username: peer.username,
       avatar: peer.avatarUrl ?? peer.name.charAt(0).toUpperCase(),
       online: Boolean(presence),
-      lastMessage: last ? { text: last.text, senderId: last.senderId, createdAt: last.createdAt } : null,
+      // Locked conversations never leak preview text — even to the owner.
+      lastMessage: last
+        ? {
+            text: settings?.locked ? '' : last.deletedForEveryone ? '' : last.text,
+            senderId: last.senderId,
+            createdAt: last.createdAt,
+          }
+        : null,
+      archived: Boolean(settings?.archived),
+      pinned: Boolean(settings?.pinned),
+      favourite: Boolean(settings?.favourite),
+      locked: Boolean(settings?.locked),
+      unreadCount: unread,
     });
   }
 
   summaries.sort((a, b) => {
+    if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
     const ta = a.lastMessage?.createdAt ?? '';
     const tb = b.lastMessage?.createdAt ?? '';
     return tb.localeCompare(ta);
@@ -439,7 +551,10 @@ export function isAcceptedFriendship(meId: string, otherId: string): boolean {
   return Boolean(row && row.status === 'accepted');
 }
 
-/** Latest `limit` messages of a conversation, chronological (oldest first). */
+/** Latest `limit` messages of a conversation, chronological (oldest first).
+ *  Messages tombstoned for the current user are excluded; delete-for-everyone
+ *  rows are kept as placeholders with the body stripped. The reply/forward
+ *  origin previews are joined so the client never needs follow-up requests. */
 export function listDirectMessages(
   userId: string,
   friendId: string,
@@ -451,17 +566,52 @@ export function listDirectMessages(
   const clamped = Math.min(Math.max(1, Math.floor(limit)), 200);
   const rows = db
     .prepare(
-      `SELECT * FROM (
-         SELECT id, senderId, recipientId, text, createdAt FROM directMessages
-         WHERE (senderId = ? AND recipientId = ?) OR (senderId = ? AND recipientId = ?)
-         ORDER BY createdAt DESC LIMIT ?
-       ) ORDER BY createdAt ASC`
+      `SELECT dm.id, dm.senderId, dm.recipientId, dm.text, dm.createdAt,
+              dm.replyToMessageId, dm.forwardedFromMessageId,
+              dm.deletedForEveryone, dm.deletedAt, dm.deletedByUserId
+       FROM (
+         SELECT id FROM directMessages dm
+         WHERE ((dm.senderId = ? AND dm.recipientId = ?) OR (dm.senderId = ? AND dm.recipientId = ?))
+           AND NOT EXISTS (SELECT 1 FROM messageDeletions md WHERE md.messageId = dm.id AND md.userId = ?)
+         ORDER BY dm.createdAt DESC LIMIT ?
+       ) sel
+       JOIN directMessages dm ON dm.id = sel.id
+       ORDER BY dm.createdAt ASC`
     )
-    .all(userId, friendId, friendId, userId, clamped) as DirectMessageRow[];
+    .all(userId, friendId, friendId, userId, userId, clamped) as DirectMessageRow[];
 
   return {
     ok: true,
-    messages: rows.map((r) => ({ id: r.id, senderId: r.senderId, text: r.text, createdAt: r.createdAt })),
+    messages: rows.map((r) => mapDirectMessage(userId, r)),
+  };
+}
+
+function mapDirectMessage(userId: string, row: DirectMessageRow): DirectMessage {
+  const replyRow = row.replyToMessageId
+    ? (db.prepare('SELECT id, senderId, text, createdAt, deletedForEveryone FROM directMessages WHERE id = ?').get(row.replyToMessageId) as
+        | Pick<DirectMessageRow, 'id' | 'senderId' | 'text' | 'createdAt' | 'deletedForEveryone'>
+        | undefined)
+    : undefined;  const replyDeletedForMe = row.replyToMessageId
+    ? Boolean(db.prepare('SELECT 1 FROM messageDeletions WHERE messageId = ? AND userId = ?').get(row.replyToMessageId, userId))
+    : false;
+  const fwdRow = row.forwardedFromMessageId
+    ? (db.prepare('SELECT id, senderId, text, createdAt, deletedForEveryone FROM directMessages WHERE id = ?').get(row.forwardedFromMessageId) as
+        | Pick<DirectMessageRow, 'id' | 'senderId' | 'text' | 'createdAt' | 'deletedForEveryone'>
+        | undefined)
+    : undefined;
+  const fwdDeletedForMe = row.forwardedFromMessageId
+    ? Boolean(db.prepare('SELECT 1 FROM messageDeletions WHERE messageId = ? AND userId = ?').get(row.forwardedFromMessageId, userId))
+    : false;
+  return {
+    id: row.id,
+    senderId: row.senderId,
+    text: messageTextFor(row),
+    createdAt: row.createdAt,
+    replyToMessageId: row.replyToMessageId,
+    forwardedFromMessageId: row.forwardedFromMessageId,
+    deletedForEveryone: Boolean(row.deletedForEveryone),
+    replyTo: row.replyToMessageId ? originPreview(replyRow, replyDeletedForMe) : null,
+    forwardedFrom: row.forwardedFromMessageId ? originPreview(fwdRow, fwdDeletedForMe) : null,
   };
 }
 
@@ -471,21 +621,583 @@ export interface SendDirectMessageResult {
   error?: SocialError;
 }
 
-export function sendDirectMessage(userId: string, friendId: string, text: string): SendDirectMessageResult {
+export interface SendDirectMessageOptions {
+  /** Id of the message being replied to — must belong to this same
+   *  conversation and be accessible to the sender. */
+  replyToMessageId?: string;
+  /** Id of an accessible message being forwarded. Forwarding creates a NEW
+   *  message and never mutates the original. */
+  forwardedFromMessageId?: string;
+}
+
+export function sendDirectMessage(
+  userId: string,
+  friendId: string,
+  text: string,
+  options: SendDirectMessageOptions = {}
+): SendDirectMessageResult {
   if (!isAcceptedFriendship(userId, friendId)) {
     return { ok: false, error: Errors.notFriends() };
   }
   const trimmed = text.trim();
-  if (trimmed.length === 0) return { ok: false, error: Errors.validation('Message cannot be empty.') };
+  if (trimmed.length === 0 && !options.forwardedFromMessageId) {
+    return { ok: false, error: Errors.validation('Message cannot be empty.') };
+  }
   if (trimmed.length > 2000) return { ok: false, error: Errors.validation('Message is too long (max 2000 characters).') };
+
+  if (options.replyToMessageId) {
+    const access = getMessageAccess(userId, options.replyToMessageId);
+    if (!access.ok) return { ok: false, error: access.error };
+    // The reply must stay inside the same conversation pair.
+    if (access.conversationId !== conversationIdFor(userId, friendId)) {
+      return { ok: false, error: Errors.validation('Reply target is not in this conversation.') };
+    }
+  }
+  if (options.forwardedFromMessageId) {
+    const access = getMessageAccess(userId, options.forwardedFromMessageId);
+    if (!access.ok) return { ok: false, error: access.error };
+  }
 
   const now = nowIso();
   const id = generateId();
   db.prepare(
-    'INSERT INTO directMessages (id, senderId, recipientId, text, createdAt) VALUES (?, ?, ?, ?, ?)'
-  ).run(id, userId, friendId, trimmed, now);
+    `INSERT INTO directMessages
+       (id, senderId, recipientId, text, createdAt, replyToMessageId, forwardedFromMessageId)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(id, userId, friendId, trimmed, now, options.replyToMessageId ?? null, options.forwardedFromMessageId ?? null);
 
-  return { ok: true, message: { id, senderId: userId, text: trimmed, createdAt: now } };
+  // A new message revives a chat the sender had "deleted": the row reappears
+  // in the conversation list (and, symmetric, for the recipient if they had
+  // deleted it too).
+  const conversationId = conversationIdFor(userId, friendId);
+  db.prepare('DELETE FROM conversationDeletions WHERE conversationId = ?').run(conversationId);
+
+  const row = db.prepare('SELECT * FROM directMessages WHERE id = ?').get(id) as DirectMessageRow;
+  return { ok: true, message: mapDirectMessage(userId, row) };
+}
+
+// ─── Message forwarding ──────────────────────────────────────────────────────
+
+/** Forward an accessible message into an accepted-friend conversation. The
+ *  original message is NEVER mutated — a new message row is created carrying
+ *  forwardedFromMessageId metadata. */
+export function forwardMessage(
+  userId: string,
+  messageId: string,
+  toFriendId: string
+): SendDirectMessageResult {
+  const source = getMessageAccess(userId, messageId);
+  if (!source.ok) return { ok: false, error: source.error };
+  if (source.message.deletedForEveryone) {
+    return { ok: false, error: Errors.messageNotFound() };
+  }
+  return sendDirectMessage(userId, toFriendId, source.message.text, {
+    forwardedFromMessageId: messageId,
+  });
+}
+
+// ─── Message pins ────────────────────────────────────────────────────────────
+
+export function pinMessage(userId: string, messageId: string): { ok: boolean; pinned: boolean; error?: SocialError } {
+  const access = getMessageAccess(userId, messageId);
+  if (!access.ok) return { ok: false, pinned: false, error: access.error };
+  const now = nowIso();
+  db.prepare(
+    `INSERT OR IGNORE INTO messagePins (id, messageId, conversationId, pinnedByUserId, createdAt)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(generateId(), messageId, access.conversationId, userId, now);
+  return { ok: true, pinned: true };
+}
+
+export function unpinMessage(userId: string, messageId: string): { ok: boolean; pinned: boolean; error?: SocialError } {
+  const access = getMessageAccess(userId, messageId);
+  if (!access.ok) return { ok: false, pinned: false, error: access.error };
+  db.prepare('DELETE FROM messagePins WHERE messageId = ? AND pinnedByUserId = ?').run(messageId, userId);
+  return { ok: true, pinned: false };
+}
+
+export function isMessagePinnedByUser(userId: string, messageId: string): boolean {
+  return Boolean(
+    db.prepare('SELECT 1 FROM messagePins WHERE messageId = ? AND pinnedByUserId = ?').get(messageId, userId)
+  );
+}
+
+/** Pinned messages in a conversation the user can access (both participants'
+ *  pins are visible — pinned message state is shared). Sorted newest first. */
+export function listPinnedMessages(userId: string, friendId: string): { ok: boolean; messages?: DirectMessage[]; error?: SocialError } {
+  if (!isAcceptedFriendship(userId, friendId)) return { ok: false, error: Errors.notFriends() };
+  const conversationId = conversationIdFor(userId, friendId);
+  const rows = db
+    .prepare(
+      `SELECT dm.* FROM messagePins mp
+       JOIN directMessages dm ON dm.id = mp.messageId
+       WHERE mp.conversationId = ?
+         AND NOT EXISTS (SELECT 1 FROM messageDeletions md WHERE md.messageId = dm.id AND md.userId = ?)
+       ORDER BY mp.createdAt DESC LIMIT 50`
+    )
+    .all(conversationId, userId) as DirectMessageRow[];
+  return { ok: true, messages: rows.map((r) => mapDirectMessage(userId, r)) };
+}
+
+// ─── Message stars (user-specific) ───────────────────────────────────────────
+
+export function starMessage(userId: string, messageId: string): { ok: boolean; starred: boolean; error?: SocialError } {
+  const access = getMessageAccess(userId, messageId);
+  if (!access.ok) return { ok: false, starred: false, error: access.error };
+  db.prepare('INSERT OR IGNORE INTO starredMessages (id, userId, messageId, createdAt) VALUES (?, ?, ?, ?)').run(
+    generateId(),
+    userId,
+    messageId,
+    nowIso()
+  );
+  return { ok: true, starred: true };
+}
+
+export function unstarMessage(userId: string, messageId: string): { ok: boolean; starred: boolean; error?: SocialError } {
+  const access = getMessageAccess(userId, messageId);
+  if (!access.ok) return { ok: false, starred: false, error: access.error };
+  db.prepare('DELETE FROM starredMessages WHERE userId = ? AND messageId = ?').run(userId, messageId);
+  return { ok: true, starred: false };
+}
+
+export function isMessageStarredByUser(userId: string, messageId: string): boolean {
+  return Boolean(
+    db.prepare('SELECT 1 FROM starredMessages WHERE userId = ? AND messageId = ?').get(userId, messageId)
+  );
+}
+
+export interface StarredMessageItem {
+  message: DirectMessage;
+  friendId: string;
+  peerName: string;
+  peerUsername: string;
+  starredAt: string;
+}
+
+/** The starring user's own starred list — never anyone else's. Messages from
+ *  conversations the user can no longer access, or that were deleted for the
+ *  user, are excluded. */
+export function listStarredMessages(userId: string): StarredMessageItem[] {
+  const rows = db
+    .prepare(
+      `SELECT dm.*, u.name AS peerName, u.username AS peerUsername, sm.createdAt AS starredAt,
+              CASE WHEN dm.senderId = ? THEN dm.recipientId ELSE dm.senderId END AS peerId
+       FROM starredMessages sm
+       JOIN directMessages dm ON dm.id = sm.messageId
+       JOIN users u ON u.id = CASE WHEN dm.senderId = ? THEN dm.recipientId ELSE dm.senderId END
+       WHERE sm.userId = ?
+         AND NOT EXISTS (SELECT 1 FROM messageDeletions md WHERE md.messageId = dm.id AND md.userId = ?)
+       ORDER BY sm.createdAt DESC LIMIT 100`
+    )
+    .all(userId, userId, userId, userId) as (DirectMessageRow & { peerName: string; peerUsername: string; starredAt: string; peerId: string })[];
+
+  return rows
+    .filter((r) => isAcceptedFriendship(userId, r.peerId))
+    .map((r) => ({
+      message: mapDirectMessage(userId, r),
+      friendId: r.peerId,
+      peerName: r.peerName,
+      peerUsername: r.peerUsername,
+      starredAt: r.starredAt,
+    }));
+}
+
+// ─── Delete for me / for everyone ────────────────────────────────────────────
+
+/** Delete-for-me only hides the message for the acting user; the other
+ *  participant's history is untouched. */
+export function deleteMessageForMe(userId: string, messageId: string): { ok: boolean; error?: SocialError } {
+  const access = getMessageAccess(userId, messageId);
+  if (!access.ok) return { ok: false, error: access.error };
+  db.prepare('INSERT OR IGNORE INTO messageDeletions (id, messageId, userId, deletedAt) VALUES (?, ?, ?, ?)').run(
+    generateId(),
+    messageId,
+    userId,
+    nowIso()
+  );
+  return { ok: true };
+}
+
+/** Server-authoritative window: only the ORIGINAL sender can delete for
+ *  everyone, and only inside the configured window (default 15 minutes). The
+ *  client timestamp is never trusted. */
+export const DELETE_FOR_EVERYONE_WINDOW_MS = 15 * 60 * 1000;
+
+export function deleteMessageForEveryone(
+  userId: string,
+  messageId: string,
+  now = Date.now(),
+  windowMs = DELETE_FOR_EVERYONE_WINDOW_MS
+): { ok: boolean; message?: DirectMessage; error?: SocialError } {
+  const access = getMessageAccess(userId, messageId);
+  if (!access.ok) return { ok: false, error: access.error };
+  if (access.message.senderId !== userId) return { ok: false, error: Errors.messageForbidden() };
+  const age = now - Date.parse(access.message.createdAt);
+  if (age > windowMs) return { ok: false, error: Errors.deleteWindowExpired() };
+
+  const deletedAt = new Date(now).toISOString();
+  db.prepare(
+    `UPDATE directMessages SET deletedForEveryone = 1, deletedAt = ?, deletedByUserId = ? WHERE id = ?`
+  ).run(deletedAt, userId, messageId);
+
+  const row = db.prepare('SELECT * FROM directMessages WHERE id = ?').get(messageId) as DirectMessageRow;
+  return { ok: true, message: mapDirectMessage(userId, row) };
+}
+
+// ─── Per-user conversation settings ──────────────────────────────────────────
+
+interface ConversationSettingsRow {
+  userId: string;
+  conversationId: string;
+  archived: number;
+  pinned: number;
+  favourite: number;
+  locked: number;
+  lastReadAt: string | null;
+  lastReadMessageId: string | null;
+  updatedAt: string;
+}
+
+export interface ConversationSettings {
+  friendId: string;
+  conversationId: string;
+  archived: boolean;
+  pinned: boolean;
+  favourite: boolean;
+  locked: boolean;
+  lastReadAt: string | null;
+  lastReadMessageId: string | null;
+  hasLock: boolean;
+}
+
+function readSettings(userId: string, conversationId: string): ConversationSettingsRow | undefined {
+  return db
+    .prepare('SELECT * FROM conversationUserSettings WHERE userId = ? AND conversationId = ?')
+    .get(userId, conversationId) as ConversationSettingsRow | undefined;
+}
+
+function settingsRowFor(userId: string, friendId: string): { ok: true; row: ConversationSettingsRow; conversationId: string } | { ok: false; error: SocialError } {
+  if (!isAcceptedFriendship(userId, friendId)) return { ok: false, error: Errors.notFriends() };
+  const conversationId = conversationIdFor(userId, friendId);
+  const existing = readSettings(userId, conversationId);
+  const row: ConversationSettingsRow =
+    existing ?? {
+      userId,
+      conversationId,
+      archived: 0,
+      pinned: 0,
+      favourite: 0,
+      locked: 0,
+      lastReadAt: null,
+      lastReadMessageId: null,
+      updatedAt: nowIso(),
+    };
+  return { ok: true, row, conversationId };
+}
+
+export function getConversationSettings(userId: string, friendId: string): { ok: boolean; settings?: ConversationSettings; error?: SocialError } {
+  const found = settingsRowFor(userId, friendId);
+  if (!found.ok) return { ok: false, error: found.error };
+  const hasLock = Boolean(
+    db.prepare('SELECT 1 FROM chatLocks WHERE userId = ? AND conversationId = ?').get(userId, found.conversationId)
+  );
+  return {
+    ok: true,
+    settings: {
+      friendId,
+      conversationId: found.conversationId,
+      archived: Boolean(found.row.archived),
+      pinned: Boolean(found.row.pinned),
+      favourite: Boolean(found.row.favourite),
+      locked: Boolean(found.row.locked),
+      lastReadAt: found.row.lastReadAt,
+      lastReadMessageId: found.row.lastReadMessageId,
+      hasLock,
+    },
+  };
+}
+
+type SettingsPatch = Partial<Pick<ConversationSettingsRow, 'archived' | 'pinned' | 'favourite' | 'locked' | 'lastReadAt' | 'lastReadMessageId'>>;
+
+/** Upsert a per-user conversation preference. `locked` always mirrors whether
+ *  a chatLock row exists — the setting alone never grants/denies access. */
+function updateSettings(userId: string, friendId: string, patch: SettingsPatch): { ok: boolean; settings?: ConversationSettings; error?: SocialError } {
+  const found = settingsRowFor(userId, friendId);
+  if (!found.ok) return { ok: false, error: found.error };
+  const now = nowIso();
+  db.prepare(
+    `INSERT INTO conversationUserSettings (userId, conversationId, archived, pinned, favourite, locked, lastReadAt, lastReadMessageId, updatedAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (userId, conversationId) DO UPDATE SET
+       archived = excluded.archived,
+       pinned = excluded.pinned,
+       favourite = excluded.favourite,
+       locked = excluded.locked,
+       lastReadAt = excluded.lastReadAt,
+       lastReadMessageId = excluded.lastReadMessageId,
+       updatedAt = excluded.updatedAt`
+  ).run(
+    userId,
+    found.conversationId,
+    patch.archived ?? found.row.archived,
+    patch.pinned ?? found.row.pinned,
+    patch.favourite ?? found.row.favourite,
+    patch.locked ?? found.row.locked,
+    patch.lastReadAt ?? found.row.lastReadAt,
+    patch.lastReadMessageId ?? found.row.lastReadMessageId,
+    now
+  );
+  const result = getConversationSettings(userId, friendId);
+  return result.ok ? { ok: true, settings: result.settings } : { ok: false, error: result.error };
+}
+
+export function setConversationArchived(userId: string, friendId: string, archived: boolean) {
+  return updateSettings(userId, friendId, { archived: archived ? 1 : 0 });
+}
+export function setConversationPinned(userId: string, friendId: string, pinned: boolean) {
+  return updateSettings(userId, friendId, { pinned: pinned ? 1 : 0 });
+}
+export function setConversationFavourite(userId: string, friendId: string, favourite: boolean) {
+  return updateSettings(userId, friendId, { favourite: favourite ? 1 : 0 });
+}
+
+/** Mark read: stores the current server time and the latest message id.
+ *  Only ever triggered by actually opening/reading the conversation. */
+export function markConversationRead(userId: string, friendId: string): { ok: boolean; settings?: ConversationSettings; error?: SocialError } {
+  const found = settingsRowFor(userId, friendId);
+  if (!found.ok) return { ok: false, error: found.error };
+  const latest = db
+    .prepare(
+      `SELECT id FROM directMessages
+       WHERE (senderId = ? AND recipientId = ?) OR (senderId = ? AND recipientId = ?)
+       ORDER BY createdAt DESC LIMIT 1`
+    )
+    .get(userId, friendId, friendId, userId) as { id: string } | undefined;
+  return updateSettings(userId, friendId, { lastReadAt: nowIso(), lastReadMessageId: latest?.id ?? null });
+}
+
+/** Mark unread: drop the read watermark entirely so every peer message counts
+ *  as unread again. (updateSettings cannot express explicit NULLs because of
+ *  its COALESCE-style fallbacks, so this runs its own upsert.) */
+export function markConversationUnread(userId: string, friendId: string): { ok: boolean; settings?: ConversationSettings; error?: SocialError } {
+  const found = settingsRowFor(userId, friendId);
+  if (!found.ok) return { ok: false, error: found.error };
+  const now = nowIso();
+  db.prepare(
+    `INSERT INTO conversationUserSettings (userId, conversationId, archived, pinned, favourite, locked, lastReadAt, lastReadMessageId, updatedAt)
+     VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+     ON CONFLICT (userId, conversationId) DO UPDATE SET
+       lastReadAt = NULL,
+       lastReadMessageId = NULL,
+       updatedAt = excluded.updatedAt`
+  ).run(userId, found.conversationId, found.row.archived, found.row.pinned, found.row.favourite, found.row.locked, now);
+  const result = getConversationSettings(userId, friendId);
+  return result.ok ? { ok: true, settings: result.settings } : { ok: false, error: result.error };
+}
+
+// ─── Chat locks (application-level) ──────────────────────────────────────────
+
+export const CHAT_LOCK_VERIFY_TTL_MS = 6 * 60 * 60 * 1000;
+
+/** In-memory "verified for this view session" map. Verification is required
+ *  before any locked content leaves the server; the client cannot simply flip
+ *  a React flag. Ephemeral by design: restarts re-require the PIN. */
+const verifiedChatLocks = new Map<string, number>();
+
+function lockKey(userId: string, conversationId: string): string {
+  return `${userId}:${conversationId}`;
+}
+
+export function isChatVerified(userId: string, conversationId: string, now = Date.now()): boolean {
+  const expiry = verifiedChatLocks.get(lockKey(userId, conversationId));
+  if (expiry === undefined) return false;
+  if (expiry <= now) {
+    verifiedChatLocks.delete(lockKey(userId, conversationId));
+    return false;
+  }
+  return true;
+}
+
+export function markChatVerified(userId: string, conversationId: string, now = Date.now()): void {
+  verifiedChatLocks.set(lockKey(userId, conversationId), now + CHAT_LOCK_VERIFY_TTL_MS);
+}
+
+export function clearChatVerification(userId: string, conversationId: string): void {
+  verifiedChatLocks.delete(lockKey(userId, conversationId));
+}
+
+/** A conversation is locked (content must not leave the server) when a
+ *  chatLocks row exists — the settings boolean always mirrors this. */
+export function isChatLocked(userId: string, friendId: string): boolean {
+  const conversationId = conversationIdFor(userId, friendId);
+  return Boolean(db.prepare('SELECT 1 FROM chatLocks WHERE userId = ? AND conversationId = ?').get(userId, conversationId));
+}
+
+function lockRowFor(userId: string, friendId: string): { ok: true; row: { pinHash: string }; conversationId: string } | { ok: false; error: SocialError } {
+  if (!isAcceptedFriendship(userId, friendId)) return { ok: false, error: Errors.notFriends() };
+  const conversationId = conversationIdFor(userId, friendId);
+  const row = db.prepare('SELECT pinHash FROM chatLocks WHERE userId = ? AND conversationId = ?').get(userId, conversationId) as
+    | { pinHash: string }
+    | undefined;
+  if (!row) return { ok: false, error: Errors.lockRequired() };
+  return { ok: true, row, conversationId };
+}
+
+/** Set (or reset) the lock PIN. Only a server-side Argon2id hash is stored. */
+export async function setChatLockPin(
+  userId: string,
+  friendId: string,
+  pin: string
+): Promise<{ ok: boolean; settings?: ConversationSettings; error?: SocialError }> {
+  if (!isAcceptedFriendship(userId, friendId)) return { ok: false, error: Errors.notFriends() };
+  if (typeof pin !== 'string' || pin.length < 4 || pin.length > 64) {
+    return { ok: false, error: Errors.validation('PIN must be 4–64 characters.') };
+  }
+  const conversationId = conversationIdFor(userId, friendId);
+  const pinHash = await hashPassword(pin);
+  const now = nowIso();
+  db.prepare(
+    `INSERT INTO chatLocks (id, userId, conversationId, pinHash, createdAt, updatedAt)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT (userId, conversationId) DO UPDATE SET pinHash = excluded.pinHash, updatedAt = excluded.updatedAt`
+  ).run(generateId(), userId, conversationId, pinHash, now, now);
+  const result = updateSettings(userId, friendId, { locked: 1 });
+  return result.ok ? { ok: true, settings: result.settings } : { ok: false, error: result.error };
+}
+
+/** Remove an existing lock after verifying the PIN. */
+export async function unlockChat(
+  userId: string,
+  friendId: string,
+  pin: string
+): Promise<{ ok: boolean; settings?: ConversationSettings; error?: SocialError }> {
+  const found = lockRowFor(userId, friendId);
+  if (!found.ok) return { ok: false, error: found.error };
+  const valid = await verifyPassword(found.row.pinHash, pin);
+  if (!valid) return { ok: false, error: Errors.lockInvalid() };
+  db.prepare('DELETE FROM chatLocks WHERE userId = ? AND conversationId = ?').run(userId, found.conversationId);
+  clearChatVerification(userId, found.conversationId);
+  const result = updateSettings(userId, friendId, { locked: 0 });
+  return result.ok ? { ok: true, settings: result.settings } : { ok: false, error: result.error };
+}
+
+/** Verify the PIN for a view session — the lock stays in place. */
+export async function verifyChatLock(
+  userId: string,
+  friendId: string,
+  pin: string
+): Promise<{ ok: boolean; settings?: ConversationSettings; error?: SocialError }> {
+  const found = lockRowFor(userId, friendId);
+  if (!found.ok) return { ok: false, error: found.error };
+  const valid = await verifyPassword(found.row.pinHash, pin);
+  if (!valid) return { ok: false, error: Errors.lockInvalid() };
+  markChatVerified(userId, found.conversationId);
+  const result = getConversationSettings(userId, friendId);
+  return result.ok ? { ok: true, settings: result.settings } : { ok: false, error: result.error };
+}
+
+// ─── Clear chat / delete chat (per-user) ─────────────────────────────────────
+
+/** "Clear chat": tombstone every message of the conversation for the acting
+ *  user only. Shared rows and the other user's history are untouched. */
+export function clearChat(userId: string, friendId: string): { ok: boolean; deletedCount: number; error?: SocialError } {
+  if (!isAcceptedFriendship(userId, friendId)) return { ok: false, deletedCount: 0, error: Errors.notFriends() };
+  const now = nowIso();
+  const result = db
+    .prepare(
+      `INSERT OR IGNORE INTO messageDeletions (id, messageId, userId, deletedAt)
+       SELECT id || ':' || ?, id, ?, ? FROM directMessages
+       WHERE (senderId = ? AND recipientId = ?) OR (senderId = ? AND recipientId = ?)`
+    )
+    .run(userId, userId, now, userId, friendId, friendId, userId);
+  return { ok: true, deletedCount: result.changes };
+}
+
+/** "Delete chat": hide the conversation for the acting user (and tombstone
+ *  their copy of the messages). The other user's history is preserved. */
+export function deleteChatForUser(userId: string, friendId: string): { ok: boolean; error?: SocialError } {
+  if (!isAcceptedFriendship(userId, friendId)) return { ok: false, error: Errors.notFriends() };
+  const conversationId = conversationIdFor(userId, friendId);
+  db.prepare(
+    'INSERT OR IGNORE INTO conversationDeletions (id, userId, conversationId, deletedAt) VALUES (?, ?, ?, ?)'
+  ).run(generateId(), userId, conversationId, nowIso());
+  clearChat(userId, friendId);
+  return { ok: true };
+}
+
+// ─── Custom conversation lists (private to the owner) ────────────────────────
+
+export interface ConversationList {
+  id: string;
+  name: string;
+  createdAt: string;
+  /** Canonical conversation ids of the members. */
+  conversationIds: string[];
+}
+
+export function listConversationLists(userId: string): ConversationList[] {
+  const rows = db.prepare('SELECT * FROM conversationLists WHERE userId = ? ORDER BY createdAt ASC').all(userId) as {
+    id: string;
+    name: string;
+    createdAt: string;
+  }[];
+  return rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    createdAt: row.createdAt,
+    conversationIds: (
+      db.prepare('SELECT conversationId FROM conversationListMembers WHERE listId = ?').all(row.id) as { conversationId: string }[]
+    ).map((r) => r.conversationId),
+  }));
+}
+
+function getOwnedList(userId: string, listId: string): { id: string; name: string } | null {
+  const row = db.prepare('SELECT id, name FROM conversationLists WHERE id = ? AND userId = ?').get(listId, userId) as
+    | { id: string; name: string }
+    | undefined;
+  return row ?? null;
+}
+
+export function createConversationList(userId: string, name: string): { ok: boolean; list?: ConversationList; error?: SocialError } {
+  const trimmed = name.trim();
+  if (!trimmed) return { ok: false, error: Errors.validation('List name cannot be empty.') };
+  if (trimmed.length > 60) return { ok: false, error: Errors.validation('List name is too long (max 60 characters).') };
+  const id = generateId();
+  db.prepare('INSERT INTO conversationLists (id, userId, name, createdAt) VALUES (?, ?, ?, ?)').run(id, userId, trimmed, nowIso());
+  return { ok: true, list: { id, name: trimmed, createdAt: nowIso(), conversationIds: [] } };
+}
+
+export function renameConversationList(userId: string, listId: string, name: string): { ok: boolean; error?: SocialError } {
+  if (!getOwnedList(userId, listId)) return { ok: false, error: Errors.listNotFound() };
+  const trimmed = name.trim();
+  if (!trimmed) return { ok: false, error: Errors.validation('List name cannot be empty.') };
+  if (trimmed.length > 60) return { ok: false, error: Errors.validation('List name is too long (max 60 characters).') };
+  db.prepare('UPDATE conversationLists SET name = ? WHERE id = ? AND userId = ?').run(trimmed, listId, userId);
+  return { ok: true };
+}
+
+export function deleteConversationList(userId: string, listId: string): { ok: boolean; error?: SocialError } {
+  if (!getOwnedList(userId, listId)) return { ok: false, error: Errors.listNotFound() };
+  db.prepare('DELETE FROM conversationLists WHERE id = ? AND userId = ?').run(listId, userId);
+  return { ok: true };
+}
+
+export function addConversationToList(userId: string, listId: string, friendId: string): { ok: boolean; error?: SocialError } {
+  const list = getOwnedList(userId, listId);
+  if (!list) return { ok: false, error: Errors.listNotFound() };
+  if (!isAcceptedFriendship(userId, friendId)) return { ok: false, error: Errors.notFriends() };
+  const conversationId = conversationIdFor(userId, friendId);
+  db.prepare(
+    'INSERT OR IGNORE INTO conversationListMembers (id, listId, conversationId, createdAt) VALUES (?, ?, ?, ?)'
+  ).run(generateId(), listId, conversationId, nowIso());
+  return { ok: true };
+}
+
+export function removeConversationFromList(userId: string, listId: string, friendId: string): { ok: boolean; error?: SocialError } {
+  if (!getOwnedList(userId, listId)) return { ok: false, error: Errors.listNotFound() };
+  const conversationId = conversationIdFor(userId, friendId);
+  db.prepare('DELETE FROM conversationListMembers WHERE listId = ? AND conversationId = ?').run(listId, conversationId);
+  return { ok: true };
 }
 
 // ─── Watch invitations ───────────────────────────────────────────────────────

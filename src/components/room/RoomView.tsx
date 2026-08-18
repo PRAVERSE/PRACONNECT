@@ -33,10 +33,12 @@ import {
   UserX,
   Shield,
   MoreVertical,
-  Volume2 as AudioOn
+  Volume2 as AudioOn,
+  Loader
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
-import { RoomFile, Participant } from '../../types';
+import { RoomFile, Participant, MediaItem } from '../../types';
+import { fetchMediaLibraryApi, buildMediaDownloadUrl } from '../../api/media';
 import { LocalMovieController } from '../../webrtc/localMovie';
 import { VoiceRing } from '../common/VoiceRing';
 import { AvatarStack } from '../common/AvatarStack';
@@ -230,11 +232,13 @@ export const RoomView: React.FC = () => {
     clearMediaConversion,
     getManagerCameraDiagnostics,
     setLocalMovieActive,
+    setRoomLibraryMedia,
   } = useApp();
 
   const [copiedCode, setCopiedCode] = useState(false);
   const [chatInput, setChatInput] = useState('');
   const [showMediaPicker, setShowMediaPicker] = useState(false);
+  const [showLibraryPicker, setShowLibraryPicker] = useState(false);
   const [localMovieStatus, setLocalMovieStatus] = useState<'idle' | 'loading' | 'active' | 'error'>('idle');
   const [localMovieError, setLocalMovieError] = useState<string | null>(null);
   // Phase 6.10 audio fix: guest browser blocked audible autoplay — offer a
@@ -770,6 +774,15 @@ export const RoomView: React.FC = () => {
   // showing the generic stream error for an MKV URL.
   const isRawMkvUrl = (url: string): boolean => url.toLowerCase().endsWith('.mkv');
 
+  // Phase C library media: the room stores only a mediaId reference; every
+  // participant streams the playable MP4 through their own session.
+  const mediaSrc =
+    currentRoom.currentMedia?.mediaType === 'library'
+      ? currentRoom.currentMedia.mediaId
+        ? buildMediaDownloadUrl(currentRoom.currentMedia.mediaId)
+        : ''
+      : currentRoom.currentMedia?.url ?? '';
+
   const renderPreparingOverlay = (title?: string) => (
     <div className="absolute inset-0 z-30 bg-black/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center text-white space-y-3">
       <div className="w-10 h-10 border-2 border-[var(--accent)] border-t-transparent rounded-full animate-spin" />
@@ -971,7 +984,7 @@ export const RoomView: React.FC = () => {
   };
 
   return (
-    <div className="w-full h-full min-h-screen flex flex-col bg-[var(--bg-surface-1)] overflow-hidden text-[var(--text-primary)] select-none transition-colors duration-200">
+    <div className="w-full h-full min-h-full flex flex-col bg-[var(--bg-surface-1)] overflow-hidden text-[var(--text-primary)] select-none transition-colors duration-200">
       {/* Media Device Error Notification Banner */}
       {mediaDiagnosticError ? (
         <div className="mx-4 mt-2 p-3 bg-rose-500/15 border border-rose-500/30 rounded-xl flex items-center justify-between text-xs text-rose-200 animate-fadeIn z-30 shadow-md">
@@ -1327,11 +1340,11 @@ export const RoomView: React.FC = () => {
                       </button>
                     )}
                   </div>
-                ) : currentRoom.currentMedia && !isRawMkvUrl(currentRoom.currentMedia.url) ? (
+                ) : currentRoom.currentMedia && mediaSrc && !isRawMkvUrl(mediaSrc) ? (
                   <>
                     <video
                       ref={videoRef}
-                      src={currentRoom.currentMedia.url}
+                      src={mediaSrc}
                       poster={currentRoom.currentMedia.poster}
                       className={`w-full h-full object-contain ${videoError ? 'opacity-20 blur-xs' : ''}`}
                       onLoadStart={() => {
@@ -2316,7 +2329,10 @@ export const RoomView: React.FC = () => {
 
             {/* Option 2 — Media Library */}
             <button
-              onClick={() => setShowMediaPicker(false)}
+              onClick={() => {
+                setShowMediaPicker(false);
+                setShowLibraryPicker(true);
+              }}
               className="w-full p-3.5 bg-[var(--bg-canvas)] hover:bg-[var(--bg-surface-2)] border border-[var(--border-subtle)] hover:border-[var(--accent)] rounded-xl text-left transition-all flex items-center gap-3 cursor-pointer group"
               aria-label="Media Library — choose a video from the PraConnect library"
             >
@@ -2340,6 +2356,138 @@ export const RoomView: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* Media Library Picker (Host Only) — real published library items. */}
+      {showLibraryPicker && isHost && (
+        <LibraryPickerModal
+          roomId={currentRoom.id}
+          onClose={() => setShowLibraryPicker(false)}
+          onSelect={async (item) => {
+            const res = await setRoomLibraryMedia(item.id);
+            if (res.ok) {
+              setShowLibraryPicker(false);
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+};
+
+/** Phase C: picker over the published media library. The host picks an item;
+ *  the room stores a mediaId reference and every participant streams the
+ *  playable MP4 from the library (never WebRTC). */
+const LibraryPickerModal: React.FC<{
+  roomId: string;
+  onClose: () => void;
+  onSelect: (item: MediaItem) => void | Promise<void>;
+}> = ({ onClose, onSelect }) => {
+  const [items, setItems] = useState<MediaItem[]>([]);
+  const [q, setQ] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [selectingId, setSelectingId] = useState<string | null>(null);
+
+  const load = async (query: string) => {
+    setBusy(true);
+    setError(null);
+    const res = await fetchMediaLibraryApi({ q: query, page: 1, pageSize: 50 });
+    setBusy(false);
+    if (res.error) {
+      setError(res.error.message);
+      setItems([]);
+      return;
+    }
+    setItems(res.items);
+  };
+
+  useEffect(() => {
+    void load('');
+  }, []);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => void load(q), 300);
+    return () => window.clearTimeout(t);
+  }, [q]);
+
+  const handleSelect = async (item: MediaItem) => {
+    if (selectingId) return;
+    setSelectingId(item.id);
+    await onSelect(item);
+    setSelectingId(null);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
+      <div className="w-full max-w-lg bg-[var(--bg-surface-1)] border border-[var(--border-strong)] rounded-3xl p-6 shadow-2xl text-[var(--text-primary)] space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-extrabold text-[var(--text-primary)] font-heading">Pick Library Media</h3>
+          <button
+            onClick={onClose}
+            className="p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] rounded-lg cursor-pointer"
+            aria-label="Close library picker"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <input
+          type="text"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Search the library…"
+          className="field w-full text-[13px]"
+          aria-label="Search library media"
+        />
+
+        {error && (
+          <p className="text-xs font-medium text-[#F59E0B] bg-[#F59E0B]/10 border border-[#F59E0B]/25 rounded-xl px-4 py-2.5">
+            {error}
+          </p>
+        )}
+
+        <div className="max-h-72 overflow-y-auto space-y-2 pr-1">
+          {busy && items.length === 0 && (
+            <p className="text-xs text-[var(--text-secondary)] py-6 text-center">Loading library…</p>
+          )}
+          {!busy && items.length === 0 && (
+            <p className="text-xs text-[var(--text-secondary)] py-6 text-center">
+              No published media available yet.
+            </p>
+          )}
+          {items.map((item) => (
+            <button
+              key={item.id}
+              onClick={() => void handleSelect(item)}
+              disabled={Boolean(selectingId)}
+              className="w-full p-3 bg-[var(--bg-canvas)] hover:bg-[var(--bg-surface-2)] border border-[var(--border-subtle)] hover:border-[var(--accent)] rounded-xl text-left transition-all flex items-center gap-3 cursor-pointer group disabled:opacity-60"
+              aria-label={`Play ${item.title} in this room`}
+            >
+              <span className="w-10 h-10 rounded-xl bg-[var(--accent-subtle)] text-[var(--accent)] flex items-center justify-center shrink-0">
+                {selectingId === item.id ? (
+                  <Loader className="w-4 h-4 animate-spin" aria-hidden="true" />
+                ) : (
+                  <Play className="w-4 h-4" aria-hidden="true" />
+                )}
+              </span>
+              <span className="flex flex-col gap-0.5 min-w-0">
+                <span className="text-xs font-bold text-[var(--text-primary)] truncate">{item.title}</span>
+                <span className="text-[11px] font-medium text-[var(--text-secondary)]">
+                  {item.duration ? `${Math.round(item.duration / 60)} min` : 'Video'} ·{' '}
+                  {(item.sizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB
+                </span>
+              </span>
+            </button>
+          ))}
+        </div>
+
+        <button
+          onClick={onClose}
+          className="w-full h-9 bg-[var(--bg-surface-2)] text-xs font-bold text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded-xl border border-[var(--border-subtle)] cursor-pointer transition-colors"
+        >
+          Cancel
+        </button>
+      </div>
     </div>
   );
 };

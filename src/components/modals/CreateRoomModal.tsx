@@ -84,7 +84,7 @@ export const CreateRoomModal: React.FC = () => {
               <input
                 type="number"
                 min={2}
-                max={50}
+                max={12}
                 value={maxMembers}
                 onChange={(e) => setMaxMembers(Number(e.target.value))}
                 className="field w-full text-[13px]"

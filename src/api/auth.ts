@@ -9,6 +9,9 @@ export interface AuthUser {
   email: string;
   avatarUrl: string | null;
   emailVerified: boolean;
+  /** Server-verified role: 'admin' (owner account) or 'user'. Always comes
+   *  from the authenticated session — the client never decides it. */
+  role: 'admin' | 'user';
   createdAt: string;
 }
 

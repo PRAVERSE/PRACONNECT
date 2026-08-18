@@ -2,7 +2,7 @@
 // All authentication endpoints mounted under /api/auth
 
 import { Hono } from 'hono';
-import { db } from '../db/index';
+import { db, bootstrapAdminRole } from '../db/index';
 import {
   hashPassword,
   verifyPassword,
@@ -20,6 +20,7 @@ import { createOtp, verifyOtp } from '../auth/otp';
 import { buildGoogleAuthUrl, exchangeCodeForTokens, getGoogleUserInfo, generateOAuthState, deriveUsernameFromGoogle } from '../auth/google';
 import { sendEmailVerificationOtp, sendPasswordResetOtp, sendResendVerificationOtp } from '../email/smtp';
 import { recordLoginActivity } from '../auth/loginActivity';
+import { requireAuth } from '../middleware/auth';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { getClientIp, rateLimit } from '../rate-limit';
 
@@ -52,6 +53,9 @@ interface UserRow {
   avatarUrl: string | null;
   emailVerified: number;
   googleProviderId: string | null;
+  /** Phase D: server role — 'admin' or 'user'. Always read from DB; never
+   *  supplied by the client. bootstrapAdminRole() promotes configured admins. */
+  role: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -245,11 +249,20 @@ auth.post('/login', async (c) => {
     return c.json(apiError('EMAIL_NOT_VERIFIED', 'Please verify your email before logging in.'), 403);
   }
 
-  const token = await createSession(user.id);
-  setSessionCookie(c, token);
-  recordLoginActivity(user.id, 'email', getCoarseLocation(c));
+  // Bootstrap BEFORE loading freshUser so the session carries the promoted role.
+  bootstrapAdminRole();
+  const freshUser = findUserById(user.id) ?? user;
 
-  return c.json({ authenticated: true, user: sanitizeUser(user as unknown as Record<string, unknown>) });
+  // Dev diagnostic — never logs password/token/session data.
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[AUTH ROLE] login user', { email: freshUser.email, role: freshUser.role });
+  }
+
+  const token = await createSession(freshUser.id);
+  setSessionCookie(c, token);
+  recordLoginActivity(freshUser.id, 'email', getCoarseLocation(c));
+
+  return c.json({ authenticated: true, user: sanitizeUser(freshUser as unknown as Record<string, unknown>) });
 });
 
 // ─── GET /me ──────────────────────────────────────────────────────────────────
@@ -261,9 +274,16 @@ auth.get('/me', async (c) => {
   const result = await getSessionUser(token);
   if (!result) return c.json({ authenticated: false });
 
+  const safeUser = sanitizeUser(result.user as unknown as Record<string, unknown>);
+
+  // Dev diagnostic — never logs password/token/session data.
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[AUTH ROLE] /me', { email: safeUser.email, role: safeUser.role });
+  }
+
   return c.json({
     authenticated: true,
-    user: sanitizeUser(result.user as unknown as Record<string, unknown>),
+    user: safeUser,
   });
 });
 
@@ -276,6 +296,18 @@ auth.post('/logout', async (c) => {
   }
   clearSessionCookie(c);
   return c.json({ message: 'Logged out successfully.' });
+});
+
+// ─── POST /logout-all ─────────────────────────────────────────────────────────
+// Logs the user out of every device: all sessions for the account are deleted,
+// including the current one (its cookie is cleared as well). Reuses the
+// existing deleteAllUserSessions; no session tokens are exposed.
+
+auth.post('/logout-all', requireAuth, async (c) => {
+  const userId = c.get('userId');
+  deleteAllUserSessions(userId);
+  clearSessionCookie(c);
+  return c.json({ message: 'Logged out of all devices.' });
 });
 
 // ─── GET /google ──────────────────────────────────────────────────────────────
@@ -372,6 +404,9 @@ auth.get('/google/callback', async (c) => {
   if (!user) {
     return c.redirect(`${appUrl}/auth?error=server_error`, 302);
   }
+
+  bootstrapAdminRole();
+  user = findUserById(user.id) ?? user;
 
   const token = await createSession(user.id);
   setSessionCookie(c, token);

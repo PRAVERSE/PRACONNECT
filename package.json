@@ -11,13 +11,14 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json",
-    "test": "npx tsx --test server/tests/rooms.test.ts server/tests/rate-limit.test.ts server/tests/reconnect.test.ts server/tests/production-serving.test.ts server/tests/hardening.test.ts server/tests/mkv-conversion.test.ts server/tests/history.test.ts src/webrtc/iceConfig.test.ts src/utils/mediaValidation.test.ts src/utils/roomCountdown.test.ts src/webrtc/localMovie.test.ts",
+    "test": "npx tsx --test server/tests/rooms.test.ts server/tests/rate-limit.test.ts server/tests/social.test.ts server/tests/dm-context.test.ts server/tests/reconnect.test.ts server/tests/production-serving.test.ts server/tests/hardening.test.ts server/tests/mkv-conversion.test.ts server/tests/history.test.ts server/tests/admin-role.test.ts server/tests/media-library.test.ts server/tests/media-pipeline.test.ts src/webrtc/iceConfig.test.ts src/utils/mediaValidation.test.ts src/utils/roomCountdown.test.ts src/utils/contextMenu.test.ts src/webrtc/localMovie.test.ts src/components/views/FriendsView.test.tsx src/components/views/MessagesView.test.tsx src/components/views/MediaLibraryView.test.tsx src/social/directory.test.ts",
     "start": "cross-env NODE_ENV=production npx tsx server/index.ts",
     "start:dev": "npx tsx watch server/index.ts",
     "server": "bun run server/index.ts",
     "server:dev": "bun --watch server/index.ts",
     "server:node": "npx tsx server/index.ts",
-    "server:node:dev": "npx tsx watch server/index.ts"
+    "server:node:dev": "npx tsx watch server/index.ts",
+    "db:reset-local": "tsx scripts/reset-local-db.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

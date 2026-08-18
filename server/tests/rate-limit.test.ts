@@ -25,6 +25,7 @@ for (const name of [
   'RESENDVERIFICATION', 'RESENDVERIFICATIONEMAIL', 'FORGOTPASSWORD', 'FORGOTPASSWORDEMAIL',
   'VERIFYPASSWORDRESET', 'VERIFYPASSWORDRESETEMAIL', 'RESETPASSWORD', 'RESETPASSWORDTOKEN',
   'JOIN', 'JOINUSER', 'CHAT', 'REACTION', 'SIGNAL',
+  'USERSEARCH', 'FRIENDREQUEST', 'DMSEND', 'WATCHINVITE',
 ]) {
   process.env[`RATE_LIMIT_${name}_MAX`] = '3';
   process.env[`RATE_LIMIT_${name}_WINDOW_MS`] = '60000';
@@ -33,6 +34,10 @@ for (const name of [
 const { db } = await import('../db/index');
 const { auth } = await import('../routes/auth');
 const { rooms, handleMediaServing, uploadsDir } = await import('../routes/rooms');
+const { users } = await import('../routes/users');
+const { friends } = await import('../routes/friends');
+const { messages } = await import('../routes/messages');
+const { invites } = await import('../routes/invites');
 const { requireAuth } = await import('../middleware/auth');
 const { createSession, SESSION_COOKIE_NAME } = await import('../auth/session');
 const { hashPassword } = await import('../auth/auth');
@@ -42,6 +47,10 @@ const { resetRateLimits, setRateLimitClock } = await import('../rate-limit');
 const app = new Hono();
 app.route('/api/auth', auth);
 app.route('/api/rooms', rooms);
+app.route('/api/users', users);
+app.route('/api/friends', friends);
+app.route('/api/messages', messages);
+app.route('/api/watch-invites', invites);
 app.use('/api/uploads/*', requireAuth);
 app.on(['GET', 'HEAD'], '/api/uploads/:filename', handleMediaServing);
 
@@ -264,6 +273,19 @@ test('G2: reactions are rate-limited per user+room', async () => {
   }
   const blocked = await call(tokens.a, 'POST', `/api/rooms/${roomId}/reaction`, { emoji: '🎉' });
   assert.equal(blocked.status, 429);
+});
+
+// ─── G3. Social flood ─────────────────────────────────────────────────────────
+
+test('G3: DM sends are rate-limited per user', async () => {
+  for (let i = 0; i < 3; i++) {
+    const res = await call(tokens.a, 'POST', '/api/messages/user-b', { text: `hi ${i}` });
+    assert.equal(res.status, 403, 'non-friend send still reaches the limiter before the guard');
+  }
+  const blocked = await call(tokens.a, 'POST', '/api/messages/user-b', { text: 'spam' });
+  assert.equal(blocked.status, 429);
+  const body = await json(blocked);
+  assert.equal((body.error as { code: string }).code, 'RATE_LIMITED');
 });
 
 // ─── H. Signal flood ──────────────────────────────────────────────────────────

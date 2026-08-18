@@ -1,126 +1,90 @@
 // server/index.ts
-// PraConnect backend entry point.
-// Runs directly with Bun: bun run server/index.ts
-// Or with tsx for Node: npx tsx server/index.ts
+// PraConnect server entry point.
+//
+// Development:   npm run dev            (Vite dev server proxies /api to this)
+// Production:    npm run build && npm run start
+//
+// The production path serves dist/ with SPA fallback, runs a bounded cleanup
+// worker, and shuts down gracefully on SIGINT/SIGTERM.
 
 import 'dotenv/config';
-import { Hono } from 'hono';
-import { cors } from 'hono/cors';
-import { logger } from 'hono/logger';
-import { auth } from './routes/auth';
-import { rooms } from './routes/rooms';
-import { startRoomCleanupWorker } from './rooms/cleanup';
-
-// Initialize database (runs schema on first start)
-import './db/index';
-
-// Validate SMTP configuration safely on startup without logging secrets
-const smtpLoaded = Boolean(
-  process.env.SMTP_HOST &&
-  process.env.SMTP_PORT &&
-  process.env.SMTP_USER &&
-  process.env.SMTP_PASS &&
-  process.env.EMAIL_FROM
-);
-console.log(`[smtp] SMTP configuration loaded: ${smtpLoaded ? 'yes' : 'no'}`);
-
-const app = new Hono();
-
-// ─── CORS ─────────────────────────────────────────────────────────────────────
-// Allow requests from the Vite dev server. Credentials required for cookies.
-const allowedOrigins = [
-  process.env.APP_URL ?? 'http://localhost:3000',
-  'http://localhost:3000',
-  'http://localhost:5173',
-];
-
-app.use('*', cors({
-  origin: (origin) => {
-    if (!origin) return null; // same-origin requests
-    if (allowedOrigins.includes(origin)) return origin;
-    return null;
-  },
-  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,
-  maxAge: 86400,
-}));
-
-// ─── Request logger ───────────────────────────────────────────────────────────
-// Only logs method + path + status — no request bodies
-app.use('*', logger());
-
 import fs from 'node:fs';
 import path from 'node:path';
+import { validateProductionEnv, productionWarnings, isStaticServingEnabled, resolveDistDir } from './productionEnv';
 
-const uploadsDir = path.resolve(process.cwd(), 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-function getMimeType(filePath: string): string {
-  const ext = path.extname(filePath).toLowerCase();
-  switch (ext) {
-    case '.mp4': return 'video/mp4';
-    case '.webm': return 'video/webm';
-    case '.ogv':
-    case '.ogg': return 'video/ogg';
-    case '.mov': return 'video/quicktime';
-    case '.mkv': return 'video/x-matroska';
-    case '.avi': return 'video/x-msvideo';
-    case '.mp3': return 'audio/mpeg';
-    case '.wav': return 'audio/wav';
-    case '.jpg':
-    case '.jpeg': return 'image/jpeg';
-    case '.png': return 'image/png';
-    default: return 'application/octet-stream';
+// ─── Production environment gate ──────────────────────────────────────────────
+// Fails fast with clear, secret-free messages before the database opens or any
+// service starts. (db/app imports are dynamic so nothing initializes early.)
+if (process.env.NODE_ENV === 'production') {
+  validateProductionEnv(process.env);
+  for (const warning of productionWarnings(process.env)) {
+    console.warn(`[server] ${warning}`);
   }
 }
 
-import { handleMediaServing } from './routes/rooms';
-import { requireAuth } from './middleware/auth';
+// ─── Production build validation ──────────────────────────────────────────────
+// dist/ must already exist when production serving is expected — the server
+// never builds or falls back to a blank page.
+const distDir = resolveDistDir(process.env);
+if (isStaticServingEnabled(process.env)) {
+  const indexHtml = path.join(distDir, 'index.html');
+  if (!fs.existsSync(indexHtml)) {
+    console.error(`[server] dist/index.html not found at ${distDir}`);
+    console.error('[server] Run "npm run build" first (production), or unset STATIC_DIR.');
+    process.exit(1);
+  }
+}
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
-app.route('/api/auth', auth);
-app.route('/api/rooms', rooms);
+// Build the application (opens the SQLite database, runs idempotent schema).
+const [{ createApp }, { closeDatabase }, { startRoomCleanupWorker, stopRoomCleanupWorker }, { installGracefulShutdown }] =
+  await Promise.all([import('./app'), import('./db/index'), import('./rooms/cleanup'), import('./shutdown')]);
+const app = createApp();
 
-// ─── Media File Serving with HTTP 206 Partial Content (Range Requests) ────────
-// Phase 6.2: media requests require a valid session; room-membership
-// authorization happens inside handleMediaServing.
-app.use('/api/uploads/*', requireAuth);
-app.on(['GET', 'HEAD'], '/api/uploads/:filename', handleMediaServing);
-
-// Health check
-app.get('/api/health', (c) => c.json({ ok: true, service: 'praconnect-api' }));
-
-// 404 fallback
-app.notFound((c) => c.json({ error: { code: 'NOT_FOUND', message: 'Route not found.' } }, 404));
-
-// Global error handler
-app.onError((err, c) => {
-  console.error('[server] Unhandled error:', err.message);
-  return c.json({ error: { code: 'INTERNAL_ERROR', message: 'An unexpected error occurred.' } }, 500);
-});
-
-// ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT ?? '4000', 10);
+const mode = process.env.NODE_ENV === 'production' ? 'production' : 'development';
+console.log(`[server] PraConnect running in ${mode} mode`);
+if (isStaticServingEnabled(process.env)) {
+  console.log(`[server] Static serving enabled (dist: ${distDir})`);
+}
+console.log('[server] Health: GET /health — Readiness: GET /ready');
 
 // Empty-room cleanup worker (does not keep the process alive on its own)
 startRoomCleanupWorker();
 
-// Bun-native server
+// ─── Start ────────────────────────────────────────────────────────────────────
 const bunGlobal = (globalThis as any).Bun;
 if (typeof bunGlobal !== 'undefined') {
-  bunGlobal.serve({
+  // Bun-native server (best-effort graceful stop)
+  const server = bunGlobal.serve({
     fetch: app.fetch,
     port: PORT,
   });
   console.log(`[server] PraConnect API running on http://localhost:${PORT}`);
+  let shuttingDown = false;
+  const stopBun = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[server] ${signal} received — shutting down`);
+    stopRoomCleanupWorker();
+    closeDatabase();
+    try {
+      server.stop(true);
+    } catch {
+      // already stopped
+    }
+    process.exit(0);
+  };
+  process.once('SIGINT', () => stopBun('SIGINT'));
+  process.once('SIGTERM', () => stopBun('SIGTERM'));
 } else {
-  // Node.js mode — use @hono/node-server
+  // Node.js mode — use @hono/node-server with graceful shutdown
   const { serve } = await import('@hono/node-server');
-  serve({ fetch: app.fetch, port: PORT });
+  const server = serve({ fetch: app.fetch, port: PORT });
   console.log(`[server] PraConnect API running on http://localhost:${PORT} (Node.js mode)`);
+  installGracefulShutdown(server, {
+    cleanup: () => {
+      stopRoomCleanupWorker();
+      closeDatabase();
+    },
+  });
 }
-
-export default app;

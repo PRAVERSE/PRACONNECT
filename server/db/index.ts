@@ -29,6 +29,22 @@ if (!memberCols.includes('removedAt')) {
   db.exec('ALTER TABLE roomMembers ADD COLUMN removedAt TEXT');
 }
 
+// Phase A: users.role — pre-existing databases get the column via ALTER.
+// Fresh databases get it from the CREATE TABLE above. Default stays 'user';
+// admin is granted only by the ADMIN_EMAIL bootstrap below (never by clients).
+const userCols = (db.prepare('PRAGMA table_info(users)').all() as { name: string }[]).map((r) => r.name);
+if (!userCols.includes('role')) {
+  db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'");
+}
+
+// Phase C: media.playableKey (browser-ready MP4 produced by the FFmpeg
+// pipeline) — pre-existing Phase B databases get it via ALTER. storageKey
+// remains the retained original (only present when MEDIA_RETAIN_ORIGINAL=1).
+const mediaCols = (db.prepare('PRAGMA table_info(media)').all() as { name: string }[]).map((r) => r.name);
+if (!mediaCols.includes('playableKey')) {
+  db.exec('ALTER TABLE media ADD COLUMN playableKey TEXT');
+}
+
 // Phase 6.9: conversion metadata columns on uploads (MKV -> playable MP4).
 const uploadCols = (db.prepare('PRAGMA table_info(uploads)').all() as { name: string }[]).map((r) => r.name);
 if (!uploadCols.includes('sourceFilename')) {
@@ -39,6 +55,25 @@ if (!uploadCols.includes('playableFilename')) {
 }
 if (!uploadCols.includes('conversionStatus')) {
   db.exec("ALTER TABLE uploads ADD COLUMN conversionStatus TEXT NOT NULL DEFAULT 'uploaded'");
+}
+
+// DM context columns: reply/forward metadata + delete-for-everyone tombstone
+// (rows are never destroyed; deletedForEveryone hides the body from everyone).
+const dmCols = (db.prepare('PRAGMA table_info(directMessages)').all() as { name: string }[]).map((r) => r.name);
+if (!dmCols.includes('replyToMessageId')) {
+  db.exec('ALTER TABLE directMessages ADD COLUMN replyToMessageId TEXT');
+}
+if (!dmCols.includes('forwardedFromMessageId')) {
+  db.exec('ALTER TABLE directMessages ADD COLUMN forwardedFromMessageId TEXT');
+}
+if (!dmCols.includes('deletedForEveryone')) {
+  db.exec('ALTER TABLE directMessages ADD COLUMN deletedForEveryone INTEGER NOT NULL DEFAULT 0');
+}
+if (!dmCols.includes('deletedAt')) {
+  db.exec('ALTER TABLE directMessages ADD COLUMN deletedAt TEXT');
+}
+if (!dmCols.includes('deletedByUserId')) {
+  db.exec('ALTER TABLE directMessages ADD COLUMN deletedByUserId TEXT');
 }
 
 // Phase 6.11: backfill persistent room history from rooms that were created
@@ -127,6 +162,66 @@ const backfilled = backfillRoomHistory();
 if (backfilled > 0) {
   console.log(`[db] Backfilled ${backfilled} pre-existing room(s) into roomHistory`);
 }
+
+// ─── Phase A/D: admin role bootstrap ──────────────────────────────────────────
+// Designated administrator accounts are promoted server-side. ADMIN_EMAILS (or
+// fallback ADMIN_EMAIL) names the accounts — never passwords. Comma-separated,
+// whitespace-trimmed, case-insensitive, deduplicated. If an admin already exists,
+// it is preserved and reused; an unknown email is ignored (the account can be
+// promoted once registered). This runs at startup and is exported for auth/tests.
+
+export function parseAdminEmails(env: NodeJS.ProcessEnv = process.env): string[] {
+  const rawList = env.ADMIN_EMAILS;
+  let candidates: string[] = [];
+
+  if (typeof rawList === 'string' && rawList.trim() !== '') {
+    candidates = rawList.split(',');
+  } else if (typeof env.ADMIN_EMAIL === 'string' && env.ADMIN_EMAIL.trim() !== '') {
+    candidates = env.ADMIN_EMAIL.split(',');
+  }
+
+  const emails = new Set<string>();
+  for (const entry of candidates) {
+    const trimmed = entry.trim().toLowerCase();
+    if (trimmed.length > 0) {
+      emails.add(trimmed);
+    }
+  }
+
+  return Array.from(emails);
+}
+
+export function bootstrapAdminRole(env: NodeJS.ProcessEnv = process.env): string[] {
+  const adminEmails = parseAdminEmails(env);
+  if (adminEmails.length === 0) return [];
+
+  const promotedIds: string[] = [];
+  const now = new Date().toISOString();
+
+  for (const email of adminEmails) {
+    const row = db
+      .prepare('SELECT id, role FROM users WHERE email = ?')
+      .get(email) as { id: string; role: string } | undefined;
+
+    if (!row) continue;
+
+    if (row.role === 'admin') {
+      promotedIds.push(row.id);
+      continue;
+    }
+
+    db.prepare("UPDATE users SET role = 'admin', updatedAt = ? WHERE id = ?").run(
+      now,
+      row.id
+    );
+    console.log(`[db] Promoted account to admin role (${email})`);
+    promotedIds.push(row.id);
+  }
+
+  return promotedIds;
+}
+
+bootstrapAdminRole();
 
 console.log(`[db] SQLite database opened at: ${dbPath}`);
 

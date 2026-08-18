@@ -13,6 +13,8 @@ import {
   relationshipActions,
   relationshipLabel,
   directoryEmptyCopy,
+  FRIENDS_TABS,
+  directorySearchRequest,
 } from './directory';
 
 test('A: server payload row maps to SocialUser', () => {
@@ -128,4 +130,41 @@ test('L: non-empty query empty result shows a match-specific message', () => {
 
 test('M: non-empty query with results renders normally', () => {
   assert.equal(directoryEmptyCopy('sam', true), null);
+});
+
+// ─── Two-tab Friends structure (final minimal experience) ────────────────────
+// The Friends UI has exactly two sections: Friends and Find Friends. No Online,
+// Offline, Requests, or Suggestions tabs exist anywhere in the structure.
+
+test('T1: Friends UI exposes exactly two tabs: Friends and Find Friends', () => {
+  assert.deepEqual(
+    FRIENDS_TABS.map((t) => t.id),
+    ['friends', 'find-friends']
+  );
+  assert.deepEqual(
+    FRIENDS_TABS.map((t) => t.label),
+    ['Friends', 'Find Friends']
+  );
+});
+
+test('T2: no Online / Offline / Requests / Suggestions tabs exist', () => {
+  const ids: string[] = FRIENDS_TABS.map((t) => t.id);
+  for (const banned of ['Online', 'Offline', 'Requests', 'Suggestions']) {
+    assert.ok(!ids.includes(banned), `${banned} tab must not exist`);
+  }
+});
+
+test('T3: Find Friends empty query loads page 1 of registered users immediately', () => {
+  const plan = directorySearchRequest('find-friends', '');
+  assert.deepEqual(plan, { query: '', offset: 0, delayMs: 0 });
+});
+
+test('T4: Find Friends typed queries debounce and reset to page 1', () => {
+  const plan = directorySearchRequest('find-friends', '   sam   ');
+  assert.deepEqual(plan, { query: '   sam   ', offset: 0, delayMs: 300 });
+});
+
+test('T5: the Friends tab never issues a directory search', () => {
+  assert.equal(directorySearchRequest('friends', ''), null);
+  assert.equal(directorySearchRequest('friends', 'sam'), null);
 });

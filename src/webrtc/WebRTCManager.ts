@@ -5,21 +5,28 @@
 
 import { checkMediaSupport, diagnoseMediaError, inspectAvailableMediaDevices, logFullDeviceEnumeration, logMediaEnvironmentDiagnostics, logMediaPermissions, queryCameraPermissionState, MediaDiagnosticError } from './mediaDeviceDiagnostics';
 import { getEnvIceConfig, nextIceRestartDelayMs, IceConfigResult } from './iceConfig';
+import { applyRemoteMovieTrack, captureStreamTrackCounts, classifyRemoteTrackKind, checkMediaSeparation, buildMovieTrackMeta } from './localMovie';
 
 export interface WebRTCSignalPayload {
   type: 'offer' | 'answer' | 'candidate' | 'track-meta';
   sdp?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
   trackId?: string;
-  trackKind?: 'camera' | 'screen' | 'audio';
+  trackKind?: 'camera' | 'screen' | 'movie' | 'audio';
 }
 
 export interface WebRTCOptions {
   roomId: string;
   myUserId: string;
-  onRemoteStreamChange: (userId: string, cameraStream: MediaStream | null, screenStream: MediaStream | null) => void;
+  onRemoteStreamChange: (
+    userId: string,
+    cameraStream: MediaStream | null,
+    screenStream: MediaStream | null,
+    movieStream?: MediaStream | null
+  ) => void;
   onLocalStreamChange: (stream: MediaStream | null) => void;
   onLocalScreenStreamChange?: (stream: MediaStream | null) => void;
+  onLocalMovieStreamChange?: (stream: MediaStream | null) => void;
   onError: (errorInfo: MediaDiagnosticError | string) => void;
   sendSignal: (targetUserId: string, signal: WebRTCSignalPayload) => Promise<void>;
 }
@@ -60,18 +67,30 @@ function summarizeSdp(sdp: string | undefined): { section: string; mid?: string;
 export class WebRTCManager {
   private roomId: string;
   private myUserId: string;
-  private onRemoteStreamChange: (userId: string, cameraStream: MediaStream | null, screenStream: MediaStream | null) => void;
+  private onRemoteStreamChange: (
+    userId: string,
+    cameraStream: MediaStream | null,
+    screenStream: MediaStream | null,
+    movieStream?: MediaStream | null
+  ) => void;
   private onLocalStreamChange: (stream: MediaStream | null) => void;
   private onLocalScreenStreamChange?: (stream: MediaStream | null) => void;
+  private onLocalMovieStreamChange?: (stream: MediaStream | null) => void;
   private onError: (errorInfo: MediaDiagnosticError | string) => void;
   private sendSignal: (targetUserId: string, signal: WebRTCSignalPayload) => Promise<void>;
 
   public localStream: MediaStream | null = null;
   public screenStream: MediaStream | null = null;
+  /** Phase 6.10: captured local movie stream (video.captureStream()) — kept
+   *  strictly separate from camera (localStream) and screen (screenStream). */
+  public movieStream: MediaStream | null = null;
   public peerConnections = new Map<string, RTCPeerConnection>();
   public remoteCameraStreams = new Map<string, MediaStream>();
   public remoteScreenStreams = new Map<string, MediaStream>();
-  public remoteTrackKinds = new Map<string, 'camera' | 'screen' | 'audio'>();
+  /** Phase 6.10: remote movie streams keyed by the host userId. Kept separate
+   *  from camera and screen streams so the Watch stage can bind the movie. */
+  public remoteMovieStreams = new Map<string, MediaStream>();
+  public remoteTrackKinds = new Map<string, 'camera' | 'screen' | 'movie' | 'audio'>();
   private pendingCandidates = new Map<string, RTCIceCandidateInit[]>();
   private makingOffer = new Map<string, boolean>();
   // Peers that need a renegotiation offer but were not 'stable' when the
@@ -82,6 +101,11 @@ export class WebRTCManager {
   // separate tracks; identifying the screen sender by sniffing contentHint is
   // fragile, so we track the RTCRtpSender directly per peer.
   private screenSenderByPeer = new Map<string, RTCRtpSender | null>();
+  // Phase 6.10: explicit per-peer bookkeeping of the MOVIE video/audio senders.
+  // A peer can carry camera video + screen video + movie video (+ mic audio +
+  // movie audio), so every movie sender is tracked by identity, never inferred.
+  private movieVideoSenderByPeer = new Map<string, RTCRtpSender | null>();
+  private movieAudioSenderByPeer = new Map<string, RTCRtpSender | null>();
   // Bounded ICE restart state per peer (Phase 6.6): a hard 'failed'
   // connection is restarted at most ICE_RESTART.maxAttempts times with
   // exponential backoff; counters reset once the connection recovers.
@@ -92,8 +116,8 @@ export class WebRTCManager {
   // manager from the environment, never built inline per peer.
   private readonly iceConfig: IceConfigResult;
   // trackId -> remoteUserId that sent it. Lets late-arriving track-meta
-  // reclassify a video track already committed to cameraStream as screen
-  // (signaling and ontrack can arrive in either order).
+  // reclassify a video/audio track already committed to cameraStream as
+  // screen or movie (signaling and ontrack can arrive in either order).
   private trackOwners = new Map<string, string>();
   private isDestroyed = false;
   private cameraStartPromise: Promise<boolean> | null = null;
@@ -112,6 +136,7 @@ export class WebRTCManager {
     this.onRemoteStreamChange = options.onRemoteStreamChange;
     this.onLocalStreamChange = options.onLocalStreamChange;
     this.onLocalScreenStreamChange = options.onLocalScreenStreamChange;
+    this.onLocalMovieStreamChange = options.onLocalMovieStreamChange;
     this.onError = options.onError;
     this.sendSignal = options.sendSignal;
     this.managerId = `${options.myUserId}-${++WebRTCManager.managerCounter}`;
@@ -156,6 +181,8 @@ export class WebRTCManager {
       screenTracks: this.screenStream?.getTracks().map((t) => `${t.kind}:${t.readyState}`) ?? [],
       localStreamId: this.localStream?.id ?? null,
       localTracks: this.localStream?.getTracks().map((t) => `${t.kind}:${t.readyState}`) ?? [],
+      movieStreamId: this.movieStream?.id ?? null,
+      movieTracks: this.movieStream?.getTracks().map((t) => `${t.kind}:${t.readyState}`) ?? [],
     });
 
     const config: RTCConfiguration = {
@@ -167,6 +194,8 @@ export class WebRTCManager {
     this.peerConnections.set(remoteUserId, pc);
     this.makingOffer.set(remoteUserId, false);
     this.screenSenderByPeer.set(remoteUserId, null);
+    this.movieVideoSenderByPeer.set(remoteUserId, null);
+    this.movieAudioSenderByPeer.set(remoteUserId, null);
 
     // W3C Perfect Negotiation: onnegotiationneeded handles offer creation
     pc.onnegotiationneeded = async () => {
@@ -191,21 +220,15 @@ export class WebRTCManager {
       if (this.isDestroyed) return;
 
       const track = event.track;
-      const isAudio = track.kind === 'audio';
       const explicitKind = this.remoteTrackKinds.get(track.id);
-      const isScreen =
-        explicitKind === 'screen' ||
-        track.contentHint === 'detail' ||
-        track.label.toLowerCase().includes('screen') ||
-        track.label.toLowerCase().includes('window') ||
-        track.label.toLowerCase().includes('display');
+      const role = classifyRemoteTrackKind(explicitKind, track);
 
       console.group(`[Diagnostics] [REMOTE TRACK] from user: ${remoteUserId}`);
       console.log('track.id:', track.id);
       console.log('track.kind:', track.kind);
       console.log('track.contentHint:', track.contentHint);
       console.log('explicitKind from signal:', explicitKind);
-      console.log('isScreen:', isScreen);
+      console.log('role (camera/screen/movie/audio):', role);
       console.groupEnd();
 
       console.log('[SCREEN DEBUG] GUEST remote track:', {
@@ -217,14 +240,15 @@ export class WebRTCManager {
         receiverReadyState: event.receiver?.track?.readyState ?? null,
         transceiverMid: pc.getTransceivers().find((t) => t.receiver.track === track)?.mid ?? null,
         explicitKind: explicitKind ?? null,
-        pendingTrackMeta: this.remoteTrackKinds.has(track.id),
-        inferredScreen: (explicitKind ?? null) === null && isScreen,
+        role,
         streamIds: event.streams?.map((s) => s.id) ?? [],
       });
 
       this.trackOwners.set(track.id, remoteUserId);
 
-      if (isAudio) {
+      if (role === 'audio') {
+        // Camera/mic audio (a movie audio track whose track-meta arrives late
+        // is migrated to the movie stream by handleSignal — order-independent).
         let camStream = this.remoteCameraStreams.get(remoteUserId);
         if (!camStream) {
           camStream = new MediaStream();
@@ -234,7 +258,87 @@ export class WebRTCManager {
           camStream.addTrack(track);
         }
         console.log(`[Diagnostics] Assigned track ${track.id} (audio) to cameraStream for ${remoteUserId}`);
-      } else if (isScreen) {
+      } else if (role === 'movie') {
+        // Phase 6.10: movie video OR audio track → dedicated movie stream,
+        // never mixed into camera or screen streams. Only same-kind stale
+        // tracks are replaced (previous movie session) — video and audio
+        // tracks MUST coexist (Phase 6.10 audio fix).
+        let movieStream = this.remoteMovieStreams.get(remoteUserId);
+        if (!movieStream) {
+          movieStream = new MediaStream();
+          this.remoteMovieStreams.set(remoteUserId, movieStream);
+        }
+        const merge = applyRemoteMovieTrack(movieStream.getTracks(), { id: track.id, kind: track.kind });
+        if (merge.changed) {
+          const fresh = new MediaStream();
+          for (const entry of merge.tracks) {
+            const match = movieStream.getTracks().find((t) => t.id === entry.id);
+            fresh.addTrack((match ?? track) as MediaStreamTrack);
+          }
+          this.remoteMovieStreams.set(remoteUserId, fresh);
+          movieStream = fresh;
+        }
+        if (track.kind === 'audio') {
+          console.log('[REMOTE MOVIE AUDIO]', {
+            ts: new Date().toISOString(),
+            fromUserId: remoteUserId,
+            trackId: track.id,
+            kind: track.kind,
+            readyState: track.readyState,
+            enabled: track.enabled,
+            muted: track.muted,
+            streamId: movieStream.id,
+          });
+        }
+        // Phase 6.10 audio trace (exact tag) — GUEST REMOTE TRACK: the raw
+        // incoming movie track exactly as ontrack delivered it, classified via
+        // track-meta (explicit) or heuristic. This is the definitive "did the
+        // guest ever receive the movie audio track" checkpoint.
+        console.log('[MOVIE AUDIO DEBUG] GUEST REMOTE TRACK', {
+          ts: new Date().toISOString(),
+          fromUserId: remoteUserId,
+          trackId: track.id,
+          kind: track.kind,
+          readyState: track.readyState,
+          enabled: track.enabled,
+          muted: track.muted,
+          label: track.label,
+          streamIds: event.streams?.map((s) => s.id) ?? [],
+          classifiedVia: explicitKind ? `track-meta:${explicitKind}` : `heuristic:${role}`,
+          receiverReadyState: event.receiver?.track?.readyState ?? null,
+        });
+        const movieCounts = captureStreamTrackCounts(movieStream);
+        // Phase 6.10 audio trace (exact tag) — GUEST MOVIE STREAM: the
+        // assembled movie stream must carry video>=1 AND audio>=1. A missing
+        // audio track here (verdict STOP) pins the bug to captureStream →
+        // sender → signaling → ontrack → assembly, NOT autoplay.
+        console.log('[MOVIE AUDIO DEBUG] GUEST MOVIE STREAM', {
+          ts: new Date().toISOString(),
+          fromUserId: remoteUserId,
+          streamId: movieStream.id,
+          videoTrackCount: movieCounts.videoTracks,
+          audioTrackCount: movieCounts.audioTracks,
+          videoTrackIds: movieStream.getVideoTracks().map((t) => t.id),
+          audioTrackIds: movieStream.getAudioTracks().map((t) => t.id),
+          verdict: movieCounts.videoTracks >= 1 && movieCounts.audioTracks >= 1 ? 'OK' : 'STOP',
+        });
+        console.log('[REMOTE MOVIE STREAM]', {
+          ts: new Date().toISOString(),
+          fromUserId: remoteUserId,
+          videoTracks: movieCounts.videoTracks,
+          audioTracks: movieCounts.audioTracks,
+          movieStreamId: movieStream.id,
+          trackKinds: movieStream.getTracks().map((t) => `${t.kind}:${t.readyState}`),
+        });
+        console.log('[MOVIE DEBUG] remote movie track received:', {
+          ts: new Date().toISOString(),
+          remoteUserId,
+          trackId: track.id,
+          kind: track.kind,
+          readyState: track.readyState,
+          movieTrackCount: movieStream.getTracks().length,
+        });
+      } else if (role === 'screen') {
         let scrStream = this.remoteScreenStreams.get(remoteUserId);
         if (!scrStream) {
           scrStream = new MediaStream();
@@ -368,6 +472,16 @@ export class WebRTCManager {
       });
     }
 
+    // Phase 6.10: same replay for an already-active local movie — the initial
+    // offer carries the movie m-lines and every movie track must be tagged
+    // with kind 'movie' so guests never render it as camera/screen.
+    const movieTracks = this.movieStream?.getTracks() ?? [];
+    for (const movieTrack of movieTracks) {
+      this.sendSignal(remoteUserId, buildMovieTrackMeta(movieTrack.id)).catch((err: any) => {
+        console.warn(`[WebRTC] track-meta send failed to ${remoteUserId}:`, { name: err?.name, message: err?.message });
+      });
+    }
+
     return pc;
   }
 
@@ -425,9 +539,15 @@ export class WebRTCManager {
   private notifyRemoteStreamUpdate(remoteUserId: string) {
     const camStream = this.remoteCameraStreams.get(remoteUserId);
     const scrStream = this.remoteScreenStreams.get(remoteUserId);
+    const movieStream = this.remoteMovieStreams.get(remoteUserId);
     const validCam = camStream && camStream.getTracks().some((t) => t.readyState === 'live') ? camStream : null;
     const validScr = scrStream && scrStream.getTracks().some((t) => t.readyState === 'live') ? scrStream : null;
-    this.onRemoteStreamChange(remoteUserId, validCam, validScr);
+    // Phase 6.10 audio fix: a movie stream whose tracks all went muted is a
+    // host-side stop (movie senders were cleared via replaceTrack(null)) — it
+    // must disappear cleanly instead of lingering as a frozen frame.
+    const validMovie =
+      movieStream && movieStream.getTracks().some((t) => t.readyState === 'live' && !t.muted) ? movieStream : null;
+    this.onRemoteStreamChange(remoteUserId, validCam, validScr, validMovie);
   }
 
   /** Create and send a new offer to a peer (Perfect Negotiation compatible, duplicate-safe) */
@@ -444,6 +564,7 @@ export class WebRTCManager {
       if (pc.localDescription) {
         const summary = summarizeSdp(pc.localDescription.sdp);
         const videoMlines = (summary ?? []).filter((b) => b.section.startsWith('m=video'));
+        const audioMlines = (summary ?? []).filter((b) => b.section.startsWith('m=audio'));
         const screenStreamId = this.screenStream?.id ?? null;
         const screenInSdp = screenStreamId
           ? videoMlines.some((b) => b.msid?.startsWith(`${screenStreamId} `))
@@ -452,10 +573,28 @@ export class WebRTCManager {
           ts: new Date().toISOString(),
           remoteUserId,
           videoMlineCount: videoMlines.length,
+          audioMlineCount: audioMlines.length,
+          audioMlines: audioMlines.map((b) => `${b.mid ?? '?'}:${b.dir ?? '?'}:msid=${b.msid ?? 'none'}`),
           signalingState: pc.signalingState,
           screenTrackAttached: this.screenStream?.getVideoTracks().some((t) => t.readyState === 'live') ?? false,
           screenInSdp,
           videoMlines: videoMlines.map((b) => `${b.mid ?? '?'}:${b.dir ?? '?'}:msid=${b.msid ?? 'none'}`),
+        });
+        // Phase 6.10 audio trace — prove the offer actually carries the movie
+        // audio m-line (its msid starts with the movie stream id, matching the
+        // sender attached by attachMovieTrackToPeer).
+        const movieStreamIdForSdp = this.movieStream?.id ?? null;
+        const movieAudioTrackIdForSdp = this.movieStream?.getAudioTracks()[0]?.id ?? null;
+        console.log('[MOVIE AUDIO DEBUG] HOST SDP', {
+          ts: new Date().toISOString(),
+          remoteUserId,
+          audioMlineCount: audioMlines.length,
+          videoMlineCount: videoMlines.length,
+          movieStreamId: movieStreamIdForSdp,
+          movieAudioTrackId: movieAudioTrackIdForSdp,
+          movieAudioMlineInSdp: movieStreamIdForSdp
+            ? audioMlines.some((b) => b.msid?.startsWith(`${movieStreamIdForSdp} `))
+            : false,
         });
         // STEP 3: verify the offer actually carries the screen m-line, not just that "an offer was sent"
         console.groupCollapsed(`[SIGNAL OUT] offer -> ${remoteUserId} SDP (from: ${this.myUserId}, ts: ${new Date().toISOString()})`);
@@ -482,8 +621,9 @@ export class WebRTCManager {
     const audioTrack = this.localStream?.getAudioTracks()[0] || null;
     const cameraVideoTrack = this.localStream?.getVideoTracks()[0] || null;
     const screenVideoTrack = this.screenStream?.getVideoTracks()[0] || null;
+    const movieVideoTrack = this.movieStream?.getVideoTracks()[0] || null;
 
-    console.log(`[WEBRTC] attachLocalTracksToPeer -> ${remoteUserId}: audio=${audioTrack ? 'present' : 'none'} camera=${cameraVideoTrack ? 'present' : 'none'} screen=${screenVideoTrack ? 'present' : 'none'}`);
+    console.log(`[WEBRTC] attachLocalTracksToPeer -> ${remoteUserId}: audio=${audioTrack ? 'present' : 'none'} camera=${cameraVideoTrack ? 'present' : 'none'} screen=${screenVideoTrack ? 'present' : 'none'} movie=${movieVideoTrack ? 'present' : 'none'}`);
 
     if (cameraVideoTrack) {
       cameraVideoTrack.contentHint = 'motion';
@@ -491,10 +631,32 @@ export class WebRTCManager {
     if (screenVideoTrack) {
       screenVideoTrack.contentHint = 'detail';
     }
+    // The movie track deliberately keeps NO contentHint: the remote heuristic
+    // must not mistake it for a screen capture before track-meta arrives.
 
-    // Audio
-    const audioSender = pc.getSenders().find((s) => s.track?.kind === 'audio') ||
-      pc.getTransceivers().find((t) => t.sender.track?.kind === 'audio' || t.receiver?.track?.kind === 'audio')?.sender;
+    // Audio — the MIC sender, explicitly excluding the MOVIE audio sender
+    // (Phase 6.10): a movie may run a second audio track on the same peer and
+    // the mic must never replace it. The exclusion applies to BOTH the sender
+    // scan and the transceiver fallback: with no mic sender, the fallback
+    // would otherwise resolve to the movie audio transceiver and queue
+    // replaceTrack(null/mic) on it — and because sender.track only updates
+    // when that promise resolves, attachMovieTrackToPeer's synchronous
+    // `audioSender.track !== movieAudioTrack` check would miss the change and
+    // never restore the movie audio (permanently silent guest).
+    const bookkeptMovieAudioSender = this.movieAudioSenderByPeer.get(remoteUserId) ?? null;
+    const isMovieAudioSender = (s: RTCRtpSender | null | undefined) =>
+      s != null &&
+      (s === bookkeptMovieAudioSender ||
+        Boolean(this.movieStream?.getAudioTracks().some((t) => t.id === s.track?.id)));
+    const audioSender =
+      pc.getSenders().find((s) => s.track?.kind === 'audio' && !isMovieAudioSender(s)) ||
+      pc
+        .getTransceivers()
+        .find(
+          (t) =>
+            !isMovieAudioSender(t.sender) &&
+            (t.sender.track?.kind === 'audio' || t.receiver?.track?.kind === 'audio')
+        )?.sender;
 
     if (audioSender) {
       audioSender.replaceTrack(audioTrack).catch((err: any) => {
@@ -512,10 +674,17 @@ export class WebRTCManager {
     // Camera Video Sender
     const senders = pc.getSenders();
     const bookkeptScreenSender = this.screenSenderByPeer.get(remoteUserId) ?? null;
-    // Camera sender is any video sender that is NOT the bookkept screen
-    // sender — explicit bookkeeping, never inferred from contentHint alone.
+    const bookkeptMovieSender = this.movieVideoSenderByPeer.get(remoteUserId) ?? null;
+    // Camera sender is any video sender that is NOT the bookkept screen or
+    // movie sender — explicit bookkeeping, never inferred from contentHint alone.
     let cameraSender = senders.find(
-      (s) => s.track?.kind === 'video' && s !== bookkeptScreenSender && s.track !== screenVideoTrack && s.track?.contentHint !== 'detail'
+      (s) =>
+        s.track?.kind === 'video' &&
+        s !== bookkeptScreenSender &&
+        s !== bookkeptMovieSender &&
+        s.track !== screenVideoTrack &&
+        s.track !== movieVideoTrack &&
+        s.track?.contentHint !== 'detail'
     );
 
     if (cameraSender) {
@@ -533,6 +702,11 @@ export class WebRTCManager {
 
     // Screen Video Sender — explicit per-peer bookkeeping
     this.attachScreenTrackToPeer(remoteUserId, pc);
+
+    // Phase 6.10: Movie Video/Audio Sender — explicit per-peer bookkeeping.
+    // The movie is a THIRD video sender on the same pc (camera + screen +
+    // movie can coexist); its audio is a SECOND audio sender next to the mic.
+    this.attachMovieTrackToPeer(remoteUserId, pc);
 
     // STEP 2 (post-verification): confirm the screen track is actually present on a sender
     const sendersAfter = pc.getSenders().map((s) => ({
@@ -627,6 +801,122 @@ export class WebRTCManager {
     }
   }
 
+  /**
+   * Phase 6.10: attach / replace / remove the MOVIE video+audio tracks on one
+   * peer using explicit per-peer sender bookkeeping (movieVideoSenderByPeer /
+   * movieAudioSenderByPeer). Mirrors attachScreenTrackToPeer but handles the
+   * audio track too: the movie carries BOTH video and audio, and its audio
+   * sender must never be confused with the microphone sender.
+   */
+  private attachMovieTrackToPeer(remoteUserId: string, pc: RTCPeerConnection) {
+    if (this.isDestroyed) return;
+    const movieStream = this.movieStream;
+    const movieVideoTrack = movieStream?.getVideoTracks()[0] || null;
+    const movieAudioTrack = movieStream?.getAudioTracks()[0] || null;
+
+    // Phase 6.10 audio fix: with no movieStream, still proceed when bookkept
+    // senders exist so stop() can replaceTrack(null) (otherwise the old movie
+    // audio/video keep flowing to the guest after the movie ends).
+    const hasBookkeptSenders =
+      Boolean(this.movieVideoSenderByPeer.get(remoteUserId)?.track) ||
+      Boolean(this.movieAudioSenderByPeer.get(remoteUserId)?.track);
+    if (!movieStream && !hasBookkeptSenders) return;
+
+    // ── Video sender ──────────────────────────────────────────────────────
+    let videoSender = this.movieVideoSenderByPeer.get(remoteUserId) ?? null;
+    if (videoSender && !pc.getSenders().includes(videoSender)) {
+      videoSender = null;
+      this.movieVideoSenderByPeer.set(remoteUserId, null);
+    }
+
+    if (movieVideoTrack) {
+      if (videoSender) {
+        if (videoSender.track === movieVideoTrack) {
+          console.log('[MOVIE DEBUG] movie video track already attached to peer:', {
+            ts: new Date().toISOString(),
+            remoteUserId,
+            trackId: movieVideoTrack.id,
+          });
+        } else {
+          videoSender.replaceTrack(movieVideoTrack).catch((err: any) => {
+            console.warn(`[WebRTC] movie video replaceTrack failed for ${remoteUserId}:`, { name: err?.name, message: err?.message });
+          });
+          this.movieVideoSenderByPeer.set(remoteUserId, videoSender);
+        }
+      } else {
+        try {
+          const sender = pc.addTrack(movieVideoTrack, movieStream!);
+          this.movieVideoSenderByPeer.set(remoteUserId, sender);
+          console.log('[MOVIE DEBUG] movie video track attached to peer:', {
+            ts: new Date().toISOString(),
+            remoteUserId,
+            trackId: movieVideoTrack.id,
+            senderCount: pc.getSenders().length,
+          });
+        } catch (err: any) {
+          console.warn(`[WebRTC] addTrack(movie video) failed for ${remoteUserId}:`, { name: err?.name, message: err?.message });
+        }
+      }
+    } else if (videoSender && videoSender.track) {
+      videoSender.replaceTrack(null).catch((err: any) => {
+        console.warn(`[WebRTC] movie video replaceTrack(null) failed for ${remoteUserId}:`, { name: err?.name, message: err?.message });
+      });
+      this.movieVideoSenderByPeer.set(remoteUserId, videoSender);
+    }
+
+    // ── Audio sender (separate from the microphone audio sender) ──────────
+    let audioSender = this.movieAudioSenderByPeer.get(remoteUserId) ?? null;
+    if (audioSender && !pc.getSenders().includes(audioSender)) {
+      audioSender = null;
+      this.movieAudioSenderByPeer.set(remoteUserId, null);
+    }
+
+    if (movieAudioTrack) {
+      if (audioSender) {
+        if (audioSender.track !== movieAudioTrack) {
+          audioSender.replaceTrack(movieAudioTrack).catch((err: any) => {
+            console.warn(`[WebRTC] movie audio replaceTrack failed for ${remoteUserId}:`, { name: err?.name, message: err?.message });
+          });
+          this.movieAudioSenderByPeer.set(remoteUserId, audioSender);
+          console.log('[LOCAL MOVIE AUDIO] replacing movie audio track on peer:', {
+            ts: new Date().toISOString(),
+            remoteUserId,
+            movieAudioTrackId: movieAudioTrack.id,
+            readyState: movieAudioTrack.readyState,
+            enabled: movieAudioTrack.enabled,
+            senderExists: true,
+            senderTrackId: audioSender.track?.id ?? null,
+            totalAudioSenders: pc.getSenders().filter((s) => s.track?.kind === 'audio').length,
+            movieAudioSenderBookkept: this.movieAudioSenderByPeer.has(remoteUserId),
+          });
+        }
+      } else {
+        try {
+          const sender = pc.addTrack(movieAudioTrack, movieStream!);
+          this.movieAudioSenderByPeer.set(remoteUserId, sender);
+          console.log('[LOCAL MOVIE AUDIO] attaching movie audio track:', {
+            ts: new Date().toISOString(),
+            remoteUserId,
+            movieAudioTrackId: movieAudioTrack.id,
+            readyState: movieAudioTrack.readyState,
+            enabled: movieAudioTrack.enabled,
+            senderExists: true,
+            senderTrackId: sender.track?.id ?? null,
+            totalAudioSenders: pc.getSenders().filter((s) => s.track?.kind === 'audio').length,
+            movieAudioSenderBookkept: this.movieAudioSenderByPeer.has(remoteUserId),
+          });
+        } catch (err: any) {
+          console.warn(`[WebRTC] addTrack(movie audio) failed for ${remoteUserId}:`, { name: err?.name, message: err?.message });
+        }
+      }
+    } else if (audioSender && audioSender.track) {
+      audioSender.replaceTrack(null).catch((err: any) => {
+        console.warn(`[WebRTC] movie audio replaceTrack(null) failed for ${remoteUserId}:`, { name: err?.name, message: err?.message });
+      });
+      this.movieAudioSenderByPeer.set(remoteUserId, audioSender);
+    }
+  }
+
   /** Update or replace tracks across all active peer connections */
   public updateLocalTracksOnAllPeers() {
     if (this.isDestroyed) return;
@@ -687,10 +977,13 @@ export class WebRTCManager {
         // STEP 7: confirm the received offer actually contains the screen m-line
         const remoteSummary = summarizeSdp(payload.sdp.sdp);
         const remoteVideoMlines = (remoteSummary ?? []).filter((b) => b.section.startsWith('m=video'));
+        const remoteAudioMlines = (remoteSummary ?? []).filter((b) => b.section.startsWith('m=audio'));
         console.log('[SCREEN DEBUG] remote offer received:', {
           ts: new Date().toISOString(),
           fromUserId,
           videoMlines: remoteVideoMlines.map((b) => `${b.mid ?? '?'}:${b.dir ?? '?'}:msid=${b.msid ?? 'none'}`),
+          audioMlineCount: remoteAudioMlines.length,
+          audioMlines: remoteAudioMlines.map((b) => `${b.mid ?? '?'}:${b.dir ?? '?'}:msid=${b.msid ?? 'none'}`),
         });
         console.groupCollapsed(`[SIGNAL IN] offer from: ${fromUserId} SDP (ts: ${new Date().toISOString()})`);
         console.log('m-line summary:', remoteSummary);
@@ -766,9 +1059,9 @@ export class WebRTCManager {
         this.remoteTrackKinds.set(payload.trackId, payload.trackKind);
         console.log(`[Diagnostics] Received track-meta from ${fromUserId}: track ${payload.trackId} is ${payload.trackKind}`);
 
-        // Order-independence: if the video track's ontrack already fired
+        // Order-independence: if the track's ontrack already fired
         // before this track-meta (order B), it was committed to the peer's
-        // cameraStream. Reclassify it to the screenStream now.
+        // cameraStream. Reclassify it to the screen stream now.
         if (payload.trackKind === 'screen') {
           const owner = this.trackOwners.get(payload.trackId);
           if (owner && this.remoteCameraStreams.has(owner)) {
@@ -792,6 +1085,33 @@ export class WebRTCManager {
             }
           }
         }
+
+        // Phase 6.10: late 'movie' track-meta migrates a track already
+        // committed to cameraStream (video OR audio) into the movie stream —
+        // the movie must never be rendered as a camera or screen.
+        if (payload.trackKind === 'movie') {
+          const owner = this.trackOwners.get(payload.trackId);
+          if (owner && this.remoteCameraStreams.has(owner)) {
+            const cam = this.remoteCameraStreams.get(owner)!;
+            const migrated = cam.getTracks().filter((t) => t.id === payload.trackId);
+            if (migrated.length > 0) {
+              migrated.forEach((t) => cam.removeTrack(t));
+              let mov = this.remoteMovieStreams.get(owner);
+              if (!mov) {
+                mov = new MediaStream();
+                this.remoteMovieStreams.set(owner, mov);
+              }
+              migrated.forEach((t) => mov!.addTrack(t));
+              console.log('[MOVIE DEBUG] late track-meta: migrated track to movieStream:', {
+                ts: new Date().toISOString(),
+                fromUserId: owner,
+                trackId: payload.trackId,
+                movieTrackCount: mov.getTracks().length,
+              });
+              this.notifyRemoteStreamUpdate(owner);
+            }
+          }
+        }
         this.notifyRemoteStreamUpdate(fromUserId);
       }
     } catch (err) {
@@ -801,11 +1121,12 @@ export class WebRTCManager {
 
   /**
    * Log + stop a track. Every track.stop() in this manager goes through here
-   * so any path that could kill the camera is identifiable in traces.
+   * so any path that could kill the camera/screen/movie is identifiable.
    */
-  private stopTrackSafely(track: MediaStreamTrack, caller: string, media: 'camera' | 'screen' | 'audio') {
+  private stopTrackSafely(track: MediaStreamTrack, caller: string, media: 'camera' | 'screen' | 'movie' | 'audio') {
     const inCameraStream = this.localStream?.getTracks().some((t) => t.id === track.id) ?? false;
     const inScreenStream = this.screenStream?.getTracks().some((t) => t.id === track.id) ?? false;
+    const inMovieStream = this.movieStream?.getTracks().some((t) => t.id === track.id) ?? false;
     console.log(`[${media.toUpperCase()} DEBUG] ABOUT TO STOP TRACK`, {
       ts: new Date().toISOString(),
       caller,
@@ -817,13 +1138,17 @@ export class WebRTCManager {
       muted: track.muted,
       inCameraStream,
       inScreenStream,
+      inMovieStream,
       owningStreamId: inCameraStream
         ? (this.localStream?.id ?? null)
         : inScreenStream
         ? (this.screenStream?.id ?? null)
+        : inMovieStream
+        ? (this.movieStream?.id ?? null)
         : 'unowned/transient',
       cameraTracks: this.localStream?.getVideoTracks().map((t) => `${t.kind}:${t.readyState}`) ?? [],
       screenTracks: this.screenStream?.getTracks().map((t) => `${t.kind}:${t.readyState}`) ?? [],
+      movieTracks: this.movieStream?.getTracks().map((t) => `${t.kind}:${t.readyState}`) ?? [],
     });
     console.trace('[MEDIA DEBUG] TRACK STOPPED', {
       trackId: track.id,
@@ -833,16 +1158,22 @@ export class WebRTCManager {
       caller,
       intendedMedia: media,
     });
-    // Separation invariant: a "camera" stop must never touch screen tracks and
-    // a "screen" stop must never touch camera tracks. If this ever fires, the
-    // camera/screen ownership model is broken.
-    if (media === 'screen' && inCameraStream) {
-      console.warn('[MEDIA DEBUG] SEPARATION VIOLATION: attempting to stop a CAMERA track as SCREEN', {
+    // Separation invariant: a "camera" stop must never touch screen/movie
+    // tracks, a "screen" stop must never touch camera/movie tracks and a
+    // "movie" stop must never touch camera/screen tracks. If this ever fires,
+    // the media ownership model is broken.
+    if (media === 'screen' && (inCameraStream || inMovieStream)) {
+      console.warn('[MEDIA DEBUG] SEPARATION VIOLATION: attempting to stop a CAMERA/MOVIE track as SCREEN', {
         trackId: track.id, caller,
       });
     }
-    if (media === 'camera' && inScreenStream) {
-      console.warn('[MEDIA DEBUG] SEPARATION VIOLATION: attempting to stop a SCREEN track as CAMERA', {
+    if (media === 'camera' && (inScreenStream || inMovieStream)) {
+      console.warn('[MEDIA DEBUG] SEPARATION VIOLATION: attempting to stop a SCREEN/MOVIE track as CAMERA', {
+        trackId: track.id, caller,
+      });
+    }
+    if (media === 'movie' && (inCameraStream || inScreenStream)) {
+      console.warn('[MEDIA DEBUG] SEPARATION VIOLATION: attempting to stop a CAMERA/SCREEN track as MOVIE', {
         trackId: track.id, caller,
       });
     }
@@ -938,27 +1269,17 @@ export class WebRTCManager {
   }
 
   /**
-   * Separation invariant check: a camera track must never live inside
-   * screenStream, and a screen track must never live inside localStream.
-   * Pure diagnostic — never mutates anything.
+   * Separation invariant check: camera, screen and movie tracks must never
+   * share a stream. Pure diagnostic — never mutates anything.
    */
   private assertMediaSeparation(action: string) {
-    const cameraTrackIds = new Set((this.localStream?.getTracks() ?? []).map((t) => t.id));
-    const screenTrackIds = new Set((this.screenStream?.getTracks() ?? []).map((t) => t.id));
-    const cameraTrackInScreenStream = (this.screenStream?.getTracks() ?? [])
-      .filter((t) => cameraTrackIds.has(t.id))
-      .map((t) => `${t.kind}:${t.id}`);
-    const screenTrackInCameraStream = (this.localStream?.getTracks() ?? [])
-      .filter((t) => screenTrackIds.has(t.id))
-      .map((t) => `${t.kind}:${t.id}`);
-
-    if (cameraTrackInScreenStream.length > 0 || screenTrackInCameraStream.length > 0) {
+    const violations = checkMediaSeparation(this.localStream, this.screenStream, this.movieStream);
+    if (violations.length > 0) {
       console.error('[MEDIA SEPARATION DEBUG] VIOLATION:', {
         ts: new Date().toISOString(),
         action,
         managerId: this.managerId,
-        cameraTrackInScreenStream,
-        screenTrackInCameraStream,
+        violations,
       });
     } else {
       console.log('[MEDIA SEPARATION DEBUG] ok:', {
@@ -967,6 +1288,7 @@ export class WebRTCManager {
         managerId: this.managerId,
         cameraTrackCount: this.localStream?.getTracks().length ?? 0,
         screenTrackCount: this.screenStream?.getTracks().length ?? 0,
+        movieTrackCount: this.movieStream?.getTracks().length ?? 0,
       });
     }
   }
@@ -981,6 +1303,7 @@ export class WebRTCManager {
       cameraAcquisitionInFlight: this.cameraAcquisitionInFlight,
       hasCameraStream: Boolean(this.localStream?.getVideoTracks().some((t) => t.readyState === 'live')),
       hasScreenStream: Boolean(this.screenStream?.getTracks().some((t) => t.readyState === 'live')),
+      hasMovieStream: Boolean(this.movieStream?.getTracks().some((t) => t.readyState === 'live')),
     };
   }
 
@@ -1260,13 +1583,17 @@ export class WebRTCManager {
         }
 
         // Diagnostic F — per-peer camera sender verification. The camera sender
-        // is any video sender that is NOT the bookkept screen sender.
+        // is any video sender that is NOT the bookkept screen or movie sender.
         const screenTrackId = this.screenStream?.getVideoTracks()[0]?.id ?? null;
+        const movieTrackId = this.movieStream?.getVideoTracks()[0]?.id ?? null;
         for (const [remoteUserId, pc] of this.peerConnections) {
           if (pc.connectionState === 'closed') continue;
           const bookkeptScreenSender = this.screenSenderByPeer.get(remoteUserId) ?? null;
+          const bookkeptMovieSender = this.movieVideoSenderByPeer.get(remoteUserId) ?? null;
           const videoSenders = pc.getSenders().filter((s) => s.track?.kind === 'video');
-          const cameraSenders = videoSenders.filter((s) => s !== bookkeptScreenSender && s.track?.id !== screenTrackId);
+          const cameraSenders = videoSenders.filter(
+            (s) => s !== bookkeptScreenSender && s !== bookkeptMovieSender && s.track?.id !== screenTrackId && s.track?.id !== movieTrackId
+          );
           const cameraSender = cameraSenders[0] ?? null;
           console.log('[CAMERA DEBUG] camera sender attached:', {
             ts: new Date().toISOString(),
@@ -1761,6 +2088,146 @@ export class WebRTCManager {
     this.setLocalScreenStream(null);
   }
 
+  /**
+   * Phase 6.10 — Authoritative LOCAL MOVIE stream setter.
+   *
+   * Passed a non-null captured stream (video.captureStream() of a local
+   * <video> whose src is a blob URL):
+   *   1. stores it as the manager's local movie stream (movieStream) —
+   *      strictly separate from camera (localStream) and screen (screenStream)
+   *   2. attaches the movie video+audio senders to EVERY existing peer
+   *      (explicit per-peer sender bookkeeping, never sniffed)
+   *   3. verifies the senders actually hold the movie tracks
+   *   4. requests renegotiation for every peer (queued if mid-negotiation)
+   *   5. sends track-meta (kind 'movie') AFTER attachment + renegotiation
+   *      initiation, for every movie track
+   *
+   * Passed null it detaches the movie senders (replaceTrack(null) keeps the
+   * m-lines for a possible restart), stops the captured tracks and
+   * renegotiates. Camera, microphone and screen streams are NEVER touched.
+   */
+  public setLocalMovieStream(stream: MediaStream | null): boolean {
+    if (this.isDestroyed) return false;
+
+    const previous = this.movieStream;
+    this.movieStream = stream;
+    this.onLocalMovieStreamChange?.(stream ? new MediaStream(stream.getTracks()) : null);
+
+    if (!stream) {
+      if (previous) {
+        previous.getTracks().forEach((t) => this.stopTrackSafely(t, 'setLocalMovieStream(null)', 'movie'));
+      }
+      console.log('[MOVIE DEBUG] HOST local movie stopped:', { ts: new Date().toISOString() });
+      this.assertMediaSeparation('setLocalMovieStream(null)');
+      this.updateLocalTracksOnAllPeers();
+      if (previous) {
+        for (const [remoteUserId, pc] of this.peerConnections) {
+          if (pc.connectionState === 'closed') continue;
+          console.log('[MOVIE DEBUG] HOST peer senders after movie stop:', {
+            ts: new Date().toISOString(),
+            remoteUserId,
+            senders: pc.getSenders().map((s) => ({ id: s.track?.id ?? null, kind: s.track?.kind ?? null, readyState: s.track?.readyState ?? null })),
+          });
+          this.requestRenegotiation(remoteUserId, 'movie-stopped');
+        }
+      }
+      return true;
+    }
+
+    const movieVideoTrack = stream.getVideoTracks()[0];
+    if (!movieVideoTrack) {
+      console.warn('[MOVIE DEBUG] setLocalMovieStream: stream has no video track', {
+        ts: new Date().toISOString(),
+        streamId: stream.id,
+        kinds: stream.getTracks().map((t) => t.kind),
+      });
+      return false;
+    }
+
+    console.log('[MOVIE DEBUG] HOST local movie started:', {
+      ts: new Date().toISOString(),
+      streamId: stream.id,
+      tracks: stream.getTracks().map((t) => `${t.kind}:${t.readyState}:${t.enabled ? 'enabled' : 'disabled'}`),
+      videoTracks: stream.getVideoTracks().length,
+      audioTracks: stream.getAudioTracks().length,
+      peerCount: this.peerConnections.size,
+      cameraTracksStillLive: this.localStream?.getTracks().filter((t) => t.readyState === 'live').length ?? 0,
+      screenTracksStillLive: this.screenStream?.getTracks().filter((t) => t.readyState === 'live').length ?? 0,
+    });
+
+    // Attach to every existing peer, verify the senders, then renegotiate.
+    for (const [remoteUserId, pc] of this.peerConnections) {
+      if (pc.connectionState === 'closed') continue;
+      this.attachMovieTrackToPeer(remoteUserId, pc);
+      const movieVideoOnSender = pc.getSenders().some((s) => s.track && s.track.id === movieVideoTrack.id);
+      if (!movieVideoOnSender) {
+        console.warn(`[MOVIE DEBUG] movie video track NOT on a sender of ${remoteUserId} — re-attaching`);
+        this.attachMovieTrackToPeer(remoteUserId, pc);
+      }
+      this.requestRenegotiation(remoteUserId, 'movie-started');
+    }
+
+    // track-meta ONLY after the tracks are attached and renegotiation is
+    // initiated/queued — never metadata for a track absent from the pc.
+    for (const [remoteUserId, pc] of this.peerConnections) {
+      if (pc.connectionState === 'closed') continue;
+      const attached = pc.getSenders().some((s) => s.track && stream.getTracks().some((t) => t.id === s.track!.id));
+      if (!attached) {
+        console.warn(`[MOVIE DEBUG] skipping track-meta for ${remoteUserId}: movie tracks not on any sender`);
+        continue;
+      }
+      for (const track of stream.getTracks()) {
+        this.sendSignal(remoteUserId, buildMovieTrackMeta(track.id)).catch((err: any) => {
+          console.warn(`[WebRTC] track-meta send failed to ${remoteUserId}:`, { name: err?.name, message: err?.message });
+        });
+      }
+    }
+    console.log('[MOVIE DEBUG] track-meta signals dispatched to all peers');
+
+    // Phase 6.10 audio fix — per-peer verification that the MOVIE AUDIO
+    // sender exists and holds exactly the movie audio track (never confused
+    // with the microphone sender).
+    const movieAudioTrackForPeers = stream.getAudioTracks()[0] ?? null;
+    for (const [remoteUserId, pc] of this.peerConnections) {
+      if (pc.connectionState === 'closed') continue;
+      const audioSender = this.movieAudioSenderByPeer.get(remoteUserId) ?? null;
+      console.log('[LOCAL MOVIE AUDIO] sender verified:', {
+        ts: new Date().toISOString(),
+        remoteUserId,
+        movieAudioTrackExists: movieAudioTrackForPeers != null,
+        movieAudioSenderExists: audioSender != null,
+        senderTrackMatchesMovieAudio: audioSender != null && audioSender.track === movieAudioTrackForPeers,
+        senderTrackId: audioSender?.track?.id ?? null,
+        totalAudioSenders: pc.getSenders().filter((s) => s.track?.kind === 'audio').length,
+        totalVideoSenders: pc.getSenders().filter((s) => s.track?.kind === 'video').length,
+      });
+      // Phase 6.10 audio trace (exact tag) — the authoritative HOST SENDER
+      // snapshot: the movie audio sender must exist, be bookkept per peer and
+      // hold EXACTLY the movie audio track (never the mic, never null).
+      console.log('[MOVIE AUDIO DEBUG] HOST SENDER', {
+        ts: new Date().toISOString(),
+        remoteUserId,
+        movieAudioTrackId: movieAudioTrackForPeers?.id ?? null,
+        senderExists: audioSender != null,
+        senderTrackId: audioSender?.track?.id ?? null,
+        senderTrackKind: audioSender?.track?.kind ?? null,
+        senderTrackReadyState: audioSender?.track?.readyState ?? null,
+        senderTrackMatchesMovieAudio: audioSender != null && audioSender.track === movieAudioTrackForPeers,
+        totalAudioSenders: pc.getSenders().filter((s) => s.track?.kind === 'audio').length,
+        movieAudioSenderByPeerHasEntry: this.movieAudioSenderByPeer.has(remoteUserId),
+      });
+    }
+
+    this.assertMediaSeparation('setLocalMovieStream(non-null)');
+
+    return true;
+  }
+
+  /** Stop host local movie sharing */
+  public stopLocalMovieStream() {
+    this.setLocalMovieStream(null);
+  }
+
   /** Close a single peer connection */
   public closePeerConnection(remoteUserId: string) {
     const pc = this.peerConnections.get(remoteUserId);
@@ -1772,15 +2239,18 @@ export class WebRTCManager {
     }
     this.remoteCameraStreams.delete(remoteUserId);
     this.remoteScreenStreams.delete(remoteUserId);
+    this.remoteMovieStreams.delete(remoteUserId);
     this.pendingCandidates.delete(remoteUserId);
     this.makingOffer.delete(remoteUserId);
     this.pendingRenegotiation.delete(remoteUserId);
     this.screenSenderByPeer.delete(remoteUserId);
+    this.movieVideoSenderByPeer.delete(remoteUserId);
+    this.movieAudioSenderByPeer.delete(remoteUserId);
     this.resetIceRestart(remoteUserId);
     for (const [trackId, owner] of this.trackOwners) {
       if (owner === remoteUserId) this.trackOwners.delete(trackId);
     }
-    this.onRemoteStreamChange(remoteUserId, null, null);
+    this.onRemoteStreamChange(remoteUserId, null, null, null);
   }
 
   /** Cleanup all peer connections and release media devices */
@@ -1802,6 +2272,7 @@ export class WebRTCManager {
     this.setCameraState('IDLE', 'manager destroyed');
 
     this.stopScreenShare();
+    this.stopLocalMovieStream();
     if (this.localStream) {
       this.localStream.getTracks().forEach((t) => this.stopTrackSafely(t, 'destroy', t.kind === 'audio' ? 'audio' : 'camera'));
       this.localStream = null;
@@ -1812,11 +2283,14 @@ export class WebRTCManager {
     this.peerConnections.clear();
     this.remoteCameraStreams.clear();
     this.remoteScreenStreams.clear();
+    this.remoteMovieStreams.clear();
     this.remoteTrackKinds.clear();
     this.pendingCandidates.clear();
     this.makingOffer.clear();
     this.pendingRenegotiation.clear();
     this.screenSenderByPeer.clear();
+    this.movieVideoSenderByPeer.clear();
+    this.movieAudioSenderByPeer.clear();
     for (const timer of this.iceRestartTimers.values()) {
       clearTimeout(timer);
     }
@@ -1827,5 +2301,6 @@ export class WebRTCManager {
     this.assertMediaSeparation('destroy');
     this.onLocalStreamChange(null);
     this.onLocalScreenStreamChange?.(null);
+    this.onLocalMovieStreamChange?.(null);
   }
 }
