@@ -36,6 +36,9 @@ class CallingService {
   private localStream: MediaStream | null = null;
   private remoteStream: MediaStream | null = null;
   private currentSession: CallSession | null = null;
+  private role: 'caller' | 'callee' | null = null;
+  private pcInitPromise: Promise<void> | null = null;
+  private pendingOffer: any = null;
   private listeners: Set<CallListener> = new Set();
   private unsubscribes: (() => void)[] = [];
   private callTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
@@ -72,7 +75,7 @@ class CallingService {
 
   public subscribe(listener: CallListener): () => void {
     this.listeners.add(listener);
-    listener(this.currentSession, this.localStream, this.remoteStream);
+    listener(this.currentSession ? { ...this.currentSession } : null, this.localStream, this.remoteStream);
     return () => {
       this.listeners.delete(listener);
     };
@@ -80,8 +83,28 @@ class CallingService {
 
   private notify(): void {
     for (const listener of this.listeners) {
-      listener(this.currentSession, this.localStream, this.remoteStream);
+      listener(this.currentSession ? { ...this.currentSession } : null, this.localStream, this.remoteStream);
     }
+  }
+
+  private updateSession(updater: (prev: CallSession) => Partial<CallSession>, tag: string): void {
+    if (!this.currentSession) return;
+    const prev = this.currentSession;
+    const updates = updater(prev);
+    this.currentSession = {
+      ...prev,
+      ...updates,
+    };
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[CALL_TRACE][SESSION_UPDATE][${tag}]`, {
+        role: this.role,
+        callId: this.currentSession.callId,
+        prevState: prev.state,
+        newState: this.currentSession.state,
+        updates,
+      });
+    }
+    this.notify();
   }
 
   public getSession(): CallSession | null {
@@ -174,8 +197,9 @@ class CallingService {
     }
 
     const callId = `call_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    this.role = 'caller';
     if (process.env.NODE_ENV !== 'production') {
-      console.log('[CALL UI DEBUG] startCall initiated:', { peerUserId, peerName, type, callId });
+      console.log('[CALL UI DEBUG] startCall initiated:', { peerUserId, peerName, type, callId, role: this.role });
     }
     this.currentSession = {
       callId,
@@ -212,29 +236,40 @@ class CallingService {
 
     if (!sent) {
       console.error('[CALL_TRACE][CLIENT_CALLER] Failed to send call:invite over WebSocket (ws state:', wsService.getState(), ')');
-      this.currentSession.state = 'failed';
-      this.currentSession.errorMessage = 'Realtime connection is not active. Please reconnect.';
-      this.notify();
+      this.updateSession(() => ({
+        state: 'failed',
+        errorMessage: 'Realtime connection is not active. Please reconnect.',
+      }), 'START_CALL_WS_FAIL');
       this.scheduleErrorCleanup(12000);
       return false;
     }
 
     // 2. Concurrently acquire local media and initialize peer connection
-    (async () => {
+    this.pcInitPromise = (async () => {
       try {
         const { stream, fallbackToAudio, notice } = await this.acquireMediaWithFallback(type);
         this.localStream = stream;
 
         if (this.currentSession && this.currentSession.callId === callId) {
           if (fallbackToAudio) {
-            this.currentSession.type = 'audio';
-            this.currentSession.isCameraOff = true;
-            this.currentSession.errorMessage = notice || null;
+            this.updateSession(() => ({
+              type: 'audio',
+              isCameraOff: true,
+              errorMessage: notice || null,
+            }), 'CALLER_MEDIA_FALLBACK');
+          } else {
+            this.notify();
           }
-          this.notify();
         }
 
         await this.initPeerConnection();
+
+        // If an offer arrived while acquiring media/initializing PC, process it now
+        if (this.pendingOffer && this.currentSession && this.currentSession.callId === this.pendingOffer.callId) {
+          const offerToProcess = this.pendingOffer;
+          this.pendingOffer = null;
+          await this.handleOffer(offerToProcess);
+        }
       } catch (err: any) {
         console.error('[CALL_TRACE][CLIENT_CALLER] Local media acquisition failed:', err);
         const userMessage = this.formatMediaErrorMessage(err);
@@ -248,9 +283,10 @@ class CallingService {
         });
 
         if (this.currentSession && this.currentSession.callId === callId) {
-          this.currentSession.state = 'failed';
-          this.currentSession.errorMessage = userMessage;
-          this.notify();
+          this.updateSession(() => ({
+            state: 'failed',
+            errorMessage: userMessage,
+          }), 'CALLER_MEDIA_ERROR');
           this.scheduleErrorCleanup(12000);
         }
       }
@@ -262,55 +298,67 @@ class CallingService {
   public async acceptCall(): Promise<void> {
     if (!this.currentSession || (this.currentSession.state !== 'ringing' && this.currentSession.state !== 'calling')) return;
 
+    this.role = 'callee';
     this.clearCallTimeoutTimer();
-    this.currentSession.state = 'connecting';
-    this.notify();
+    this.updateSession(() => ({ state: 'connecting' }), 'ACCEPT_CALL');
 
-    try {
-      const { stream, fallbackToAudio, notice } = await this.acquireMediaWithFallback(this.currentSession.type);
-      this.localStream = stream;
+    this.pcInitPromise = (async () => {
+      try {
+        const { stream, fallbackToAudio, notice } = await this.acquireMediaWithFallback(this.currentSession!.type);
+        this.localStream = stream;
 
-      if (fallbackToAudio && this.currentSession) {
-        this.currentSession.type = 'audio';
-        this.currentSession.isCameraOff = true;
-        this.currentSession.errorMessage = notice || null;
+        if (this.currentSession) {
+          if (fallbackToAudio) {
+            this.updateSession(() => ({
+              type: 'audio',
+              isCameraOff: true,
+              errorMessage: notice || null,
+            }), 'CALLEE_MEDIA_FALLBACK');
+          } else {
+            this.notify();
+          }
+        }
+
+        await this.initPeerConnection();
+
+        if (!this.currentSession) return;
+
+        wsService.send({
+          type: 'call:accept',
+          callId: this.currentSession.callId,
+          targetUserId: this.currentSession.peerUserId,
+        });
+
+        // Callee creates offer
+        const offer = await this.pc!.createOffer();
+        await this.pc!.setLocalDescription(offer);
+
+        wsService.send({
+          type: 'sdp:offer',
+          callId: this.currentSession.callId,
+          targetUserId: this.currentSession.peerUserId,
+          sdp: offer,
+        });
+      } catch (err: any) {
+        console.error('[CALL_TRACE][CLIENT_CALLEE] acceptCall media acquisition failed:', err);
+        const userMessage = this.formatMediaErrorMessage(err);
+
+        if (this.currentSession) {
+          wsService.send({
+            type: 'call:reject',
+            callId: this.currentSession.callId,
+            targetUserId: this.currentSession.peerUserId,
+            reason: 'MEDIA_ERROR',
+          });
+
+          this.updateSession(() => ({
+            state: 'failed',
+            errorMessage: userMessage,
+          }), 'CALLEE_MEDIA_ERROR');
+          this.scheduleErrorCleanup(12000);
+        }
       }
-      this.notify();
-
-      await this.initPeerConnection();
-
-      wsService.send({
-        type: 'call:accept',
-        callId: this.currentSession.callId,
-        targetUserId: this.currentSession.peerUserId,
-      });
-
-      // Sender creates offer
-      const offer = await this.pc!.createOffer();
-      await this.pc!.setLocalDescription(offer);
-
-      wsService.send({
-        type: 'sdp:offer',
-        callId: this.currentSession.callId,
-        targetUserId: this.currentSession.peerUserId,
-        sdp: offer,
-      });
-    } catch (err: any) {
-      console.error('[CALL_TRACE][CLIENT_CALLEE] acceptCall media acquisition failed:', err);
-      const userMessage = this.formatMediaErrorMessage(err);
-
-      wsService.send({
-        type: 'call:reject',
-        callId: this.currentSession.callId,
-        targetUserId: this.currentSession.peerUserId,
-        reason: 'MEDIA_ERROR',
-      });
-
-      this.currentSession.state = 'failed';
-      this.currentSession.errorMessage = userMessage;
-      this.notify();
-      this.scheduleErrorCleanup(12000);
-    }
+    })();
   }
 
   public rejectCall(): void {
@@ -321,8 +369,7 @@ class CallingService {
       callId: this.currentSession.callId,
       targetUserId: this.currentSession.peerUserId,
     });
-    this.currentSession.state = 'declined';
-    this.notify();
+    this.updateSession(() => ({ state: 'declined' }), 'REJECT_CALL');
     this.scheduleErrorCleanup(2000);
   }
 
@@ -334,8 +381,7 @@ class CallingService {
       callId: this.currentSession.callId,
       targetUserId: this.currentSession.peerUserId,
     });
-    this.currentSession.state = 'cancelled';
-    this.notify();
+    this.updateSession(() => ({ state: 'cancelled' }), 'CANCEL_CALL');
     this.cleanup();
   }
 
@@ -348,8 +394,7 @@ class CallingService {
         targetUserId: this.currentSession.peerUserId,
         reason,
       });
-      this.currentSession.state = 'ended';
-      this.notify();
+      this.updateSession(() => ({ state: 'ended' }), 'END_CALL');
     }
     this.cleanup();
   }
@@ -377,8 +422,7 @@ class CallingService {
     if (audioTracks.length === 0) return;
     const newEnabledState = !audioTracks[0].enabled;
     audioTracks.forEach((t) => (t.enabled = newEnabledState));
-    this.currentSession.isMuted = !newEnabledState;
-    this.notify();
+    this.updateSession(() => ({ isMuted: !newEnabledState }), 'TOGGLE_MUTE');
   }
 
   public toggleCamera(): void {
@@ -387,19 +431,7 @@ class CallingService {
     if (videoTracks.length === 0) return;
     const newEnabledState = !videoTracks[0].enabled;
     videoTracks.forEach((t) => (t.enabled = newEnabledState));
-    this.currentSession.isCameraOff = !newEnabledState;
-    this.notify();
-  }
-
-  private async initLocalStream(type: CallType): Promise<void> {
-    if (typeof window === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-      throw new Error('Media devices not supported by browser.');
-    }
-    const constraints: MediaStreamConstraints = {
-      audio: true,
-      video: type === 'video',
-    };
-    this.localStream = await navigator.mediaDevices.getUserMedia(constraints);
+    this.updateSession(() => ({ isCameraOff: !newEnabledState }), 'TOGGLE_CAMERA');
   }
 
   private async initPeerConnection(): Promise<void> {
@@ -420,6 +452,16 @@ class CallingService {
     this.remoteStream = new MediaStream();
 
     this.pc.ontrack = (event) => {
+      const roleTag = (this.role || 'PEER').toUpperCase();
+      console.log(`[CALL_TRACE][${roleTag}] pc.ontrack fired:`, {
+        role: this.role,
+        callId: this.currentSession?.callId,
+        kind: event.track?.kind,
+        readyState: event.track?.readyState,
+        trackId: event.track?.id,
+        streamId: event.streams?.[0]?.id,
+      });
+
       if (event.streams && event.streams[0]) {
         event.streams[0].getTracks().forEach((track) => {
           if (this.remoteStream && !this.remoteStream.getTracks().some((t) => t.id === track.id)) {
@@ -431,10 +473,33 @@ class CallingService {
           this.remoteStream.addTrack(event.track);
         }
       }
-      if (this.currentSession) {
-        this.currentSession.state = 'connected';
-      }
-      this.notify();
+
+      const capturedCallId = this.currentSession?.callId;
+      const currentTracks = this.remoteStream
+        ? this.remoteStream.getTracks().map((t) => ({ id: t.id, kind: t.kind, readyState: t.readyState }))
+        : null;
+
+      console.log(`[CALL_TRACE][${roleTag}] remoteStream immediately after ontrack:`, {
+        callId: capturedCallId,
+        hasRemoteStream: !!this.remoteStream,
+        tracks: currentTracks,
+      });
+
+      setTimeout(() => {
+        if (this.currentSession && this.currentSession.callId === capturedCallId) {
+          const delayedTracks = this.remoteStream
+            ? this.remoteStream.getTracks().map((t) => ({ id: t.id, kind: t.kind, readyState: t.readyState }))
+            : null;
+          console.log(`[CALL_TRACE][${roleTag}] remoteStream 500ms post-ontrack check:`, {
+            callId: capturedCallId,
+            hasRemoteStream: !!this.remoteStream,
+            tracks: delayedTracks,
+            sessionState: this.currentSession.state,
+          });
+        }
+      }, 500);
+
+      this.updateSession(() => ({ state: 'connected' }), 'PC_ONTRACK');
       this.startStatsMonitoring();
     };
 
@@ -454,6 +519,7 @@ class CallingService {
       const state = this.pc.iceConnectionState;
       if (process.env.NODE_ENV !== 'production') {
         console.log('[CALL DEBUG] ICE STATE:', {
+          role: this.role,
           callId: this.currentSession?.callId,
           iceConnectionState: state,
           connectionState: this.pc.connectionState,
@@ -477,8 +543,7 @@ class CallingService {
           this.iceRecoveryTimer = null;
         }
         if (this.currentSession && (this.currentSession.state === 'connecting' || this.currentSession.state === 'calling')) {
-          this.currentSession.state = 'connected';
-          this.notify();
+          this.updateSession(() => ({ state: 'connected' }), 'ICE_CONNECTED');
         }
       }
     };
@@ -507,9 +572,10 @@ class CallingService {
     }
 
     if (this.currentSession) {
-      this.currentSession.state = 'failed';
-      this.currentSession.errorMessage = 'Unable to establish a network connection.';
-      this.notify();
+      this.updateSession(() => ({
+        state: 'failed',
+        errorMessage: 'Unable to establish a network connection.',
+      }), 'ICE_FAILED');
       setTimeout(() => this.cleanup(), 3000);
     }
   }
@@ -524,12 +590,27 @@ class CallingService {
     }
   }
 
+  private async handleOffer(event: any): Promise<void> {
+    if (!this.pc || !this.currentSession || this.currentSession.callId !== event.callId) return;
+    console.log('[CALL_TRACE] Handling sdp:offer from peer:', event.senderUserId);
+    await this.setRemoteDescriptionAndDrainCandidates(event.sdp);
+    const answer = await this.pc.createAnswer();
+    await this.pc.setLocalDescription(answer);
+
+    wsService.send({
+      type: 'sdp:answer',
+      callId: event.callId,
+      targetUserId: event.senderUserId,
+      sdp: answer,
+    });
+  }
+
   private async handleSignalingMessage(event: any): Promise<void> {
     if (!event || typeof event.type !== 'string') return;
 
     switch (event.type) {
       case 'call:invite': {
-        // [CALL_TRACE] Client (callee): on receiving the incoming-call event
+        this.role = 'callee';
         console.log('[CALL_TRACE][CLIENT_CALLEE] Received incoming call:invite event:', {
           callId: event.callId,
           senderUserId: event.senderUserId,
@@ -566,8 +647,7 @@ class CallingService {
       case 'call:accept': {
         if (this.currentSession && this.currentSession.callId === event.callId) {
           this.clearCallTimeoutTimer();
-          this.currentSession.state = 'connecting';
-          this.notify();
+          this.updateSession(() => ({ state: 'connecting' }), 'SIGNALING_CALL_ACCEPT');
         }
         break;
       }
@@ -575,9 +655,10 @@ class CallingService {
       case 'call:reject': {
         if (this.currentSession && this.currentSession.callId === event.callId) {
           this.clearCallTimeoutTimer();
-          this.currentSession.state = 'declined';
-          this.currentSession.errorMessage = 'Call declined.';
-          this.notify();
+          this.updateSession(() => ({
+            state: 'declined',
+            errorMessage: 'Call declined.',
+          }), 'SIGNALING_CALL_REJECT');
           setTimeout(() => this.cleanup(), 2000);
         }
         break;
@@ -586,8 +667,7 @@ class CallingService {
       case 'call:cancel': {
         if (this.currentSession && this.currentSession.callId === event.callId) {
           this.clearCallTimeoutTimer();
-          this.currentSession.state = 'cancelled';
-          this.notify();
+          this.updateSession(() => ({ state: 'cancelled' }), 'SIGNALING_CALL_CANCEL');
           this.cleanup();
         }
         break;
@@ -596,25 +676,23 @@ class CallingService {
       case 'call:ended': {
         if (this.currentSession && this.currentSession.callId === event.callId) {
           this.clearCallTimeoutTimer();
-          this.currentSession.state = 'ended';
-          this.notify();
+          this.updateSession(() => ({ state: 'ended' }), 'SIGNALING_CALL_ENDED');
           this.cleanup();
         }
         break;
       }
 
       case 'sdp:offer': {
-        if (this.currentSession && this.currentSession.callId === event.callId && this.pc) {
-          await this.setRemoteDescriptionAndDrainCandidates(event.sdp);
-          const answer = await this.pc.createAnswer();
-          await this.pc.setLocalDescription(answer);
-
-          wsService.send({
-            type: 'sdp:answer',
-            callId: event.callId,
-            targetUserId: event.senderUserId,
-            sdp: answer,
-          });
+        if (this.currentSession && this.currentSession.callId === event.callId) {
+          if (!this.pc) {
+            console.log('[CALL_TRACE] Received sdp:offer before PC initialized, queueing offer');
+            this.pendingOffer = event;
+            if (this.pcInitPromise) {
+              await this.pcInitPromise;
+            }
+          } else {
+            await this.handleOffer(event);
+          }
         }
         break;
       }
@@ -640,9 +718,10 @@ class CallingService {
       case 'error': {
         if (this.currentSession && this.currentSession.state !== 'idle') {
           this.clearCallTimeoutTimer();
-          this.currentSession.state = 'failed';
-          this.currentSession.errorMessage = event.message || 'Call failed.';
-          this.notify();
+          this.updateSession(() => ({
+            state: 'failed',
+            errorMessage: event.message || 'Call failed.',
+          }), 'SIGNALING_ERROR');
           this.scheduleErrorCleanup(12000);
         }
         break;
@@ -745,7 +824,10 @@ class CallingService {
       this.iceRecoveryTimer = null;
     }
     this.pendingIceCandidates = [];
+    this.pendingOffer = null;
+    this.pcInitPromise = null;
     this.isRestartingIce = false;
+    this.role = null;
 
     if (this.localStream) {
       this.localStream.getTracks().forEach((t) => t.stop());

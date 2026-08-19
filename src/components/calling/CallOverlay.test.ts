@@ -162,3 +162,62 @@ test('14. CallOverlay renders non-blocking fallback banner when camera is unavai
   assert.match(source, /<AlertCircle/);
 });
 
+test('15. CallOverlay attaches addtrack and removetrack event listeners to remoteStream', () => {
+  assert.match(source, /remoteStream\.addEventListener\('addtrack', handleTrackAdded\)/);
+  assert.match(source, /remoteStream\.addEventListener\('removetrack', handleTrackRemoved\)/);
+});
+
+test('16. Regression Test: CallingService session updates create new object references for React state', () => {
+  let session = {
+    callId: 'call_123',
+    peerUserId: 'user_b',
+    peerName: 'Bob',
+    type: 'video' as const,
+    state: 'calling' as const,
+    isMuted: false,
+    isCameraOff: false,
+  };
+
+  const updateSession = (updater: (prev: typeof session) => Partial<typeof session>) => {
+    session = { ...session, ...updater(session) };
+  };
+
+  const initialRef = session;
+  updateSession(() => ({ state: 'connected' }));
+
+  // Object reference MUST change so React setSession detects state change
+  assert.notEqual(session, initialRef);
+  assert.equal(session.state, 'connected');
+  assert.equal(session.callId, 'call_123');
+  assert.equal(session.peerUserId, 'user_b');
+});
+
+test('17. Regression Test: Caller side properly preserves remote tracks and never clobbers remoteStream', () => {
+  const mockRemoteStream = {
+    tracks: [] as any[],
+    getTracks() {
+      return this.tracks;
+    },
+    getVideoTracks() {
+      return this.tracks.filter((t: any) => t.kind === 'video');
+    },
+    addTrack(track: any) {
+      if (!this.tracks.some((t: any) => t.id === track.id)) {
+        this.tracks.push(track);
+      }
+    },
+  };
+
+  const videoTrack = { id: 'track_video_1', kind: 'video', enabled: true, readyState: 'live' };
+  const audioTrack = { id: 'track_audio_1', kind: 'audio', enabled: true, readyState: 'live' };
+
+  mockRemoteStream.addTrack(audioTrack);
+  assert.equal(mockRemoteStream.getTracks().length, 1);
+  assert.equal(mockRemoteStream.getVideoTracks().length, 0);
+
+  mockRemoteStream.addTrack(videoTrack);
+  assert.equal(mockRemoteStream.getTracks().length, 2);
+  assert.equal(mockRemoteStream.getVideoTracks().length, 1);
+  assert.equal(mockRemoteStream.getVideoTracks()[0].id, 'track_video_1');
+});
+

@@ -18,7 +18,7 @@ export const CallOverlay: React.FC = () => {
   // Subscribe to CallingService state updates
   useEffect(() => {
     const unsub = callingService.subscribe((s, local, remote) => {
-      setSession(s);
+      setSession(s ? { ...s } : null);
       setLocalStream(local);
       setRemoteStream(remote);
     });
@@ -27,8 +27,11 @@ export const CallOverlay: React.FC = () => {
 
   // Bind local MediaStream to local video element
   useEffect(() => {
-    if (localVideoRef.current) {
-      localVideoRef.current.srcObject = localStream;
+    if (localVideoRef.current && localStream) {
+      if (localVideoRef.current.srcObject !== localStream) {
+        localVideoRef.current.srcObject = localStream;
+      }
+      localVideoRef.current.play().catch(() => {});
     }
   }, [localStream, session?.isCameraOff]);
 
@@ -36,12 +39,15 @@ export const CallOverlay: React.FC = () => {
   useEffect(() => {
     if (remoteVideoRef.current && remoteStream && remoteVideoRef.current.srcObject !== remoteStream) {
       remoteVideoRef.current.srcObject = remoteStream;
+      remoteVideoRef.current.play().catch(() => {});
     }
 
     if (!remoteStream) {
       setIsRemoteVideoActive(false);
       return;
     }
+
+    let cleanups: (() => void)[] = [];
 
     const updateActiveState = () => {
       const videoTracks = remoteStream.getVideoTracks();
@@ -50,24 +56,64 @@ export const CallOverlay: React.FC = () => {
         return;
       }
       const mainTrack = videoTracks[0];
-      setIsRemoteVideoActive(mainTrack.enabled && mainTrack.readyState === 'live');
+      const active = mainTrack.enabled && mainTrack.readyState === 'live';
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[CALL_TRACE][UI] updateActiveState:', {
+          videoTracksCount: videoTracks.length,
+          enabled: mainTrack.enabled,
+          readyState: mainTrack.readyState,
+          muted: mainTrack.muted,
+          active,
+        });
+      }
+      setIsRemoteVideoActive(active);
+    };
+
+    const attachTrackListeners = () => {
+      cleanups.forEach((c) => c());
+      cleanups = [];
+
+      const videoTracks = remoteStream.getVideoTracks();
+      videoTracks.forEach((track) => {
+        const handler = () => updateActiveState();
+        track.addEventListener('mute', handler);
+        track.addEventListener('unmute', handler);
+        track.addEventListener('ended', handler);
+        cleanups.push(() => {
+          track.removeEventListener('mute', handler);
+          track.removeEventListener('unmute', handler);
+          track.removeEventListener('ended', handler);
+        });
+      });
     };
 
     updateActiveState();
+    attachTrackListeners();
 
-    const videoTracks = remoteStream.getVideoTracks();
-    if (videoTracks.length > 0) {
-      const mainTrack = videoTracks[0];
-      mainTrack.addEventListener('mute', updateActiveState);
-      mainTrack.addEventListener('unmute', updateActiveState);
-      mainTrack.addEventListener('ended', updateActiveState);
+    const handleTrackAdded = (e: MediaStreamTrackEvent) => {
+      console.log('[CALL_TRACE][UI] remoteStream addtrack event:', e.track.kind, e.track.readyState);
+      if (remoteVideoRef.current && remoteVideoRef.current.srcObject !== remoteStream) {
+        remoteVideoRef.current.srcObject = remoteStream;
+        remoteVideoRef.current.play().catch(() => {});
+      }
+      updateActiveState();
+      attachTrackListeners();
+    };
 
-      return () => {
-        mainTrack.removeEventListener('mute', updateActiveState);
-        mainTrack.removeEventListener('unmute', updateActiveState);
-        mainTrack.removeEventListener('ended', updateActiveState);
-      };
-    }
+    const handleTrackRemoved = (e: MediaStreamTrackEvent) => {
+      console.log('[CALL_TRACE][UI] remoteStream removetrack event:', e.track.kind);
+      updateActiveState();
+      attachTrackListeners();
+    };
+
+    remoteStream.addEventListener('addtrack', handleTrackAdded);
+    remoteStream.addEventListener('removetrack', handleTrackRemoved);
+
+    return () => {
+      remoteStream.removeEventListener('addtrack', handleTrackAdded);
+      remoteStream.removeEventListener('removetrack', handleTrackRemoved);
+      cleanups.forEach((c) => c());
+    };
   }, [remoteStream, session?.state]);
 
   // Connected Call Timer (starts strictly upon 'connected' state)
