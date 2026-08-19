@@ -12,9 +12,16 @@
 //   - locked conversations require a verified PIN before content leaves
 
 import { Hono } from 'hono';
+import { Readable } from 'node:stream';
 import { requireAuth } from '../middleware/auth';
 import { apiError } from '../auth/auth';
 import { rateLimit } from '../rate-limit';
+import {
+  startChatMediaUpload,
+  uploadChatMediaChunk,
+  completeChatMediaUpload,
+  readChatMediaStream,
+} from '../social/mediaService';
 import {
   listConversations,
   listDirectMessages,
@@ -31,6 +38,9 @@ import {
   listStarredMessages,
   deleteMessageForMe,
   deleteMessageForEveryone,
+  editDirectMessage,
+  searchDirectMessages,
+  setDisappearingDuration,
   getConversationSettings,
   setConversationArchived,
   setConversationPinned,
@@ -450,3 +460,137 @@ function getPeerFromMessage(messageId: string): string | null {
   const row = getMessageRow(messageId);
   return row ? row.recipientId : null;
 }
+
+// ─── Chat Media Chunked Uploads & Streaming ─────────────────────────────────
+
+messages.post('/media/start', async (c) => {
+  const userId = c.get('userId');
+  const tooMany = rateLimit(c, `chatMedia:${userId}`, 'dmSend');
+  if (tooMany) return tooMany;
+
+  const body = await c.req.json().catch(() => ({}));
+  const { friendId, originalName, mimeType, sizeBytes } = body as any;
+
+  if (!friendId || !originalName || !mimeType || typeof sizeBytes !== 'number') {
+    return c.json(apiError('VALIDATION_ERROR', 'Missing required upload parameters.'), 400);
+  }
+
+  const result = await startChatMediaUpload(userId, friendId, originalName, mimeType, sizeBytes);
+  if (!result.ok) {
+    const status = result.error === 'MEDIA_TOO_LARGE' ? 413 : result.error === 'FRIENDSHIP_REQUIRED' ? 403 : 400;
+    return c.json(apiError(result.error ?? 'UPLOAD_START_FAILED', 'Failed to start upload session.'), status);
+  }
+
+  return c.json({
+    ok: true,
+    uploadId: result.uploadId,
+    expectedChunks: result.expectedChunks,
+    chunkSize: result.chunkSize,
+  });
+});
+
+messages.put('/media/:uploadId/chunks/:index', async (c) => {
+  const userId = c.get('userId');
+  const uploadId = c.req.param('uploadId');
+  const chunkIndex = parseInt(c.req.param('index'), 10);
+
+  if (isNaN(chunkIndex)) {
+    return c.json(apiError('VALIDATION_ERROR', 'Invalid chunk index.'), 400);
+  }
+
+  const rawBody = c.req.raw.body;
+  if (!rawBody) {
+    return c.json(apiError('VALIDATION_ERROR', 'Empty chunk payload.'), 400);
+  }
+
+  const stream = (rawBody instanceof Readable)
+    ? rawBody
+    : (typeof (Readable as any).fromWeb === 'function' && typeof (rawBody as any).getReader === 'function')
+    ? (Readable as any).fromWeb(rawBody)
+    : Readable.from(Buffer.from(await c.req.arrayBuffer()));
+
+  const result = await uploadChatMediaChunk(userId, uploadId, chunkIndex, stream);
+  if (!result.ok) {
+    return c.json(apiError(result.error ?? 'CHUNK_UPLOAD_FAILED', 'Failed to store chunk.'), 400);
+  }
+
+  return c.json({ ok: true, chunkIndex });
+});
+
+messages.post('/media/:uploadId/complete', async (c) => {
+  const userId = c.get('userId');
+  const uploadId = c.req.param('uploadId');
+
+  const result = await completeChatMediaUpload(userId, uploadId);
+  if (!result.ok || !result.media) {
+    return c.json(apiError(result.error ?? 'UPLOAD_COMPLETE_FAILED', 'Failed to finalize media upload.'), 400);
+  }
+
+  return c.json({
+    ok: true,
+    media: {
+      id: result.media.id,
+      mimeType: result.media.mimeType,
+      sizeBytes: result.media.sizeBytes,
+      originalName: result.media.originalName,
+      createdAt: result.media.createdAt,
+    },
+  });
+});
+
+messages.get('/media/:mediaId', async (c) => {
+  const userId = c.get('userId');
+  const mediaId = c.req.param('mediaId');
+
+  const readRes = await readChatMediaStream(userId, mediaId);
+  if (!readRes.ok || !readRes.stream) {
+    const status = readRes.error === 'FRIENDSHIP_REQUIRED' ? 403 : 404;
+    return c.json(apiError(readRes.error ?? 'NOT_FOUND', 'Media not found or access denied.'), status);
+  }
+
+  c.header('Content-Type', readRes.mimeType ?? 'application/octet-stream');
+  if (readRes.size) c.header('Content-Length', readRes.size.toString());
+  if (readRes.originalName) {
+    c.header('Content-Disposition', `inline; filename="${encodeURIComponent(readRes.originalName)}"`);
+  }
+
+  return c.body(readRes.stream as any);
+});
+
+// ─── Phase 2 Advanced Endpoints ──────────────────────────────────────────────
+
+messages.patch('/:messageId/edit', async (c) => {
+  const userId = c.get('userId');
+  const tooMany = rateLimit(c, `dmEdit:${userId}`, 'dmSend');
+  if (tooMany) return tooMany;
+
+  const body = await c.req.json().catch(() => ({}));
+  const text = typeof body.text === 'string' ? body.text : '';
+
+  const result = editDirectMessage(userId, c.req.param('messageId'), text);
+  if (!result.ok) return serviceError(c, result.error!.code, result.error!.message);
+
+  return c.json({ ok: true, message: result.message });
+});
+
+messages.get('/search', (c) => {
+  const userId = c.get('userId');
+  const query = c.req.query('q') ?? '';
+  const results = searchDirectMessages(userId, query);
+  return c.json({ results });
+});
+
+messages.patch('/disappearing-duration', async (c) => {
+  const userId = c.get('userId');
+  const body = await c.req.json().catch(() => ({}));
+  const { friendId, durationSeconds } = body as any;
+
+  if (!friendId || typeof durationSeconds !== 'number') {
+    return c.json(apiError('VALIDATION_ERROR', 'Missing required parameters.'), 400);
+  }
+
+  const result = setDisappearingDuration(userId, friendId, durationSeconds);
+  if (!result.ok) return serviceError(c, result.error!.code, result.error!.message);
+
+  return c.json({ ok: true, duration: result.duration });
+});

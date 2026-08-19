@@ -22,6 +22,7 @@ import { AmbientBackground } from './components/common/AmbientBackground';
 import { ToastContainer } from './components/common/ToastContainer';
 import { PortalTransition } from './components/room/PortalTransition';
 import { WatchPartyRecapModal } from './components/room/WatchPartyRecapModal';
+import { CallOverlay } from './components/calling/CallOverlay';
 
 const MainContent: React.FC = () => {
   const { activeTab } = useApp();
@@ -107,6 +108,9 @@ const AppShell: React.FC = () => {
       <InviteModal />
       <NotificationsModal />
       <ScheduleRoomModal />
+
+      {/* Full-Screen Video & Audio Call Overlay */}
+      <CallOverlay />
     </div>
   );
 };

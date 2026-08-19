@@ -36,8 +36,19 @@ if (isStaticServingEnabled(process.env)) {
 }
 
 // Build the application (opens the SQLite database, runs idempotent schema).
-const [{ createApp }, { closeDatabase }, { startRoomCleanupWorker, stopRoomCleanupWorker }, { installGracefulShutdown }] =
-  await Promise.all([import('./app'), import('./db/index'), import('./rooms/cleanup'), import('./shutdown')]);
+const [
+  { createApp },
+  { closeDatabase },
+  { startRoomCleanupWorker, stopRoomCleanupWorker },
+  { installGracefulShutdown },
+  { setupWebSocketServer, closeWebSocketServer }
+] = await Promise.all([
+  import('./app'),
+  import('./db/index'),
+  import('./rooms/cleanup'),
+  import('./shutdown'),
+  import('./realtime/ws')
+]);
 const app = createApp();
 
 const PORT = parseInt(process.env.PORT ?? '4000', 10);
@@ -65,6 +76,7 @@ if (typeof bunGlobal !== 'undefined') {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[server] ${signal} received — shutting down`);
+    closeWebSocketServer();
     stopRoomCleanupWorker();
     closeDatabase();
     try {
@@ -80,9 +92,11 @@ if (typeof bunGlobal !== 'undefined') {
   // Node.js mode — use @hono/node-server with graceful shutdown
   const { serve } = await import('@hono/node-server');
   const server = serve({ fetch: app.fetch, port: PORT });
+  setupWebSocketServer(server as any);
   console.log(`[server] PraConnect API running on http://localhost:${PORT} (Node.js mode)`);
   installGracefulShutdown(server, {
     cleanup: () => {
+      closeWebSocketServer();
       stopRoomCleanupWorker();
       closeDatabase();
     },

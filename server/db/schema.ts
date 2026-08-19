@@ -16,7 +16,10 @@ export const schema = `
     -- sent from the client is never accepted.
     role         TEXT NOT NULL DEFAULT 'user',
     createdAt    TEXT NOT NULL,
-    updatedAt    TEXT NOT NULL
+    updatedAt    TEXT NOT NULL,
+    -- Phase 1 realtime: ISO time the user last went fully offline, set by the
+    -- presence system when their last live connection closes.
+    lastSeenAt   TEXT
   );
 
   CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email
@@ -289,6 +292,25 @@ export const schema = `
     recipientId TEXT NOT NULL,
     text        TEXT NOT NULL,
     createdAt   TEXT NOT NULL,
+    -- Phase 1 realtime: canonical pair id (sorted user ids joined ':') and the
+    -- per-conversation monotonically increasing sequence assigned at insert.
+    -- Ordering across the whole app is by sequenceId, never by client clocks.
+    conversationId TEXT,
+    sequenceId     INTEGER,
+    replyToMessageId TEXT,
+    forwardedFromMessageId TEXT,
+    deletedForEveryone INTEGER NOT NULL DEFAULT 0,
+    deletedAt TEXT,
+    deletedByUserId TEXT,
+    -- Phase 2 advanced messaging: attachment, editing, disappearing, vanish & E2E preparation
+    attachmentId TEXT,
+    editedAt TEXT,
+    expiresAt TEXT,
+    vanish INTEGER NOT NULL DEFAULT 0,
+    contentType TEXT,
+    encryptionVersion TEXT,
+    ciphertext TEXT,
+    keyVersion TEXT,
     FOREIGN KEY (senderId) REFERENCES users (id) ON DELETE CASCADE,
     FOREIGN KEY (recipientId) REFERENCES users (id) ON DELETE CASCADE
   );
@@ -298,6 +320,74 @@ export const schema = `
 
   CREATE INDEX IF NOT EXISTS idx_direct_messages_recipient
     ON directMessages (recipientId, createdAt);
+
+  -- Realtime sync/resume: fetch messages after a watermark or order by sequence.
+  CREATE INDEX IF NOT EXISTS idx_direct_messages_conversation_sequence
+    ON directMessages (conversationId, sequenceId);
+
+  CREATE INDEX IF NOT EXISTS idx_direct_messages_expires
+    ON directMessages (expiresAt)
+    WHERE expiresAt IS NOT NULL;
+
+  -- Per-conversation sequence counters (Phase 1 realtime). One row per
+  -- conversation: lastSequence is consumed transactionally with each insert.
+  CREATE TABLE IF NOT EXISTS dmConversationSequences (
+    conversationId TEXT PRIMARY KEY,
+    lastSequence   INTEGER NOT NULL DEFAULT 0
+  );
+
+  -- ─── Phase 2: Rich Chat Media ──────────────────────────────────────────────
+  CREATE TABLE IF NOT EXISTS chatMedia (
+    id             TEXT PRIMARY KEY,
+    uploaderUserId TEXT NOT NULL,
+    conversationId TEXT NOT NULL,
+    storageKey     TEXT NOT NULL,
+    thumbnailKey   TEXT,
+    mimeType       TEXT NOT NULL,
+    sizeBytes      INTEGER NOT NULL,
+    originalName   TEXT NOT NULL,
+    createdAt      TEXT NOT NULL,
+    FOREIGN KEY (uploaderUserId) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_chat_media_conversation
+    ON chatMedia (conversationId);
+
+  CREATE INDEX IF NOT EXISTS idx_chat_media_uploader
+    ON chatMedia (uploaderUserId);
+
+  -- Resumable/chunked chat media upload sessions
+  CREATE TABLE IF NOT EXISTS chatMediaUploads (
+    id                 TEXT PRIMARY KEY,
+    uploaderUserId     TEXT NOT NULL,
+    conversationId     TEXT NOT NULL,
+    originalName       TEXT NOT NULL,
+    mimeType           TEXT NOT NULL,
+    sizeBytes          INTEGER NOT NULL,
+    expectedChunks     INTEGER NOT NULL,
+    receivedChunksMask TEXT NOT NULL,
+    createdAt          TEXT NOT NULL,
+    expiresAt          TEXT NOT NULL,
+    FOREIGN KEY (uploaderUserId) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_chat_media_uploads_expires
+    ON chatMediaUploads (expiresAt);
+
+  -- ─── Phase 2: WebPush Subscriptions ────────────────────────────────────────
+  CREATE TABLE IF NOT EXISTS pushSubscriptions (
+    id         TEXT PRIMARY KEY,
+    userId     TEXT NOT NULL,
+    endpoint   TEXT NOT NULL UNIQUE,
+    p256dh     TEXT NOT NULL,
+    auth       TEXT NOT NULL,
+    userAgent  TEXT,
+    createdAt  TEXT NOT NULL,
+    FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user
+    ON pushSubscriptions (userId);
 
   CREATE TABLE IF NOT EXISTS watchInvites (
     id             TEXT PRIMARY KEY,
@@ -393,6 +483,14 @@ export const schema = `
     locked            INTEGER NOT NULL DEFAULT 0,
     lastReadAt        TEXT,
     lastReadMessageId TEXT,
+    -- Phase 1 realtime: receipt watermarks. deliveredThroughSequenceId is the
+    -- highest message sequence this user has acked as delivered/read (read
+    -- implies delivered). Values are per-user, so each side's sent-message
+    -- status comes from the OTHER side's row.
+    deliveredThroughSequenceId INTEGER NOT NULL DEFAULT 0,
+    readThroughSequenceId      INTEGER NOT NULL DEFAULT 0,
+    -- Phase 2 advanced messaging: disappearing message timer in seconds (0 = off, 86400 = 24h, 604800 = 7d, 7776000 = 90d)
+    disappearingDuration       INTEGER NOT NULL DEFAULT 0,
     updatedAt         TEXT NOT NULL,
     PRIMARY KEY (userId, conversationId),
     FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE
@@ -459,6 +557,18 @@ export const schema = `
 
   CREATE INDEX IF NOT EXISTS idx_conversation_list_members_conversation
     ON conversationListMembers (conversationId);
+
+  -- ─── Phase 1 realtime: user privacy settings ───────────────────────────────
+  -- Server-side mirrors of the client preferences that the realtime system
+  -- must honor (presence visibility, read receipts). DEFAULT 1 = visible.
+
+  CREATE TABLE IF NOT EXISTS userPrivacySettings (
+    userId             TEXT PRIMARY KEY,
+    showActivityStatus INTEGER NOT NULL DEFAULT 1,
+    readReceipts       INTEGER NOT NULL DEFAULT 1,
+    updatedAt          TEXT NOT NULL,
+    FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE
+  );
 
   -- ─── Phase B: Media Library ────────────────────────────────────────────────
   -- Durable library items. The status column is the processing lifecycle

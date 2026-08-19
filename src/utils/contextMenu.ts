@@ -117,10 +117,15 @@ export function buildMessageMenuItems(message: ContextMenuMessage, options: Mess
   ];
 
   if (!message.deletedForEveryone) {
+    const isSender = message.senderId === options.myId;
+    const isWithinEditWindow = options.nowMs - Date.parse(message.createdAt) <= 15 * 60 * 1000;
+    const canEdit = isSender && isWithinEditWindow;
+
     items.push(
       { id: 'reply', label: 'Reply', disabled: !hasBody },
       { id: 'copy', label: 'Copy', disabled: !hasBody },
       { id: 'forward', label: 'Forward', disabled: !hasBody },
+      ...(canEdit ? [{ id: 'edit', label: 'Edit message' }] : []),
       { id: 'pin', label: pinMessageToggleLabel(options.isPinned) },
       { id: 'star', label: starToggleLabel(options.isStarred) },
     );

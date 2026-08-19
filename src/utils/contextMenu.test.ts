@@ -109,7 +109,7 @@ test('toggle labels flip with state', () => {
 test('buildMessageMenuItems covers the WhatsApp-style actions', () => {
   const items = buildMessageMenuItems(ownFresh, { myId: 'me', nowMs: t0 + 120_000, isPinned: false, isStarred: true });
   const ids = items.map((i) => i.id);
-  assert.deepEqual(ids, ['info', 'reply', 'copy', 'forward', 'pin', 'star', 'select', 'delete']);
+  assert.deepEqual(ids, ['info', 'reply', 'copy', 'forward', 'edit', 'pin', 'star', 'select', 'delete']);
   assert.equal(items.find((i) => i.id === 'pin')!.label, 'Pin message');
   assert.equal(items.find((i) => i.id === 'star')!.label, 'Unstar');
   const del = items.find((i) => i.id === 'delete')!;

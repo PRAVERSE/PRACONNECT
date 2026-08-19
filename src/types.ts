@@ -161,6 +161,14 @@ export interface MessageOriginPreview {
   deleted: boolean;
 }
 
+export interface ChatMediaAttachment {
+  mediaId: string;
+  originalName: string;
+  mimeType: string;
+  sizeBytes: number;
+  hasThumbnail?: boolean;
+}
+
 export interface DirectMessage {
   id: string;
   senderId: string;
@@ -169,6 +177,10 @@ export interface DirectMessage {
   /** Server ISO timestamp — the info dialog formats from this, not the
    *  locale-display `timestamp`. */
   createdAt?: string;
+  conversationId?: string;
+  sequenceId?: number;
+  status?: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
+  clientMessageId?: string;
   replyToMessageId?: string | null;
   forwardedFromMessageId?: string | null;
   /** Set when the sender deleted the message for everyone (body already
@@ -176,6 +188,12 @@ export interface DirectMessage {
   deletedForEveryone?: boolean;
   replyTo?: MessageOriginPreview | null;
   forwardedFrom?: MessageOriginPreview | null;
+  attachmentId?: string | null;
+  attachment?: ChatMediaAttachment | null;
+  editedAt?: string | null;
+  expiresAt?: string | null;
+  vanish?: boolean;
+  reaction?: string | null;
 }
 
 export interface DMConversation {

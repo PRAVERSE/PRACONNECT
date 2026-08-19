@@ -13,6 +13,88 @@ export const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
+// Helper to check existing table columns safely
+function getTableColumns(tableName: string): string[] {
+  try {
+    return (db.prepare(`PRAGMA table_info(${tableName})`).all() as { name: string }[]).map((r) => r.name);
+  } catch {
+    return [];
+  }
+}
+
+// Pre-alter existing tables if they exist before running schema index statements
+const existingUsersCols = getTableColumns('users');
+if (existingUsersCols.length > 0) {
+  if (!existingUsersCols.includes('role')) {
+    db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'");
+  }
+  if (!existingUsersCols.includes('lastSeenAt')) {
+    db.exec('ALTER TABLE users ADD COLUMN lastSeenAt TEXT');
+  }
+}
+
+const existingDmCols = getTableColumns('directMessages');
+if (existingDmCols.length > 0) {
+  if (!existingDmCols.includes('replyToMessageId')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN replyToMessageId TEXT');
+  }
+  if (!existingDmCols.includes('forwardedFromMessageId')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN forwardedFromMessageId TEXT');
+  }
+  if (!existingDmCols.includes('deletedForEveryone')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN deletedForEveryone INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!existingDmCols.includes('deletedAt')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN deletedAt TEXT');
+  }
+  if (!existingDmCols.includes('deletedByUserId')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN deletedByUserId TEXT');
+  }
+  if (!existingDmCols.includes('conversationId')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN conversationId TEXT');
+  }
+  if (!existingDmCols.includes('sequenceId')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN sequenceId INTEGER');
+  }
+  if (!existingDmCols.includes('attachmentId')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN attachmentId TEXT');
+  }
+  if (!existingDmCols.includes('editedAt')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN editedAt TEXT');
+  }
+  if (!existingDmCols.includes('expiresAt')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN expiresAt TEXT');
+  }
+  if (!existingDmCols.includes('vanish')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN vanish INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!existingDmCols.includes('contentType')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN contentType TEXT');
+  }
+  if (!existingDmCols.includes('encryptionVersion')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN encryptionVersion TEXT');
+  }
+  if (!existingDmCols.includes('ciphertext')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN ciphertext TEXT');
+  }
+  if (!existingDmCols.includes('keyVersion')) {
+    db.exec('ALTER TABLE directMessages ADD COLUMN keyVersion TEXT');
+  }
+}
+
+const existingCusCols = getTableColumns('conversationUserSettings');
+if (existingCusCols.length > 0) {
+  if (!existingCusCols.includes('deliveredThroughSequenceId')) {
+    db.exec('ALTER TABLE conversationUserSettings ADD COLUMN deliveredThroughSequenceId INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!existingCusCols.includes('readThroughSequenceId')) {
+    db.exec('ALTER TABLE conversationUserSettings ADD COLUMN readThroughSequenceId INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!existingCusCols.includes('disappearingDuration')) {
+    db.exec('ALTER TABLE conversationUserSettings ADD COLUMN disappearingDuration INTEGER NOT NULL DEFAULT 0');
+  }
+}
+
 // Run schema statements one by one
 // better-sqlite3's exec() handles multiple statements but we split to be safe
 for (const statement of schema
@@ -24,57 +106,66 @@ for (const statement of schema
 
 // Phase 6.5: add removedAt to roomMembers on databases created before this
 // column existed. Fresh databases get it from the CREATE TABLE above.
-const memberCols = (db.prepare('PRAGMA table_info(roomMembers)').all() as { name: string }[]).map((r) => r.name);
-if (!memberCols.includes('removedAt')) {
+const memberCols = getTableColumns('roomMembers');
+if (memberCols.length > 0 && !memberCols.includes('removedAt')) {
   db.exec('ALTER TABLE roomMembers ADD COLUMN removedAt TEXT');
-}
-
-// Phase A: users.role — pre-existing databases get the column via ALTER.
-// Fresh databases get it from the CREATE TABLE above. Default stays 'user';
-// admin is granted only by the ADMIN_EMAIL bootstrap below (never by clients).
-const userCols = (db.prepare('PRAGMA table_info(users)').all() as { name: string }[]).map((r) => r.name);
-if (!userCols.includes('role')) {
-  db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'");
 }
 
 // Phase C: media.playableKey (browser-ready MP4 produced by the FFmpeg
 // pipeline) — pre-existing Phase B databases get it via ALTER. storageKey
 // remains the retained original (only present when MEDIA_RETAIN_ORIGINAL=1).
-const mediaCols = (db.prepare('PRAGMA table_info(media)').all() as { name: string }[]).map((r) => r.name);
-if (!mediaCols.includes('playableKey')) {
+const mediaCols = getTableColumns('media');
+if (mediaCols.length > 0 && !mediaCols.includes('playableKey')) {
   db.exec('ALTER TABLE media ADD COLUMN playableKey TEXT');
 }
 
 // Phase 6.9: conversion metadata columns on uploads (MKV -> playable MP4).
-const uploadCols = (db.prepare('PRAGMA table_info(uploads)').all() as { name: string }[]).map((r) => r.name);
-if (!uploadCols.includes('sourceFilename')) {
-  db.exec('ALTER TABLE uploads ADD COLUMN sourceFilename TEXT');
-}
-if (!uploadCols.includes('playableFilename')) {
-  db.exec('ALTER TABLE uploads ADD COLUMN playableFilename TEXT');
-}
-if (!uploadCols.includes('conversionStatus')) {
-  db.exec("ALTER TABLE uploads ADD COLUMN conversionStatus TEXT NOT NULL DEFAULT 'uploaded'");
+const uploadCols = getTableColumns('uploads');
+if (uploadCols.length > 0) {
+  if (!uploadCols.includes('sourceFilename')) {
+    db.exec('ALTER TABLE uploads ADD COLUMN sourceFilename TEXT');
+  }
+  if (!uploadCols.includes('playableFilename')) {
+    db.exec('ALTER TABLE uploads ADD COLUMN playableFilename TEXT');
+  }
+  if (!uploadCols.includes('conversionStatus')) {
+    db.exec("ALTER TABLE uploads ADD COLUMN conversionStatus TEXT NOT NULL DEFAULT 'uploaded'");
+  }
 }
 
-// DM context columns: reply/forward metadata + delete-for-everyone tombstone
-// (rows are never destroyed; deletedForEveryone hides the body from everyone).
-const dmCols = (db.prepare('PRAGMA table_info(directMessages)').all() as { name: string }[]).map((r) => r.name);
-if (!dmCols.includes('replyToMessageId')) {
-  db.exec('ALTER TABLE directMessages ADD COLUMN replyToMessageId TEXT');
-}
-if (!dmCols.includes('forwardedFromMessageId')) {
-  db.exec('ALTER TABLE directMessages ADD COLUMN forwardedFromMessageId TEXT');
-}
-if (!dmCols.includes('deletedForEveryone')) {
-  db.exec('ALTER TABLE directMessages ADD COLUMN deletedForEveryone INTEGER NOT NULL DEFAULT 0');
-}
-if (!dmCols.includes('deletedAt')) {
-  db.exec('ALTER TABLE directMessages ADD COLUMN deletedAt TEXT');
-}
-if (!dmCols.includes('deletedByUserId')) {
-  db.exec('ALTER TABLE directMessages ADD COLUMN deletedByUserId TEXT');
-}
+const realtimeSequenceBackfill = db.transaction(() => {
+  const missingConversation = (
+    db.prepare('SELECT COUNT(*) AS n FROM directMessages WHERE conversationId IS NULL').get() as { n: number }
+  ).n;
+  if (missingConversation > 0) {
+    db.exec(
+      `UPDATE directMessages
+       SET conversationId = min(senderId, recipientId) || ':' || max(senderId, recipientId)
+       WHERE conversationId IS NULL`
+    );
+  }
+  const missingSequence = (
+    db.prepare('SELECT COUNT(*) AS n FROM directMessages WHERE sequenceId IS NULL').get() as { n: number }
+  ).n;
+  if (missingSequence > 0) {
+    db.exec(
+      `UPDATE directMessages
+       SET sequenceId = (
+         SELECT COUNT(*) FROM directMessages AS m2
+         WHERE m2.conversationId = directMessages.conversationId
+           AND (m2.createdAt < directMessages.createdAt
+                OR (m2.createdAt = directMessages.createdAt AND m2.id <= directMessages.id))
+       )
+       WHERE sequenceId IS NULL`
+    );
+  }
+  // Prime counters so the next insert continues where the backfill stopped.
+  db.exec(
+    `INSERT OR IGNORE INTO dmConversationSequences (conversationId, lastSequence)
+     SELECT conversationId, MAX(sequenceId) FROM directMessages GROUP BY conversationId`
+  );
+});
+realtimeSequenceBackfill();
 
 // Phase 6.11: backfill persistent room history from rooms that were created
 // before the history tables existed. Every active room row becomes one

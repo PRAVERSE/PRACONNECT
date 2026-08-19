@@ -26,7 +26,14 @@ import {
   MailCheck,
   List as ListIcon,
   Eraser,
-  Check
+  Check,
+  CheckCheck,
+  Clock,
+  Paperclip,
+  Phone,
+  Video,
+  FileText,
+  Download
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
@@ -41,6 +48,8 @@ import { StarredMessagesModal } from '../messages/StarredMessagesModal';
 import { LockDialog } from '../messages/LockDialog';
 import type { LockDialogMode } from '../messages/LockDialog';
 import { ListsModal } from '../messages/ListsModal';
+import { ImageViewerModal } from '../common/ImageViewerModal';
+import { callingService } from '../../services/calling';
 import { useLongPress } from '../../hooks/useLongPress';
 import {
   buildMessageMenuItems,
@@ -90,7 +99,12 @@ export const MessagesView: React.FC = () => {
     isChatVerified,
     conversationLists,
     addConversationToList,
-    removeConversationFromList
+    removeConversationFromList,
+    connectionState,
+    typingByConversation,
+    presenceByUser,
+    sendTypingStart,
+    sendTypingStop
   } = useApp();
 
   const [messageInput, setMessageInput] = useState('');
@@ -121,13 +135,138 @@ export const MessagesView: React.FC = () => {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [starredIds, setStarredIds] = useState<string[]>([]);
 
+  // ─── File Upload & Image Viewer state ──────────────────────────────────────
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [filePreviewUrl, setFilePreviewUrl] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'ready' | 'error'>('idle');
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadedAttachmentId, setUploadedAttachmentId] = useState<string | null>(null);
+  const [viewingImage, setViewingImage] = useState<{ src: string; name?: string } | null>(null);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const modalInputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const uploadAbortRef = useRef<boolean>(false);
   const touchTargetRef = useRef<{ kind: 'message' | 'conversation'; message?: DirectMessage; friendId?: string } | null>(null);
+
+  const cancelUpload = useCallback(() => {
+    uploadAbortRef.current = true;
+    if (filePreviewUrl) URL.revokeObjectURL(filePreviewUrl);
+    setSelectedFile(null);
+    setFilePreviewUrl(null);
+    setUploadProgress(0);
+    setUploadStatus('idle');
+    setUploadError(null);
+    setUploadedAttachmentId(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  }, [filePreviewUrl]);
+
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !activeDMId) return;
+
+    // 50 MiB limit validation
+    const maxBytes = 52428800; // 50 MiB
+    if (file.size > maxBytes) {
+      setUploadError('File exceeds the 50 MB maximum size limit.');
+      setUploadStatus('error');
+      return;
+    }
+
+    // Dangerous extension check
+    const dangerousExts = ['.exe', '.bat', '.cmd', '.scr', '.msi', '.com', '.pif', '.hta', '.cpl', '.jar', '.vbs', '.ps1', '.sh', '.php', '.jsp', '.asp', '.aspx'];
+    const ext = '.' + file.name.split('.').pop()?.toLowerCase();
+    if (dangerousExts.includes(ext)) {
+      setUploadError('Executable and script files are not permitted.');
+      setUploadStatus('error');
+      return;
+    }
+
+    uploadAbortRef.current = false;
+    setSelectedFile(file);
+    setUploadError(null);
+    setUploadStatus('uploading');
+    setUploadProgress(0);
+
+    const objectUrl = URL.createObjectURL(file);
+    setFilePreviewUrl(objectUrl);
+
+    try {
+      // 1. Start chunked upload
+      const startRes = await fetch('/api/messages/media/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          friendId: activeDMId,
+          originalName: file.name,
+          mimeType: file.type || 'application/octet-stream',
+          sizeBytes: file.size,
+        }),
+      }).then((r) => r.json());
+
+      if (!startRes.ok || !startRes.uploadId) {
+        if (startRes.error?.code === 'MEDIA_TOO_LARGE') {
+          throw new Error('File exceeds the 50 MB maximum size limit.');
+        }
+        throw new Error(startRes.error?.message || 'Failed to initialize upload session.');
+      }
+
+      const uploadId = startRes.uploadId;
+      const chunkSize = startRes.chunkSize || 2 * 1024 * 1024;
+      const totalChunks = startRes.expectedChunks || Math.ceil(file.size / chunkSize);
+
+      // 2. Upload chunks sequentially
+      for (let i = 0; i < totalChunks; i++) {
+        if (uploadAbortRef.current) return;
+
+        const start = i * chunkSize;
+        const end = Math.min(start + chunkSize, file.size);
+        const chunkBlob = file.slice(start, end);
+
+        const chunkRes = await fetch(`/api/messages/media/${uploadId}/chunks/${i}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          credentials: 'include',
+          body: chunkBlob,
+        }).then((r) => r.json());
+
+        if (!chunkRes.ok) {
+          throw new Error(`Failed to upload chunk ${i + 1} of ${totalChunks}`);
+        }
+
+        const pct = Math.round(((i + 1) / totalChunks) * 100);
+        setUploadProgress(pct);
+      }
+
+      // 3. Complete upload
+      const compRes = await fetch(`/api/messages/media/${uploadId}/complete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+      }).then((r) => r.json());
+
+      if (!compRes.ok || !compRes.media?.id) {
+        throw new Error(compRes.error?.message || 'Failed to finalize upload.');
+      }
+
+      setUploadedAttachmentId(compRes.media.id);
+      setUploadStatus('ready');
+      setUploadProgress(100);
+    } catch (err: any) {
+      setUploadStatus('error');
+      setUploadError(err.message || 'File upload failed.');
+    }
+  };
 
   const activeConversation = conversations.find((c) => c.friendId === activeDMId) || null;
   const activeFriend = activeDMId ? friends.find((f) => f.id === activeDMId) || null : null;
   const messages = activeDMId ? dmConversations[activeDMId] || [] : [];
+  const activeConversationKey = activeDMId && currentUser?.id ? conversationKeyFor(activeDMId, currentUser.id) : null;
+  const isPeerTyping = Boolean(activeConversationKey && typingByConversation[activeConversationKey]);
+  const activePeerPresence = activeDMId ? presenceByUser[activeDMId] : undefined;
+  const isPeerOnline = activePeerPresence ? activePeerPresence.online : Boolean(activeFriend?.status === 'online');
 
   // Pending watch invites from the active conversation's friend (incoming) or
   // to them (outgoing), oldest first.
@@ -190,14 +329,34 @@ export const MessagesView: React.FC = () => {
 
   const handleSend = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!messageInput.trim() || !activeDMId) return;
+    if ((!messageInput.trim() && !uploadedAttachmentId) || !activeDMId) return;
+
+    const options: any = {};
+    if (replyTo) options.replyToMessageId = replyTo.id;
+    if (uploadedAttachmentId) options.attachmentId = uploadedAttachmentId;
+
     if (replyTo) {
-      sendReply(activeDMId, messageInput.trim(), replyTo.id);
+      sendReply(activeDMId, messageInput.trim(), replyTo.id, uploadedAttachmentId ? { attachmentId: uploadedAttachmentId } : undefined);
     } else {
-      sendDirectMessage(activeDMId, messageInput.trim());
+      sendDirectMessage(activeDMId, messageInput.trim(), options);
     }
+
+    if (activeDMId) sendTypingStop(activeDMId);
     setReplyTo(null);
     setMessageInput('');
+    cancelUpload();
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = e.target.value;
+    setMessageInput(val);
+    if (activeDMId) {
+      if (val.trim().length > 0) {
+        sendTypingStart(activeDMId);
+      } else {
+        sendTypingStop(activeDMId);
+      }
+    }
   };
 
   const handleSelectFriendForChat = (friend: Friend) => {
@@ -527,74 +686,52 @@ export const MessagesView: React.FC = () => {
     watchInvites.find((i) => i.id === inviteId)?.status ?? 'pending';
 
   return (
-    <div className="w-full h-full min-h-0 flex flex-col pt-8 md:pt-10 px-4 sm:px-8 md:px-16 text-[var(--text-primary)] font-['Inter',sans-serif] select-none">
-      {/* ─── PAGE HEADER — same rhythm as Friends/Explore ──────────────────── */}
-      <header
-        className={`flex items-start justify-between gap-4 pb-6 mb-0 border-b border-[var(--border-hairline)] shrink-0 ${
+    <div className="w-full h-full min-h-0 flex overflow-hidden text-[var(--text-primary)] font-['Inter',sans-serif] select-none">
+      {/* ─── LEFT: Conversation rail — narrow sidebar with border separator ─── */}
+      <aside
+        className={`w-full md:w-[280px] lg:w-[320px] shrink-0 h-full min-h-0 bg-transparent flex flex-col border-r border-[var(--border-hairline)] ${
           activeConversation ? 'hidden md:flex' : 'flex'
         }`}
-        style={{ animation: 'rise 640ms var(--ease) both' }}
       >
-        <div className="min-w-0">
-          <h1
-            className="font-display font-bold tracking-[-0.02em] text-[clamp(1.75rem,2.8vw,2.4rem)] leading-[1.1]"
-            style={{ animation: 'rise 640ms var(--ease) 80ms both' }}
-          >
-            Messages
-          </h1>
-          <p
-            className="text-[15px] leading-relaxed text-[var(--text-secondary)] mt-2"
-            style={{ animation: 'rise 640ms var(--ease) 150ms both' }}
-          >
-            Chat with your squad and send watch invites straight from the room.
-          </p>
-        </div>
-
-        <button
-          onClick={() => setIsNewChatOpen(true)}
-          className="btn-primary text-sm shrink-0"
-          style={{ animation: 'rise 640ms var(--ease) 220ms both' }}
-        >
-          <Plus className="w-4 h-4" aria-hidden="true" />
-          <span className="hidden sm:inline">New Message</span>
-        </button>
-      </header>
-
-      {/* ─── MESSAGING WORKSPACE — fills the remaining page height ─────────── */}
-      <div className="flex-1 min-h-0 w-full flex overflow-hidden">
-        {/* ─── LEFT: Conversation rail — same canvas as the page, no block ─── */}
-        <aside
-          className={`w-full md:w-[280px] lg:w-[320px] shrink-0 h-full min-h-0 bg-transparent flex flex-col ${
-            activeConversation ? 'hidden md:flex' : 'flex'
-          }`}
-        >
+        {/* Compact rail header with Messages title & search */}
+        <div className="shrink-0 px-4 py-3 border-b border-[var(--border-hairline)] flex flex-col gap-2.5">
+          <div className="flex items-center justify-between">
+            <h2 className="font-display font-bold text-base tracking-[-0.01em] flex items-center gap-2">
+              <span>Messages</span>
+              {connectionState === 'RECONNECTING' && (
+                <span className="text-[11px] font-normal text-[var(--text-tertiary)] flex items-center gap-1 animate-pulse">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                  Reconnecting...
+                </span>
+              )}
+            </h2>
+          </div>
           {!hasNoConversations && (
-            <div className="shrink-0 px-1 pt-4 pb-3.5 border-b border-[var(--border-hairline)]">
-              <div className="relative max-w-[420px]">
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search conversations..."
-                  className="w-full h-10 pl-12 pr-10 rounded-xl border-none bg-[var(--bg-glass)] text-[13px] text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] transition-shadow transition-colors focus:outline-none focus:shadow-[0_0_0_3px_var(--emphasis-dim)] focus:bg-[var(--bg-glass)]"
-                  aria-label="Search conversations"
-                />
-                <Search
-                  className="w-4 h-4 text-[var(--text-tertiary)] absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none"
-                  aria-hidden="true"
-                />
-                {hasSearchQuery && (
-                  <button
-                    onClick={() => setSearchQuery('')}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 p-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] transition-colors rounded-full cursor-pointer"
-                    aria-label="Clear search query"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                )}
-              </div>
+            <div className="relative w-full">
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search conversations..."
+                className="w-full h-9 pl-9 pr-8 rounded-xl border-none bg-[var(--bg-glass)] text-[12px] text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] transition-shadow transition-colors focus:outline-none focus:shadow-[0_0_0_2px_var(--emphasis-dim)]"
+                aria-label="Search conversations"
+              />
+              <Search
+                className="w-3.5 h-3.5 text-[var(--text-tertiary)] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                aria-hidden="true"
+              />
+              {hasSearchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] transition-colors rounded-full cursor-pointer"
+                  aria-label="Clear search query"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              )}
             </div>
           )}
+        </div>
 
           <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar flex flex-col">
             {hasNoConversations ? (
@@ -808,49 +945,57 @@ export const MessagesView: React.FC = () => {
                     <div className="text-[11px] text-[var(--text-secondary)] flex items-center gap-1.5">
                       <span className="truncate">@{activeFriend.username}</span>
                       <span>·</span>
-                      <span className="flex items-center gap-1.5">
-                        <span
-                          className={`w-1.5 h-1.5 rounded-full ${
-                            activeFriend.status === 'online'
-                              ? 'bg-[var(--text-primary)] live-dot shadow-[0_0_6px_var(--emphasis-glow)]'
-                              : 'bg-[var(--text-tertiary)]'
-                          }`}
-                        />
-                        {activeFriend.status === 'online' ? 'Online' : 'Offline'}
-                      </span>
+                      {isPeerTyping ? (
+                        <span className="text-[var(--emphasis-strong)] font-medium italic animate-pulse">typing...</span>
+                      ) : (
+                        <span className="flex items-center gap-1.5">
+                          <span
+                            className={`w-1.5 h-1.5 rounded-full ${
+                              isPeerOnline
+                                ? 'bg-[var(--text-primary)] live-dot shadow-[0_0_6px_var(--emphasis-glow)]'
+                                : 'bg-[var(--text-tertiary)]'
+                            }`}
+                          />
+                          {isPeerOnline ? 'Online' : 'Offline'}
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
 
-                <button
-                  onClick={handleInviteToWatch}
-                  disabled={!currentRoom || sendingInvite}
-                  className="btn-primary text-xs px-3.5 py-2 shrink-0 disabled:opacity-40"
-                  title={currentRoom ? `Invite ${activeFriend.name} to ${currentRoom.name}` : 'Join or create a room first'}
-                >
-                  {sendingInvite ? (
-                    <Loader className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
-                  ) : (
-                    <Play className="w-3.5 h-3.5" aria-hidden="true" />
-                  )}
-                  <span>Invite to Watch</span>
-                </button>
-                <button
-                  onClick={() => setStarredOpen(true)}
-                  className="shrink-0 p-2 text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-glass)] rounded-full transition-colors cursor-pointer"
-                  aria-label="Starred messages"
-                  title="Starred messages"
-                >
-                  <Star className="w-4 h-4" aria-hidden="true" />
-                </button>
-                <button
-                  onClick={() => setListsOpen(true)}
-                  className="shrink-0 p-2 text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-glass)] rounded-full transition-colors cursor-pointer"
-                  aria-label="Conversation lists"
-                  title="Conversation lists"
-                >
-                  <ListIcon className="w-4 h-4" aria-hidden="true" />
-                </button>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    onClick={() => callingService.startCall(activeFriend.id, activeFriend.name, 'audio')}
+                    className="p-2 text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-glass)] rounded-full transition-colors cursor-pointer"
+                    aria-label="Start Audio Call"
+                    title={`Audio call @${activeFriend.username}`}
+                  >
+                    <Phone className="w-4 h-4" />
+                  </button>
+
+                  <button
+                    onClick={() => callingService.startCall(activeFriend.id, activeFriend.name, 'video')}
+                    className="p-2 text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-glass)] rounded-full transition-colors cursor-pointer"
+                    aria-label="Start Video Call"
+                    title={`Video call @${activeFriend.username}`}
+                  >
+                    <Video className="w-4 h-4" />
+                  </button>
+
+                  <button
+                    onClick={handleInviteToWatch}
+                    disabled={!currentRoom || sendingInvite}
+                    className="btn-primary text-xs px-3.5 py-2 shrink-0 disabled:opacity-40"
+                    title={currentRoom ? `Invite ${activeFriend.name} to ${currentRoom.name}` : 'Join or create a room first'}
+                  >
+                    {sendingInvite ? (
+                      <Loader className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                    ) : (
+                      <Play className="w-3.5 h-3.5" aria-hidden="true" />
+                    )}
+                    <span className="hidden sm:inline">Invite to Watch</span>
+                  </button>
+                </div>
               </header>
 
               {/* Message stream — the only scrollable region on the right */}
@@ -1048,15 +1193,75 @@ export const MessagesView: React.FC = () => {
                           {deleted ? (
                             <span className="italic opacity-70">This message was deleted.</span>
                           ) : (
-                            msg.text
+                            <>
+                              {msg.attachment && (
+                                <div className="mb-2">
+                                  {msg.attachment.mimeType.startsWith('image/') ? (
+                                    <img
+                                      src={`/api/messages/media/${msg.attachment.mediaId}`}
+                                      alt={msg.attachment.originalName}
+                                      onClick={() => setViewingImage({ src: `/api/messages/media/${msg.attachment.mediaId}`, name: msg.attachment.originalName })}
+                                      className="max-w-full max-h-56 rounded-xl object-cover cursor-pointer hover:opacity-90 transition-opacity border border-white/10"
+                                    />
+                                  ) : msg.attachment.mimeType.startsWith('video/') ? (
+                                    <video
+                                      src={`/api/messages/media/${msg.attachment.mediaId}`}
+                                      controls
+                                      playsInline
+                                      className="max-w-full max-h-56 rounded-xl object-cover border border-white/10"
+                                    />
+                                  ) : (
+                                    <div className="flex items-center gap-3 p-2.5 rounded-xl bg-black/20 border border-white/10 text-xs">
+                                      <FileText className="w-6 h-6 shrink-0 opacity-80" />
+                                      <div className="min-w-0 flex-1">
+                                        <div className="font-semibold truncate">{msg.attachment.originalName}</div>
+                                        <div className="text-[10px] opacity-70">{(msg.attachment.sizeBytes / (1024 * 1024)).toFixed(1)} MB</div>
+                                      </div>
+                                      <a
+                                        href={`/api/messages/media/${msg.attachment.mediaId}`}
+                                        download={msg.attachment.originalName}
+                                        className="p-1.5 rounded-full hover:bg-white/20 transition-colors"
+                                        title="Download file"
+                                        target="_blank"
+                                        rel="noreferrer"
+                                      >
+                                        <Download className="w-4 h-4" />
+                                      </a>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                              {msg.text}
+                            </>
                           )}
                           {isPinned && (
                             <Pin className="inline-block w-3 h-3 ml-1.5 text-[var(--text-tertiary)]" aria-hidden="true" />
                           )}
                         </div>
-                        <span className="text-[10px] text-[var(--text-tertiary)] mt-1 px-1 font-mono">
-                          {msg.timestamp}
-                        </span>
+                        <div className="flex items-center gap-1 mt-1 px-1">
+                          <span className="text-[10px] text-[var(--text-tertiary)] font-mono">
+                            {msg.timestamp}
+                          </span>
+                          {isMe && (
+                            <span className="inline-flex items-center">
+                              {msg.status === 'sending' && (
+                                <Clock className="w-3 h-3 text-white/50 animate-spin ml-0.5" title="Sending" />
+                              )}
+                              {msg.status === 'sent' && (
+                                <Check className="w-3 h-3 text-white/60 ml-0.5" title="Sent" />
+                              )}
+                              {msg.status === 'delivered' && (
+                                <CheckCheck className="w-3 h-3 text-white/75 ml-0.5" title="Delivered" />
+                              )}
+                              {msg.status === 'read' && (
+                                <CheckCheck className="w-3 h-3 text-cyan-400 ml-0.5" title="Read" />
+                              )}
+                              {msg.status === 'failed' && (
+                                <span className="text-[10px] text-red-400 font-semibold ml-1">Failed</span>
+                              )}
+                            </span>
+                          )}
+                        </div>
                       </div>
                     );
                   })
@@ -1066,7 +1271,7 @@ export const MessagesView: React.FC = () => {
 
               {/* Composer — integrated bottom control, thin top separator */}
               {replyTo && (
-                <div className="flex items-center gap-2.5 mb-2.5 px-4 py-2.5 rounded-2xl bg-[var(--bg-glass)] border border-[var(--border-hairline)]">
+                <div className="flex items-center gap-2.5 mb-2.5 px-4 py-2.5 rounded-2xl bg-[var(--bg-glass)] border border-[var(--border-hairline)] mx-4">
                   <CornerUpLeft className="w-3.5 h-3.5 text-[var(--text-tertiary)] shrink-0" aria-hidden="true" />
                   <span className="flex-1 min-w-0 text-[12px] text-[var(--text-secondary)] truncate">
                     Replying to <span className="font-semibold text-[var(--text-primary)]">{replyTo.senderId === currentUser?.id ? 'yourself' : activeFriend?.name}</span>
@@ -1081,19 +1286,74 @@ export const MessagesView: React.FC = () => {
                   </button>
                 </div>
               )}
+
+              {/* Upload Progress Bar */}
+              {selectedFile && (
+                <div className="flex items-center gap-3 px-4 py-2.5 mx-4 mb-2 rounded-2xl bg-[var(--bg-glass)] border border-[var(--border-hairline)] text-xs">
+                  {filePreviewUrl && selectedFile.type.startsWith('image/') ? (
+                    <img src={filePreviewUrl} alt="Preview" className="w-8 h-8 rounded-lg object-cover shrink-0" />
+                  ) : (
+                    <FileText className="w-6 h-6 text-[var(--text-tertiary)] shrink-0" />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center justify-between gap-2 mb-1">
+                      <span className="font-medium truncate text-[var(--text-primary)]">{selectedFile.name}</span>
+                      <span className="text-[10px] text-[var(--text-tertiary)] font-mono">
+                        {uploadStatus === 'uploading' ? `${uploadProgress}%` : uploadStatus === 'ready' ? 'Ready' : 'Failed'}
+                      </span>
+                    </div>
+                    {uploadStatus === 'uploading' && (
+                      <div className="w-full h-1 bg-[var(--emphasis-dim)] rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-[var(--emphasis)] transition-all duration-150"
+                          style={{ width: `${uploadProgress}%` }}
+                        />
+                      </div>
+                    )}
+                    {uploadError && (
+                      <span className="text-[10px] text-red-400 font-medium block truncate">{uploadError}</span>
+                    )}
+                  </div>
+                  <button
+                    onClick={cancelUpload}
+                    className="p-1 rounded-full text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--emphasis-dim)] transition-colors cursor-pointer shrink-0"
+                    title="Cancel upload"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
               <footer className="shrink-0 px-4 sm:px-6 pt-3 pb-4 border-t border-[var(--border-hairline)]">
-                <form onSubmit={handleSend} className="flex gap-2.5">
+                <form onSubmit={handleSend} className="flex gap-2.5 items-center">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    onChange={handleFileSelect}
+                    className="hidden"
+                    accept="image/*,video/*,audio/*,.pdf,.zip,.txt,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="p-2.5 rounded-full text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-glass)] transition-colors cursor-pointer shrink-0"
+                    title="Attach file (up to 50 MB)"
+                    aria-label="Attach file"
+                  >
+                    <Paperclip className="w-4 h-4" />
+                  </button>
+
                   <input
                     type="text"
                     value={messageInput}
-                    onChange={(e) => setMessageInput(e.target.value)}
+                    onChange={handleInputChange}
                     placeholder={`Message @${activeFriend.username}...`}
                     className="field flex-1 min-w-0 text-sm py-2.5"
                     aria-label={`Message @${activeFriend.username}`}
                   />
                   <button
                     type="submit"
-                    disabled={!messageInput.trim()}
+                    disabled={(!messageInput.trim() && !uploadedAttachmentId) || uploadStatus === 'uploading'}
                     className="btn-primary text-xs px-4 sm:px-5 py-2.5 shrink-0 disabled:opacity-40"
                     aria-label="Send message"
                   >
@@ -1125,7 +1385,6 @@ export const MessagesView: React.FC = () => {
             </div>
           )}
         </section>
-      </div>
 
       {/* ─── START NEW CHAT MODAL — floating surface, no stroke ─────────────── */}
       {isNewChatOpen && (
@@ -1313,6 +1572,15 @@ export const MessagesView: React.FC = () => {
             handleConversationMenuSelect(item);
             setConversationMenu(null);
           }}
+        />
+      )}
+
+      {viewingImage && (
+        <ImageViewerModal
+          open={Boolean(viewingImage)}
+          src={viewingImage.src}
+          originalName={viewingImage.name}
+          onClose={() => setViewingImage(null)}
         />
       )}
     </div>

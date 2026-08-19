@@ -59,6 +59,7 @@ export const LIMITS = {
   dmStar: { max: 60, windowMs: 60 * 1000 },
   dmConversationSettings: { max: 90, windowMs: 60 * 1000 },
   dmLock: { max: 10, windowMs: 60 * 1000 }, // PIN attempts are deliberately tight
+  callInvite: { max: 20, windowMs: 60 * 1000 },
 } as const;
 
 export type LimitName = keyof typeof LIMITS;

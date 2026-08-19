@@ -104,6 +104,7 @@ import {
 } from '../api/social';
 import { mapSearchResponse } from '../social/directory';
 import { conversationKeyFor } from '../utils/contextMenu';
+import { wsService, ConnectionState } from '../services/websocket';
 
 interface AppContextType {
   activeTab: NavigationTab;
@@ -220,6 +221,11 @@ interface AppContextType {
   setActiveDMId: (id: string | null) => void;
   dmConversations: Record<string, DirectMessage[]>;
   sendDirectMessage: (friendId: string, text: string) => void;
+  connectionState: ConnectionState;
+  typingByConversation: Record<string, boolean>;
+  presenceByUser: Record<string, { online: boolean; lastSeenAt?: string | null }>;
+  sendTypingStart: (friendId: string) => void;
+  sendTypingStop: (friendId: string) => void;
   addFriend: (username: string) => void;
   acceptFriendRequest: (requestId: string) => void;
   rejectFriendRequest: (requestId: string) => void;
@@ -446,6 +452,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   /** Conversation keys verified with a PIN this session (6h server window). */
   const [verifiedChatKeys, setVerifiedChatKeys] = useState<Set<string>>(new Set());
   const [conversationLists, setConversationLists] = useState<ConversationList[]>([]);
+
+  // Real-time messaging state
+  const [connectionState, setConnectionState] = useState<ConnectionState>('DISCONNECTED');
+  const [typingByConversation, setTypingByConversation] = useState<Record<string, boolean>>({});
+  const [presenceByUser, setPresenceByUser] = useState<Record<string, { online: boolean; lastSeenAt?: string | null }>>({});
+  const [deliveredThroughSequenceId, setDeliveredThroughSequenceId] = useState<Record<string, number>>({});
+  const [readThroughSequenceId, setReadThroughSequenceId] = useState<Record<string, number>>({});
 
   // Social state (server-backed)
   const [friendRequests, setFriendRequests] = useState<{
@@ -1169,29 +1182,54 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const sendDirectMessage = (friendId: string, text: string, replyToMessageId?: string | null) => {
-    if (!text.trim()) return;
+    if (!text.trim() || !currentUser?.id) return;
+    const conversationId = conversationKeyFor(friendId, currentUser.id);
+    const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const nowIsoStr = new Date().toISOString();
     const optimistic: DirectMessage = {
-      id: `dm-${Date.now()}`,
-      senderId: currentUser?.id ?? 'user',
+      id: tempId,
+      clientMessageId: tempId,
+      senderId: currentUser.id,
       text: text.trim(),
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      createdAt: nowIsoStr,
+      conversationId,
+      sequenceId: 0,
+      status: 'sending',
+      replyToMessageId: replyToMessageId ?? undefined,
     };
+
     setDmConversations((prev) => ({
       ...prev,
       [friendId]: [...(prev[friendId] || []), optimistic]
     }));
-    sendDirectMessageApi(friendId, text.trim(), replyToMessageId ? { replyToMessageId } : undefined).then((res) => {
-      if (res.ok && res.data?.message) {
-        const serverMsg = mapDirectMessageItem(res.data.message);
-        setDmConversations((prev) => ({
-          ...prev,
-          [friendId]: (prev[friendId] || []).map((m) => (m.id === optimistic.id ? serverMsg : m))
-        }));
-        fetchConversationsApi().then((r) => {
-          if (r.ok && r.data) setConversations(r.data.conversations);
-        });
-      }
-    });
+
+    const wsSent = wsService.sendDirectMessage(
+      tempId,
+      conversationId,
+      text.trim(),
+      replyToMessageId ? { replyToMessageId } : undefined
+    );
+
+    if (!wsSent) {
+      sendDirectMessageApi(friendId, text.trim(), replyToMessageId ? { replyToMessageId } : undefined).then((res) => {
+        if (res.ok && res.data?.message) {
+          const serverMsg = mapDirectMessageItem(res.data.message);
+          setDmConversations((prev) => ({
+            ...prev,
+            [friendId]: (prev[friendId] || []).map((m) => (m.id === tempId ? { ...serverMsg, status: 'sent' } : m))
+          }));
+          fetchConversationsApi().then((r) => {
+            if (r.ok && r.data) setConversations(r.data.conversations);
+          });
+        } else {
+          setDmConversations((prev) => ({
+            ...prev,
+            [friendId]: (prev[friendId] || []).map((m) => (m.id === tempId ? { ...m, status: 'failed' } : m))
+          }));
+        }
+      });
+    }
   };
 
   /** Add a friend by @handle: resolves the username in the directory and sends a request. */
@@ -1697,6 +1735,231 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [isAuthenticated, currentUser?.id, refreshSocial, pushNotification]);
 
+  // ─── Real-time WebSocket connection & event handlers ─────────────────────
+  useEffect(() => {
+    if (!isAuthenticated || !currentUser?.id) {
+      wsService.disconnect();
+      setConnectionState('DISCONNECTED');
+      return;
+    }
+
+    wsService.connect();
+
+    const unsubState = wsService.on('connection_state_change', (e) => {
+      setConnectionState(e.state as ConnectionState);
+    });
+
+    const unsubReady = wsService.on('connection:ready', () => {
+      // Send sync request for active conversations on connect/reconnect
+      const syncReq = conversations.map((c) => ({
+        conversationId: conversationKeyFor(c.friendId, currentUser.id),
+        lastSequenceId: c.lastSequenceId ?? 0,
+      }));
+      if (syncReq.length > 0) {
+        wsService.requestSync(syncReq);
+      }
+    });
+
+    const unsubSent = wsService.on('message:sent', (e) => {
+      const { clientMessageId, message } = e;
+      if (message) {
+        const friendId = message.senderId === currentUser.id ? message.recipientId : message.senderId;
+        const mapped = mapDirectMessageItem(message);
+        setDmConversations((prev) => {
+          const list = prev[friendId] || [];
+          const reconciled = list.map((m) =>
+            m.id === clientMessageId || m.clientMessageId === clientMessageId
+              ? { ...mapped, status: 'sent' as const }
+              : m
+          );
+          if (!reconciled.some((m) => m.id === message.id)) {
+            reconciled.push({ ...mapped, status: 'sent' as const });
+          }
+          return { ...prev, [friendId]: reconciled };
+        });
+        fetchConversationsApi().then((res) => {
+          if (res.ok && res.data) setConversations(res.data.conversations);
+        });
+      }
+    });
+
+    const unsubNew = wsService.on('message:new', (e) => {
+      const { message } = e;
+      if (message) {
+        const friendId = message.senderId === currentUser.id ? message.recipientId : message.senderId;
+        const mapped = mapDirectMessageItem(message);
+        setDmConversations((prev) => {
+          const list = prev[friendId] || [];
+          if (list.some((m) => m.id === message.id)) return prev;
+          return { ...prev, [friendId]: [...list, mapped] };
+        });
+
+        // Automatically emit delivery ACK if message belongs to active DM
+        const conversationId = conversationKeyFor(friendId, currentUser.id);
+        if (message.sequenceId) {
+          wsService.sendDeliveryAck(conversationId, message.sequenceId);
+        }
+
+        fetchConversationsApi().then((res) => {
+          if (res.ok && res.data) setConversations(res.data.conversations);
+        });
+      }
+    });
+
+    const unsubDelivery = wsService.on('message:delivery', (e) => {
+      const { conversationId, throughSequenceId } = e;
+      if (conversationId && throughSequenceId) {
+        setDeliveredThroughSequenceId((prev) => ({ ...prev, [conversationId]: throughSequenceId }));
+        setDmConversations((prev) => {
+          const next: Record<string, DirectMessage[]> = {};
+          for (const [friendId, msgs] of Object.entries(prev)) {
+            const list = (msgs ?? []) as DirectMessage[];
+            next[friendId] = list.map((m) =>
+              m.senderId === currentUser.id && (m.sequenceId ?? 0) <= throughSequenceId && m.status !== 'read'
+                ? { ...m, status: 'delivered' as const }
+                : m
+            );
+          }
+          return next;
+        });
+      }
+    });
+
+    const unsubRead = wsService.on('messages:read', (e) => {
+      const { conversationId, throughSequenceId } = e;
+      if (conversationId && throughSequenceId) {
+        setReadThroughSequenceId((prev) => ({ ...prev, [conversationId]: throughSequenceId }));
+        setDmConversations((prev) => {
+          const next: Record<string, DirectMessage[]> = {};
+          for (const [friendId, msgs] of Object.entries(prev)) {
+            const list = (msgs ?? []) as DirectMessage[];
+            next[friendId] = list.map((m) =>
+              m.senderId === currentUser.id && (m.sequenceId ?? 0) <= throughSequenceId
+                ? { ...m, status: 'read' as const }
+                : m
+            );
+          }
+          return next;
+        });
+      }
+    });
+
+    const unsubTyping = wsService.on('typing', (e) => {
+      const { conversationId, state } = e;
+      if (conversationId) {
+        setTypingByConversation((prev) => ({ ...prev, [conversationId]: state === 'typing' }));
+      }
+    });
+
+    const unsubPresence = wsService.on('presence', (e) => {
+      const { userId, status, lastSeenAt } = e;
+      if (userId) {
+        setPresenceByUser((prev) => ({
+          ...prev,
+          [userId]: { online: status === 'online', lastSeenAt: lastSeenAt ?? null },
+        }));
+        setFriends((prev) =>
+          prev.map((f) => (f.id === userId ? { ...f, status: status === 'online' ? 'online' : 'offline' } : f))
+        );
+      }
+    });
+
+    const unsubSync = wsService.on('sync:messages', (e) => {
+      const { conversationId, messages } = e;
+      if (conversationId && Array.isArray(messages)) {
+        const parts = conversationId.split(':');
+        const peerId = parts.find((id: string) => id !== currentUser.id);
+        if (peerId) {
+          setDmConversations((prev) => {
+            const list = prev[peerId] || [];
+            const existingIds = new Set(list.map((m) => m.id));
+            const newMapped = messages
+              .map(mapDirectMessageItem)
+              .filter((m: DirectMessage) => !existingIds.has(m.id));
+            if (newMapped.length === 0) return prev;
+            const combined = [...list, ...newMapped];
+            combined.sort((a, b) => (a.sequenceId ?? 0) - (b.sequenceId ?? 0));
+            return { ...prev, [peerId]: combined };
+          });
+        }
+      }
+    });
+
+    const unsubError = wsService.on('error', (e) => {
+      const { clientMessageId } = e;
+      if (clientMessageId) {
+        setDmConversations((prev) => {
+          const next: Record<string, DirectMessage[]> = {};
+          for (const [friendId, msgs] of Object.entries(prev)) {
+            const list = (msgs ?? []) as DirectMessage[];
+            next[friendId] = list.map((m) =>
+              m.id === clientMessageId || m.clientMessageId === clientMessageId
+                ? { ...m, status: 'failed' as const }
+                : m
+            );
+          }
+          return next;
+        });
+      }
+    });
+
+    return () => {
+      unsubState();
+      unsubReady();
+      unsubSent();
+      unsubNew();
+      unsubDelivery();
+      unsubRead();
+      unsubTyping();
+      unsubPresence();
+      unsubSync();
+      unsubError();
+    };
+  }, [isAuthenticated, currentUser?.id, conversations]);
+
+  // Multi-tab BroadcastChannel state synchronization
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
+    const channel = new BroadcastChannel('praconnect_messaging_sync');
+
+    channel.onmessage = (event) => {
+      const data = event.data;
+      if (!data || typeof data.type !== 'string') return;
+      if (data.type === 'NEW_DM_STATE') {
+        const { friendId, message } = data;
+        if (friendId && message) {
+          setDmConversations((prev) => {
+            const list = prev[friendId] || [];
+            if (list.some((m) => m.id === message.id)) return prev;
+            return { ...prev, [friendId]: [...list, message] };
+          });
+        }
+      }
+    };
+
+    return () => {
+      channel.close();
+    };
+  }, []);
+
+  const sendTypingStart = useCallback(
+    (friendId: string) => {
+      if (!currentUser?.id) return;
+      const conversationId = conversationKeyFor(friendId, currentUser.id);
+      wsService.sendTypingStart(conversationId);
+    },
+    [currentUser?.id]
+  );
+
+  const sendTypingStop = useCallback(
+    (friendId: string) => {
+      if (!currentUser?.id) return;
+      const conversationId = conversationKeyFor(friendId, currentUser.id);
+      wsService.sendTypingStop(conversationId);
+    },
+    [currentUser?.id]
+  );
+
   // ─── Find Friends directory ───────────────────────────────────────────────
   const searchUsers = useCallback(async (query: string, offset = 0) => {
     const requestId = ++searchRequestIdRef.current;
@@ -2067,6 +2330,11 @@ participants,
         setActiveDMId,
         dmConversations,
         sendDirectMessage,
+        connectionState,
+        typingByConversation,
+        presenceByUser,
+        sendTypingStart,
+        sendTypingStop,
         addFriend,
         acceptFriendRequest,
         rejectFriendRequest,

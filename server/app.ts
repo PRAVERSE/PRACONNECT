@@ -16,6 +16,8 @@ import { messages } from './routes/messages';
 import { invites } from './routes/invites';
 import { media } from './routes/media';
 import { adminMedia } from './routes/adminMedia';
+import { pushRoutes } from './routes/push';
+import { calling } from './routes/calling';
 import { requireAuth } from './middleware/auth';
 import { db } from './db/index';
 import { isApiPath, resolveStaticFile, serveStaticFile } from './static';
@@ -66,6 +68,8 @@ export function createApp(options: CreateAppOptions = {}): Hono {
   app.route('/api/watch-invites', invites);
   app.route('/api/media', media);
   app.route('/api/admin/media', adminMedia);
+  app.route('/api/push', pushRoutes);
+  app.route('/api/calling', calling);
 
   // Uploaded media: authenticated + room-membership authorized (Phase 6.2).
   app.use('/api/uploads/*', requireAuth);

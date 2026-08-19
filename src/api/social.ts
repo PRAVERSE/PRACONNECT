@@ -33,6 +33,10 @@ export interface DirectMessageItem {
   senderId: string;
   text: string;
   createdAt: string;
+  conversationId?: string;
+  sequenceId?: number;
+  status?: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
+  clientMessageId?: string;
   /** Peer receiving the message (present on live `dm:new` events). */
   recipientId?: string;
   replyToMessageId?: string | null;
@@ -49,6 +53,7 @@ export interface ConversationSummary {
   avatar: string;
   online: boolean;
   lastMessage: { text: string; senderId: string; createdAt: string } | null;
+  lastSequenceId?: number;
   archived?: boolean;
   pinned?: boolean;
   favourite?: boolean;

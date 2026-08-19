@@ -16,6 +16,8 @@ import { db } from '../db/index';
 import { generateId, hashPassword, verifyPassword } from '../auth/auth';
 import { nowIso } from '../rooms/time';
 import { getRoomOrNull, isRoomMember, isRoomExpired } from '../rooms/service';
+import { isUserOnlineNow } from '../realtime/registry';
+import { checkAndCleanupUnreferencedMedia } from './mediaService';
 
 export interface SocialError {
   code: string;
@@ -57,6 +59,12 @@ export function publicUser(row: { id: string; name: string; username: string; av
   return { id: row.id, name: row.name, username: row.username, avatarUrl: row.avatarUrl };
 }
 
+export function getUserPublicProfile(userId: string): PublicUser | null {
+  const row = db.prepare('SELECT id, name, username, avatarUrl FROM users WHERE id = ?').get(userId) as UserRow | undefined;
+  if (!row) return null;
+  return publicUser(row);
+}
+
 // ─── Row shapes ──────────────────────────────────────────────────────────────
 
 interface UserRow {
@@ -82,6 +90,8 @@ interface DirectMessageRow {
   recipientId: string;
   text: string;
   createdAt: string;
+  conversationId: string | null;
+  sequenceId: number | null;
   replyToMessageId: string | null;
   forwardedFromMessageId: string | null;
   deletedForEveryone: number;
@@ -391,6 +401,10 @@ export interface DirectMessage {
   senderId: string;
   text: string;
   createdAt: string;
+  /** Canonical pair id (sorted user ids joined ':') — assigned server-side. */
+  conversationId: string;
+  /** Per-conversation monotonic sequence — the single ordering key. */
+  sequenceId: number;
   replyToMessageId?: string | null;
   forwardedFromMessageId?: string | null;
   deletedForEveryone?: boolean;
@@ -398,6 +412,17 @@ export interface DirectMessage {
   replyTo?: { id: string; text: string; senderId: string; deleted: boolean } | null;
   /** The original message this one was forwarded from (joined server-side). */
   forwardedFrom?: { id: string; text: string; senderId: string; deleted: boolean } | null;
+  attachmentId?: string | null;
+  attachment?: {
+    mediaId: string;
+    originalName: string;
+    mimeType: string;
+    sizeBytes: number;
+    hasThumbnail?: boolean;
+  } | null;
+  editedAt?: string | null;
+  expiresAt?: string | null;
+  vanish?: boolean;
 }
 
 export interface ConversationSummary {
@@ -407,6 +432,8 @@ export interface ConversationSummary {
   avatar: string;
   online: boolean;
   lastMessage: { text: string; senderId: string; createdAt: string } | null;
+  /** Highest sequence seen in this conversation (realtime sync/resume). */
+  lastSequenceId: number;
   /** Per-user conversation preferences (server-authoritative). */
   archived?: boolean;
   pinned?: boolean;
@@ -491,11 +518,11 @@ export function listConversations(userId: string): ConversationSummary[] {
 
     const last = db
       .prepare(
-        `SELECT text, senderId, createdAt, deletedForEveryone FROM directMessages
-         WHERE (senderId = ? AND recipientId = ?) OR (senderId = ? AND recipientId = ?)
-         ORDER BY createdAt DESC LIMIT 1`
+        `SELECT text, senderId, createdAt, deletedForEveryone, sequenceId FROM directMessages
+         WHERE conversationId = ?
+         ORDER BY COALESCE(sequenceId, 0) DESC, createdAt DESC LIMIT 1`
       )
-      .get(userId, peerId, peerId, userId) as Pick<DirectMessageRow, 'text' | 'senderId' | 'createdAt' | 'deletedForEveryone'> | undefined;
+      .get(conversationId) as Pick<DirectMessageRow, 'text' | 'senderId' | 'createdAt' | 'deletedForEveryone' | 'sequenceId'> | undefined;
     const presence = db
       .prepare(
         `SELECT 1 FROM roomMembers m JOIN rooms r ON r.id = m.roomId
@@ -520,7 +547,7 @@ export function listConversations(userId: string): ConversationSummary[] {
       name: peer.name,
       username: peer.username,
       avatar: peer.avatarUrl ?? peer.name.charAt(0).toUpperCase(),
-      online: Boolean(presence),
+      online: Boolean(presence) || isUserOnlineNow(peerId),
       // Locked conversations never leak preview text — even to the owner.
       lastMessage: last
         ? {
@@ -529,6 +556,7 @@ export function listConversations(userId: string): ConversationSummary[] {
             createdAt: last.createdAt,
           }
         : null,
+      lastSequenceId: last?.sequenceId ?? 0,
       archived: Boolean(settings?.archived),
       pinned: Boolean(settings?.pinned),
       favourite: Boolean(settings?.favourite),
@@ -554,35 +582,58 @@ export function isAcceptedFriendship(meId: string, otherId: string): boolean {
 /** Latest `limit` messages of a conversation, chronological (oldest first).
  *  Messages tombstoned for the current user are excluded; delete-for-everyone
  *  rows are kept as placeholders with the body stripped. The reply/forward
- *  origin previews are joined so the client never needs follow-up requests. */
+ *  origin previews are joined so the client never needs follow-up requests.
+ *  Ordering is by the server-assigned sequence, never by client clocks. */
+export interface ListDirectMessagesResult {
+  ok: boolean;
+  messages?: DirectMessage[];
+  conversationId?: string;
+  /** This user's own receipt watermarks (status of RECEIVED messages). */
+  deliveredThroughSequenceId?: number;
+  readThroughSequenceId?: number;
+  /** The peer's receipt watermarks (status of SENT messages). */
+  peerDeliveredThroughSequenceId?: number;
+  peerReadThroughSequenceId?: number;
+  error?: SocialError;
+}
+
 export function listDirectMessages(
   userId: string,
   friendId: string,
   limit = 50
-): { ok: boolean; messages?: DirectMessage[]; error?: SocialError } {
+): ListDirectMessagesResult {
   if (!isAcceptedFriendship(userId, friendId)) {
     return { ok: false, error: Errors.notFriends() };
   }
   const clamped = Math.min(Math.max(1, Math.floor(limit)), 200);
+  const conversationId = conversationIdFor(userId, friendId);
   const rows = db
     .prepare(
       `SELECT dm.id, dm.senderId, dm.recipientId, dm.text, dm.createdAt,
+              dm.conversationId, dm.sequenceId,
               dm.replyToMessageId, dm.forwardedFromMessageId,
               dm.deletedForEveryone, dm.deletedAt, dm.deletedByUserId
        FROM (
          SELECT id FROM directMessages dm
-         WHERE ((dm.senderId = ? AND dm.recipientId = ?) OR (dm.senderId = ? AND dm.recipientId = ?))
+         WHERE dm.conversationId = ?
            AND NOT EXISTS (SELECT 1 FROM messageDeletions md WHERE md.messageId = dm.id AND md.userId = ?)
-         ORDER BY dm.createdAt DESC LIMIT ?
+         ORDER BY COALESCE(dm.sequenceId, 0) DESC, dm.createdAt DESC LIMIT ?
        ) sel
        JOIN directMessages dm ON dm.id = sel.id
-       ORDER BY dm.createdAt ASC`
+       ORDER BY COALESCE(dm.sequenceId, 0) ASC, dm.createdAt ASC`
     )
-    .all(userId, friendId, friendId, userId, userId, clamped) as DirectMessageRow[];
+    .all(conversationId, userId, clamped) as DirectMessageRow[];
 
+  const mine = receiptWatermarksFor(userId, conversationId);
+  const peer = receiptWatermarksFor(friendId, conversationId);
   return {
     ok: true,
     messages: rows.map((r) => mapDirectMessage(userId, r)),
+    conversationId,
+    deliveredThroughSequenceId: mine.deliveredThroughSequenceId,
+    readThroughSequenceId: mine.readThroughSequenceId,
+    peerDeliveredThroughSequenceId: peer.deliveredThroughSequenceId,
+    peerReadThroughSequenceId: peer.readThroughSequenceId,
   };
 }
 
@@ -602,22 +653,44 @@ function mapDirectMessage(userId: string, row: DirectMessageRow): DirectMessage 
   const fwdDeletedForMe = row.forwardedFromMessageId
     ? Boolean(db.prepare('SELECT 1 FROM messageDeletions WHERE messageId = ? AND userId = ?').get(row.forwardedFromMessageId, userId))
     : false;
+  const attachmentRow = (row as any).attachmentId
+    ? (db
+        .prepare('SELECT id, originalName, mimeType, sizeBytes, thumbnailKey FROM chatMedia WHERE id = ?')
+        .get((row as any).attachmentId) as { id: string; originalName: string; mimeType: string; sizeBytes: number; thumbnailKey: string | null } | undefined)
+    : undefined;
+
   return {
     id: row.id,
     senderId: row.senderId,
     text: messageTextFor(row),
     createdAt: row.createdAt,
+    conversationId: row.conversationId ?? conversationIdFor(row.senderId, row.recipientId),
+    sequenceId: row.sequenceId ?? 0,
     replyToMessageId: row.replyToMessageId,
     forwardedFromMessageId: row.forwardedFromMessageId,
     deletedForEveryone: Boolean(row.deletedForEveryone),
     replyTo: row.replyToMessageId ? originPreview(replyRow, replyDeletedForMe) : null,
     forwardedFrom: row.forwardedFromMessageId ? originPreview(fwdRow, fwdDeletedForMe) : null,
+    attachmentId: (row as any).attachmentId ?? null,
+    attachment: attachmentRow
+      ? {
+          mediaId: attachmentRow.id,
+          originalName: attachmentRow.originalName,
+          mimeType: attachmentRow.mimeType,
+          sizeBytes: attachmentRow.sizeBytes,
+          hasThumbnail: Boolean(attachmentRow.thumbnailKey),
+        }
+      : null,
+    editedAt: (row as any).editedAt ?? null,
+    expiresAt: (row as any).expiresAt ?? null,
+    vanish: Boolean((row as any).vanish),
   };
 }
 
 export interface SendDirectMessageResult {
   ok: boolean;
   message?: DirectMessage;
+  sequenceId?: number;
   error?: SocialError;
 }
 
@@ -628,6 +701,8 @@ export interface SendDirectMessageOptions {
   /** Id of an accessible message being forwarded. Forwarding creates a NEW
    *  message and never mutates the original. */
   forwardedFromMessageId?: string;
+  attachmentId?: string;
+  vanish?: boolean;
 }
 
 export function sendDirectMessage(
@@ -640,7 +715,7 @@ export function sendDirectMessage(
     return { ok: false, error: Errors.notFriends() };
   }
   const trimmed = text.trim();
-  if (trimmed.length === 0 && !options.forwardedFromMessageId) {
+  if (trimmed.length === 0 && !options.forwardedFromMessageId && !options.attachmentId) {
     return { ok: false, error: Errors.validation('Message cannot be empty.') };
   }
   if (trimmed.length > 2000) return { ok: false, error: Errors.validation('Message is too long (max 2000 characters).') };
@@ -660,20 +735,56 @@ export function sendDirectMessage(
 
   const now = nowIso();
   const id = generateId();
-  db.prepare(
-    `INSERT INTO directMessages
-       (id, senderId, recipientId, text, createdAt, replyToMessageId, forwardedFromMessageId)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, userId, friendId, trimmed, now, options.replyToMessageId ?? null, options.forwardedFromMessageId ?? null);
+  const conversationId = conversationIdFor(userId, friendId);
+
+  // Check disappearing duration setting
+  let expiresAt: string | null = null;
+  const cusRow = db
+    .prepare('SELECT disappearingDuration FROM conversationUserSettings WHERE conversationId = ? AND disappearingDuration > 0 LIMIT 1')
+    .get(conversationId) as { disappearingDuration: number } | undefined;
+  if (cusRow && cusRow.disappearingDuration > 0) {
+    expiresAt = new Date(Date.now() + cusRow.disappearingDuration * 1000).toISOString();
+  }
+
+  // Sequence assignment and insert share one transaction so the counter can
+  // never be double-issued and the message is never persisted without a
+  // sequence. Ordering is server-authoritative — client clocks play no role.
+  const insertMessage = db.transaction((): number => {
+    db.prepare('INSERT OR IGNORE INTO dmConversationSequences (conversationId, lastSequence) VALUES (?, 0)').run(conversationId);
+    db.prepare('UPDATE dmConversationSequences SET lastSequence = lastSequence + 1 WHERE conversationId = ?').run(conversationId);
+    const sequenceRow = db.prepare('SELECT lastSequence FROM dmConversationSequences WHERE conversationId = ?').get(conversationId) as {
+      lastSequence: number;
+    };
+    const sequenceId = sequenceRow.lastSequence;
+    db.prepare(
+      `INSERT INTO directMessages
+         (id, senderId, recipientId, conversationId, sequenceId, text, createdAt, replyToMessageId, forwardedFromMessageId, attachmentId, expiresAt, vanish)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id,
+      userId,
+      friendId,
+      conversationId,
+      sequenceId,
+      trimmed,
+      now,
+      options.replyToMessageId ?? null,
+      options.forwardedFromMessageId ?? null,
+      options.attachmentId ?? null,
+      expiresAt,
+      options.vanish ? 1 : 0
+    );
+    return sequenceId;
+  });
+  const sequenceId = insertMessage();
 
   // A new message revives a chat the sender had "deleted": the row reappears
   // in the conversation list (and, symmetric, for the recipient if they had
   // deleted it too).
-  const conversationId = conversationIdFor(userId, friendId);
   db.prepare('DELETE FROM conversationDeletions WHERE conversationId = ?').run(conversationId);
 
   const row = db.prepare('SELECT * FROM directMessages WHERE id = ?').get(id) as DirectMessageRow;
-  return { ok: true, message: mapDirectMessage(userId, row) };
+  return { ok: true, message: mapDirectMessage(userId, row), sequenceId };
 }
 
 // ─── Message forwarding ──────────────────────────────────────────────────────
@@ -693,6 +804,7 @@ export function forwardMessage(
   }
   return sendDirectMessage(userId, toFriendId, source.message.text, {
     forwardedFromMessageId: messageId,
+    attachmentId: (source.message as any).attachmentId ?? null,
   });
 }
 
@@ -840,6 +952,10 @@ export function deleteMessageForEveryone(
     `UPDATE directMessages SET deletedForEveryone = 1, deletedAt = ?, deletedByUserId = ? WHERE id = ?`
   ).run(deletedAt, userId, messageId);
 
+  if ((access.message as any).attachmentId) {
+    void checkAndCleanupUnreferencedMedia((access.message as any).attachmentId);
+  }
+
   const row = db.prepare('SELECT * FROM directMessages WHERE id = ?').get(messageId) as DirectMessageRow;
   return { ok: true, message: mapDirectMessage(userId, row) };
 }
@@ -855,6 +971,8 @@ interface ConversationSettingsRow {
   locked: number;
   lastReadAt: string | null;
   lastReadMessageId: string | null;
+  deliveredThroughSequenceId: number;
+  readThroughSequenceId: number;
   updatedAt: string;
 }
 
@@ -890,6 +1008,8 @@ function settingsRowFor(userId: string, friendId: string): { ok: true; row: Conv
       locked: 0,
       lastReadAt: null,
       lastReadMessageId: null,
+      deliveredThroughSequenceId: 0,
+      readThroughSequenceId: 0,
       updatedAt: nowIso(),
     };
   return { ok: true, row, conversationId };
@@ -917,7 +1037,12 @@ export function getConversationSettings(userId: string, friendId: string): { ok:
   };
 }
 
-type SettingsPatch = Partial<Pick<ConversationSettingsRow, 'archived' | 'pinned' | 'favourite' | 'locked' | 'lastReadAt' | 'lastReadMessageId'>>;
+type SettingsPatch = Partial<
+  Pick<
+    ConversationSettingsRow,
+    'archived' | 'pinned' | 'favourite' | 'locked' | 'lastReadAt' | 'lastReadMessageId' | 'deliveredThroughSequenceId' | 'readThroughSequenceId'
+  >
+>;
 
 /** Upsert a per-user conversation preference. `locked` always mirrors whether
  *  a chatLock row exists — the setting alone never grants/denies access. */
@@ -926,8 +1051,8 @@ function updateSettings(userId: string, friendId: string, patch: SettingsPatch):
   if (!found.ok) return { ok: false, error: found.error };
   const now = nowIso();
   db.prepare(
-    `INSERT INTO conversationUserSettings (userId, conversationId, archived, pinned, favourite, locked, lastReadAt, lastReadMessageId, updatedAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO conversationUserSettings (userId, conversationId, archived, pinned, favourite, locked, lastReadAt, lastReadMessageId, deliveredThroughSequenceId, readThroughSequenceId, updatedAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (userId, conversationId) DO UPDATE SET
        archived = excluded.archived,
        pinned = excluded.pinned,
@@ -935,6 +1060,8 @@ function updateSettings(userId: string, friendId: string, patch: SettingsPatch):
        locked = excluded.locked,
        lastReadAt = excluded.lastReadAt,
        lastReadMessageId = excluded.lastReadMessageId,
+       deliveredThroughSequenceId = excluded.deliveredThroughSequenceId,
+       readThroughSequenceId = excluded.readThroughSequenceId,
        updatedAt = excluded.updatedAt`
   ).run(
     userId,
@@ -945,6 +1072,8 @@ function updateSettings(userId: string, friendId: string, patch: SettingsPatch):
     patch.locked ?? found.row.locked,
     patch.lastReadAt ?? found.row.lastReadAt,
     patch.lastReadMessageId ?? found.row.lastReadMessageId,
+    patch.deliveredThroughSequenceId ?? found.row.deliveredThroughSequenceId,
+    patch.readThroughSequenceId ?? found.row.readThroughSequenceId,
     now
   );
   const result = getConversationSettings(userId, friendId);
@@ -961,19 +1090,26 @@ export function setConversationFavourite(userId: string, friendId: string, favou
   return updateSettings(userId, friendId, { favourite: favourite ? 1 : 0 });
 }
 
-/** Mark read: stores the current server time and the latest message id.
+/** Mark read: stores the current server time, the latest message id, and
+ *  raises the receipt watermarks to the conversation's highest sequence.
  *  Only ever triggered by actually opening/reading the conversation. */
 export function markConversationRead(userId: string, friendId: string): { ok: boolean; settings?: ConversationSettings; error?: SocialError } {
   const found = settingsRowFor(userId, friendId);
   if (!found.ok) return { ok: false, error: found.error };
   const latest = db
     .prepare(
-      `SELECT id FROM directMessages
-       WHERE (senderId = ? AND recipientId = ?) OR (senderId = ? AND recipientId = ?)
-       ORDER BY createdAt DESC LIMIT 1`
+      `SELECT id, sequenceId FROM directMessages
+       WHERE conversationId = ?
+       ORDER BY COALESCE(sequenceId, 0) DESC, createdAt DESC LIMIT 1`
     )
-    .get(userId, friendId, friendId, userId) as { id: string } | undefined;
-  return updateSettings(userId, friendId, { lastReadAt: nowIso(), lastReadMessageId: latest?.id ?? null });
+    .get(found.conversationId) as { id: string; sequenceId: number | null } | undefined;
+  const through = latest?.sequenceId ?? 0;
+  return updateSettings(userId, friendId, {
+    lastReadAt: nowIso(),
+    lastReadMessageId: latest?.id ?? null,
+    readThroughSequenceId: through,
+    deliveredThroughSequenceId: through,
+  });
 }
 
 /** Mark unread: drop the read watermark entirely so every peer message counts
@@ -993,6 +1129,138 @@ export function markConversationUnread(userId: string, friendId: string): { ok: 
   ).run(userId, found.conversationId, found.row.archived, found.row.pinned, found.row.favourite, found.row.locked, now);
   const result = getConversationSettings(userId, friendId);
   return result.ok ? { ok: true, settings: result.settings } : { ok: false, error: result.error };
+}
+
+/** Update delivery watermark: watermark only moves forward and is capped by highest available sequence. */
+export function updateDeliveryWatermark(
+  userId: string,
+  friendId: string,
+  throughSequenceId: number
+): { ok: boolean; newWatermark?: number; error?: SocialError } {
+  const found = settingsRowFor(userId, friendId);
+  if (!found.ok) return { ok: false, error: found.error };
+
+  const maxSeqRow = db
+    .prepare('SELECT MAX(sequenceId) AS maxSeq FROM directMessages WHERE conversationId = ?')
+    .get(found.conversationId) as { maxSeq: number | null } | undefined;
+  const maxAvailable = maxSeqRow?.maxSeq ?? 0;
+
+  const current = found.row.deliveredThroughSequenceId;
+  const target = Math.min(Math.max(current, throughSequenceId), maxAvailable);
+
+  if (target > current) {
+    updateSettings(userId, friendId, { deliveredThroughSequenceId: target });
+  }
+
+  return { ok: true, newWatermark: Math.max(current, target) };
+}
+
+/** Update read watermark: watermark only moves forward and automatically raises delivery watermark. */
+export function updateReadWatermark(
+  userId: string,
+  friendId: string,
+  throughSequenceId: number
+): { ok: boolean; newWatermark?: number; error?: SocialError } {
+  const found = settingsRowFor(userId, friendId);
+  if (!found.ok) return { ok: false, error: found.error };
+
+  const maxSeqRow = db
+    .prepare('SELECT MAX(sequenceId) AS maxSeq FROM directMessages WHERE conversationId = ?')
+    .get(found.conversationId) as { maxSeq: number | null } | undefined;
+  const maxAvailable = maxSeqRow?.maxSeq ?? 0;
+
+  const currentRead = found.row.readThroughSequenceId;
+  const currentDelivered = found.row.deliveredThroughSequenceId;
+  const targetRead = Math.min(Math.max(currentRead, throughSequenceId), maxAvailable);
+  const targetDelivered = Math.max(currentDelivered, targetRead);
+
+  if (targetRead > currentRead || targetDelivered > currentDelivered) {
+    updateSettings(userId, friendId, {
+      readThroughSequenceId: targetRead,
+      deliveredThroughSequenceId: targetDelivered,
+      lastReadAt: nowIso(),
+    });
+  }
+
+  return { ok: true, newWatermark: Math.max(currentRead, targetRead) };
+}
+
+/** Helper to query user's watermark values for a conversation. */
+export function receiptWatermarksFor(userId: string, conversationId: string): { deliveredThroughSequenceId: number; readThroughSequenceId: number } {
+  const row = readSettings(userId, conversationId);
+  return {
+    deliveredThroughSequenceId: row?.deliveredThroughSequenceId ?? 0,
+    readThroughSequenceId: row?.readThroughSequenceId ?? 0,
+  };
+}
+
+/** Delta sync: fetch messages in a conversation after a specified sequence watermark. */
+export function syncMessagesAfterSequence(
+  userId: string,
+  friendId: string,
+  lastSequenceId: number,
+  limit = 100
+): { ok: boolean; messages?: DirectMessage[]; conversationId?: string; error?: SocialError } {
+  if (!isAcceptedFriendship(userId, friendId)) {
+    return { ok: false, error: Errors.notFriends() };
+  }
+  const conversationId = conversationIdFor(userId, friendId);
+  const clampedLimit = Math.min(Math.max(1, Math.floor(limit)), 500);
+
+  const rows = db
+    .prepare(
+      `SELECT dm.id, dm.senderId, dm.recipientId, dm.text, dm.createdAt,
+              dm.conversationId, dm.sequenceId,
+              dm.replyToMessageId, dm.forwardedFromMessageId,
+              dm.deletedForEveryone, dm.deletedAt, dm.deletedByUserId
+       FROM directMessages dm
+       WHERE dm.conversationId = ?
+         AND dm.sequenceId > ?
+         AND NOT EXISTS (SELECT 1 FROM messageDeletions md WHERE md.messageId = dm.id AND md.userId = ?)
+       ORDER BY dm.sequenceId ASC LIMIT ?`
+    )
+    .all(conversationId, lastSequenceId, userId, clampedLimit) as DirectMessageRow[];
+
+  return {
+    ok: true,
+    conversationId,
+    messages: rows.map((r) => mapDirectMessage(userId, r)),
+  };
+}
+
+/** Privacy settings for presence / read receipts. */
+export interface UserPrivacySettings {
+  showActivityStatus: boolean;
+  readReceipts: boolean;
+}
+
+export function getUserPrivacySettings(userId: string): UserPrivacySettings {
+  const row = db
+    .prepare('SELECT showActivityStatus, readReceipts FROM userPrivacySettings WHERE userId = ?')
+    .get(userId) as { showActivityStatus: number; readReceipts: number } | undefined;
+  if (!row) return { showActivityStatus: true, readReceipts: true };
+  return {
+    showActivityStatus: Boolean(row.showActivityStatus),
+    readReceipts: Boolean(row.readReceipts),
+  };
+}
+
+export function updateUserPrivacySettings(userId: string, patch: Partial<UserPrivacySettings>): UserPrivacySettings {
+  const current = getUserPrivacySettings(userId);
+  const updated = {
+    showActivityStatus: patch.showActivityStatus ?? current.showActivityStatus,
+    readReceipts: patch.readReceipts ?? current.readReceipts,
+  };
+  const now = nowIso();
+  db.prepare(
+    `INSERT INTO userPrivacySettings (userId, showActivityStatus, readReceipts, updatedAt)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT (userId) DO UPDATE SET
+       showActivityStatus = excluded.showActivityStatus,
+       readReceipts = excluded.readReceipts,
+       updatedAt = excluded.updatedAt`
+  ).run(userId, updated.showActivityStatus ? 1 : 0, updated.readReceipts ? 1 : 0, now);
+  return updated;
 }
 
 // ─── Chat locks (application-level) ──────────────────────────────────────────
@@ -1342,6 +1610,102 @@ export function respondWatchInvite(
   db.prepare("UPDATE watchInvites SET status = 'accepted', respondedAt = ? WHERE id = ?").run(now, inviteId);
   const updated = db.prepare('SELECT * FROM watchInvites WHERE id = ?').get(inviteId) as WatchInviteRow;
   return { ok: true, invite: mapInviteRow(updated), roomCode: row.roomCode };
+}
+
+// ─── Phase 2 Advanced Social Features ────────────────────────────────────────
+
+export function editDirectMessage(
+  userId: string,
+  messageId: string,
+  newText: string
+): { ok: boolean; message?: DirectMessage; error?: SocialError } {
+  const access = getMessageAccess(userId, messageId);
+  if (!access.ok) return { ok: false, error: access.error };
+  if (access.message.senderId !== userId) {
+    return { ok: false, error: Errors.messageForbidden() };
+  }
+  if (access.message.deletedForEveryone) {
+    return { ok: false, error: Errors.validation('Deleted messages cannot be edited.') };
+  }
+  const trimmed = newText.trim();
+  if (!trimmed) return { ok: false, error: Errors.validation('Edited message cannot be empty.') };
+
+  // Enforce 15-minute edit window
+  const createdMs = new Date(access.message.createdAt).getTime();
+  if (Date.now() - createdMs > 15 * 60 * 1000) {
+    return { ok: false, error: Errors.validation('Messages can only be edited within 15 minutes of sending.') };
+  }
+
+  const now = nowIso();
+  db.prepare('UPDATE directMessages SET text = ?, editedAt = ? WHERE id = ?').run(trimmed, now, messageId);
+
+  const updatedRow = db.prepare('SELECT * FROM directMessages WHERE id = ?').get(messageId) as DirectMessageRow;
+  return { ok: true, message: mapDirectMessage(userId, updatedRow) };
+}
+
+export interface SearchMessageResultItem {
+  id: string;
+  friendId: string;
+  senderId: string;
+  text: string;
+  createdAt: string;
+  preview: string;
+}
+
+export function searchDirectMessages(userId: string, query: string): SearchMessageResultItem[] {
+  const trimmed = query.trim().toLowerCase();
+  if (!trimmed) return [];
+
+  const rows = db
+    .prepare(
+      `SELECT dm.id, dm.senderId, dm.recipientId, dm.text, dm.createdAt,
+              CASE WHEN dm.senderId = ? THEN dm.recipientId ELSE dm.senderId END AS friendId
+       FROM directMessages dm
+       WHERE (dm.senderId = ? OR dm.recipientId = ?)
+         AND LOWER(dm.text) LIKE ?
+         AND dm.deletedForEveryone = 0
+         AND NOT EXISTS (SELECT 1 FROM messageDeletions md WHERE md.messageId = dm.id AND md.userId = ?)
+       ORDER BY dm.createdAt DESC LIMIT 50`
+    )
+    .all(userId, userId, userId, `%${trimmed}%`, userId) as {
+      id: string;
+      senderId: string;
+      recipientId: string;
+      text: string;
+      createdAt: string;
+      friendId: string;
+    }[];
+
+  return rows
+    .filter((r) => isAcceptedFriendship(userId, r.friendId))
+    .map((r) => ({
+      id: r.id,
+      friendId: r.friendId,
+      senderId: r.senderId,
+      text: r.text,
+      createdAt: r.createdAt,
+      preview: r.text.length > 80 ? `${r.text.slice(0, 80)}...` : r.text,
+    }));
+}
+
+export function setDisappearingDuration(
+  userId: string,
+  friendId: string,
+  durationSeconds: number
+): { ok: boolean; duration?: number; error?: SocialError } {
+  const found = settingsRowFor(userId, friendId);
+  if (!found.ok) return { ok: false, error: found.error };
+
+  const valid = [0, 86400, 604800, 7776000].includes(durationSeconds) ? durationSeconds : 0;
+  const now = nowIso();
+
+  db.prepare(
+    `INSERT INTO conversationUserSettings (userId, conversationId, disappearingDuration, updatedAt)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(userId, conversationId) DO UPDATE SET disappearingDuration = excluded.disappearingDuration, updatedAt = excluded.updatedAt`
+  ).run(userId, found.conversationId, valid, now);
+
+  return { ok: true, duration: valid };
 }
 
 // ─── Maintenance ──────────────────────────────────────────────────────────────
