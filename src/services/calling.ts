@@ -45,6 +45,8 @@ class CallingService {
   private cachedIceServers: RTCIceServer[] | null = null;
   private isRestartingIce = false;
 
+  private errorCleanupTimer: ReturnType<typeof setTimeout> | null = null;
+
   constructor() {
     const callEvents = [
       'call:invite',
@@ -102,6 +104,70 @@ class CallingService {
     return defaultStun;
   }
 
+  /**
+   * Pre-flight hardware check to detect available audio and video inputs.
+   */
+  public async getAvailableMediaDevices(): Promise<{ hasAudio: boolean; hasVideo: boolean }> {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.enumerateDevices) {
+      return { hasAudio: true, hasVideo: true };
+    }
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const hasAudio = devices.some((d) => d.kind === 'audioinput');
+      const hasVideo = devices.some((d) => d.kind === 'videoinput');
+      return { hasAudio, hasVideo };
+    } catch {
+      return { hasAudio: true, hasVideo: true };
+    }
+  }
+
+  /**
+   * Acquire local media stream with graceful degradation from video to audio.
+   */
+  private async acquireMediaWithFallback(type: CallType): Promise<{ stream: MediaStream; fallbackToAudio: boolean; notice?: string }> {
+    if (typeof window === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Media devices are not supported by this browser.');
+    }
+
+    if (type === 'video') {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        return { stream, fallbackToAudio: false };
+      } catch (err: any) {
+        console.warn('[CALL_MEDIA] Video + Audio acquisition failed:', err.name || err.message);
+        const name = err.name || '';
+        const msg = err.message || '';
+        // If error is related to video device missing or in use, attempt fallback to audio
+        if (
+          name === 'NotFoundError' ||
+          name === 'DevicesNotFoundError' ||
+          name === 'NotReadableError' ||
+          name === 'TrackStartError' ||
+          name === 'OverconstrainedError' ||
+          msg.includes('Requested device not found')
+        ) {
+          try {
+            console.log('[CALL_MEDIA] Attempting fallback to audio-only...');
+            const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            return {
+              stream: audioStream,
+              fallbackToAudio: true,
+              notice: 'Camera unavailable — continuing with audio only.',
+            };
+          } catch (audioErr) {
+            console.error('[CALL_MEDIA] Audio-only fallback also failed:', audioErr);
+            throw err; // throw original error
+          }
+        }
+        throw err;
+      }
+    }
+
+    // Audio-only request
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    return { stream, fallbackToAudio: false };
+  }
+
   public async startCall(peerUserId: string, peerName: string, type: CallType): Promise<boolean> {
     if (this.currentSession && this.currentSession.state !== 'idle') {
       return false;
@@ -126,29 +192,71 @@ class CallingService {
     // 30-Second unanswered call timeout
     this.startCallTimeoutTimer(30000, 'NO_ANSWER');
 
-    try {
-      await this.initLocalStream(type);
-      this.notify();
-      await this.initPeerConnection();
+    // 1. Send invite immediately over WebSocket so callee starts ringing right away
+    console.log('[CALL_TRACE][CLIENT_CALLER] Emitting call:invite event:', {
+      callId,
+      targetUserId: peerUserId,
+      recipientUserId: peerUserId,
+      callType: type,
+      wsReadyState: wsService.getState(),
+      hasLocalStream: !!this.localStream,
+    });
 
-      // Send invite
-      wsService.send({
-        type: 'call:invite',
-        callId,
-        targetUserId: peerUserId,
-        recipientUserId: peerUserId,
-        callType: type,
-      });
+    const sent = wsService.send({
+      type: 'call:invite',
+      callId,
+      targetUserId: peerUserId,
+      recipientUserId: peerUserId,
+      callType: type,
+    });
 
-      return true;
-    } catch (err: any) {
-      const userMessage = this.formatMediaErrorMessage(err);
+    if (!sent) {
+      console.error('[CALL_TRACE][CLIENT_CALLER] Failed to send call:invite over WebSocket (ws state:', wsService.getState(), ')');
       this.currentSession.state = 'failed';
-      this.currentSession.errorMessage = userMessage;
+      this.currentSession.errorMessage = 'Realtime connection is not active. Please reconnect.';
       this.notify();
-      setTimeout(() => this.cleanup(), 3000);
+      this.scheduleErrorCleanup(12000);
       return false;
     }
+
+    // 2. Concurrently acquire local media and initialize peer connection
+    (async () => {
+      try {
+        const { stream, fallbackToAudio, notice } = await this.acquireMediaWithFallback(type);
+        this.localStream = stream;
+
+        if (this.currentSession && this.currentSession.callId === callId) {
+          if (fallbackToAudio) {
+            this.currentSession.type = 'audio';
+            this.currentSession.isCameraOff = true;
+            this.currentSession.errorMessage = notice || null;
+          }
+          this.notify();
+        }
+
+        await this.initPeerConnection();
+      } catch (err: any) {
+        console.error('[CALL_TRACE][CLIENT_CALLER] Local media acquisition failed:', err);
+        const userMessage = this.formatMediaErrorMessage(err);
+
+        // Notify callee that call is cancelled due to caller media error
+        wsService.send({
+          type: 'call:cancel',
+          callId,
+          targetUserId: peerUserId,
+          reason: 'MEDIA_ERROR',
+        });
+
+        if (this.currentSession && this.currentSession.callId === callId) {
+          this.currentSession.state = 'failed';
+          this.currentSession.errorMessage = userMessage;
+          this.notify();
+          this.scheduleErrorCleanup(12000);
+        }
+      }
+    })();
+
+    return true;
   }
 
   public async acceptCall(): Promise<void> {
@@ -159,8 +267,16 @@ class CallingService {
     this.notify();
 
     try {
-      await this.initLocalStream(this.currentSession.type);
+      const { stream, fallbackToAudio, notice } = await this.acquireMediaWithFallback(this.currentSession.type);
+      this.localStream = stream;
+
+      if (fallbackToAudio && this.currentSession) {
+        this.currentSession.type = 'audio';
+        this.currentSession.isCameraOff = true;
+        this.currentSession.errorMessage = notice || null;
+      }
       this.notify();
+
       await this.initPeerConnection();
 
       wsService.send({
@@ -180,11 +296,20 @@ class CallingService {
         sdp: offer,
       });
     } catch (err: any) {
+      console.error('[CALL_TRACE][CLIENT_CALLEE] acceptCall media acquisition failed:', err);
       const userMessage = this.formatMediaErrorMessage(err);
+
+      wsService.send({
+        type: 'call:reject',
+        callId: this.currentSession.callId,
+        targetUserId: this.currentSession.peerUserId,
+        reason: 'MEDIA_ERROR',
+      });
+
       this.currentSession.state = 'failed';
       this.currentSession.errorMessage = userMessage;
       this.notify();
-      setTimeout(() => this.cleanup(), 3000);
+      this.scheduleErrorCleanup(12000);
     }
   }
 
@@ -198,7 +323,7 @@ class CallingService {
     });
     this.currentSession.state = 'declined';
     this.notify();
-    setTimeout(() => this.cleanup(), 1500);
+    this.scheduleErrorCleanup(2000);
   }
 
   public cancelCall(): void {
@@ -227,6 +352,23 @@ class CallingService {
       this.notify();
     }
     this.cleanup();
+  }
+
+  public dismissError(): void {
+    if (this.errorCleanupTimer) {
+      clearTimeout(this.errorCleanupTimer);
+      this.errorCleanupTimer = null;
+    }
+    this.cleanup();
+  }
+
+  private scheduleErrorCleanup(ms = 12000): void {
+    if (this.errorCleanupTimer) clearTimeout(this.errorCleanupTimer);
+    this.errorCleanupTimer = setTimeout(() => {
+      if (this.currentSession && (this.currentSession.state === 'failed' || this.currentSession.state === 'declined')) {
+        this.cleanup();
+      }
+    }, ms);
   }
 
   public toggleMute(): void {
@@ -387,6 +529,15 @@ class CallingService {
 
     switch (event.type) {
       case 'call:invite': {
+        // [CALL_TRACE] Client (callee): on receiving the incoming-call event
+        console.log('[CALL_TRACE][CLIENT_CALLEE] Received incoming call:invite event:', {
+          callId: event.callId,
+          senderUserId: event.senderUserId,
+          callerUserId: event.callerUserId,
+          peerName: event.peerName,
+          callType: event.callType,
+        });
+
         if (this.currentSession && this.currentSession.state !== 'idle') {
           wsService.send({
             type: 'call:reject',
@@ -492,7 +643,7 @@ class CallingService {
           this.currentSession.state = 'failed';
           this.currentSession.errorMessage = event.message || 'Call failed.';
           this.notify();
-          setTimeout(() => this.cleanup(), 3000);
+          this.scheduleErrorCleanup(12000);
         }
         break;
       }
@@ -563,23 +714,28 @@ class CallingService {
   private formatMediaErrorMessage(err: any): string {
     if (!err) return 'Call failed to initialize.';
     const name = err.name || '';
+    const msg = err.message || '';
     if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
-      return 'Camera or microphone permission was denied.';
+      return 'Camera or microphone access was denied. Please allow device permissions in your browser or system settings.';
     }
-    if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
-      return 'No camera or microphone found on your device.';
+    if (name === 'NotFoundError' || name === 'DevicesNotFoundError' || msg.includes('Requested device not found') || msg.includes('not found')) {
+      return 'No camera or microphone found on your device. Please connect a device to make calls.';
     }
-    if (name === 'NotReadableError' || name === 'TrackStartError') {
-      return 'Camera or microphone is already in use by another application.';
+    if (name === 'NotReadableError' || name === 'TrackStartError' || msg.includes('in use') || msg.includes('Could not start')) {
+      return 'Camera or microphone is already in use by another application. Please close other apps and try again.';
     }
     if (name === 'OverconstrainedError') {
-      return 'Requested video/audio settings are not supported by your camera.';
+      return 'Requested camera or microphone settings are not supported by your hardware.';
     }
-    return err.message || 'Media permission error.';
+    return msg || 'Unable to access media devices.';
   }
 
   private cleanup(): void {
     this.clearCallTimeoutTimer();
+    if (this.errorCleanupTimer) {
+      clearTimeout(this.errorCleanupTimer);
+      this.errorCleanupTimer = null;
+    }
     if (this.statsTimer) {
       clearInterval(this.statsTimer);
       this.statsTimer = null;

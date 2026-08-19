@@ -89,6 +89,8 @@ class WebSocketService {
       this.ws = socket;
 
       socket.onopen = () => {
+        // [CALL_TRACE] Client: on socket connect
+        console.log('[CALL_TRACE][CLIENT] WebSocket connected successfully:', { wsUrl, readyState: socket.readyState });
         this.reconnectAttempts = 0;
         this.updateState('CONNECTED');
         this.startHeartbeat();

@@ -25,10 +25,15 @@ export default defineConfig(() => {
         host: 'localhost',
         port: 3000,
       },
-      // Proxy /api requests to the Hono backend during development.
+      // Proxy /api and /ws requests to the Hono backend during development.
       proxy: {
         '/api': {
           target: 'http://localhost:4000',
+          changeOrigin: true,
+        },
+        '/ws': {
+          target: 'http://localhost:4000',
+          ws: true,
           changeOrigin: true,
         },
       },

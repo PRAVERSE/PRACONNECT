@@ -150,3 +150,15 @@ test('12. Regression Test: Camera toggle correctness (ON -> OFF -> ON)', async (
   assert.equal(mockCallingService.currentSession.isCameraOff, false);
   assert.equal(notified, true);
 });
+
+test('13. CallOverlay error state renders dismiss button and failure card', () => {
+  assert.match(source, /session\.state === 'failed'/);
+  assert.match(source, /onClick=\{\(\) => callingService\.dismissError\(\)\}/);
+  assert.match(source, />\s*Dismiss\s*<\/button>/);
+});
+
+test('14. CallOverlay renders non-blocking fallback banner when camera is unavailable', () => {
+  assert.match(source, /session\.errorMessage && \(session\.state === 'calling' \|\| session\.state === 'connecting' \|\| session\.state === 'connected'\)/);
+  assert.match(source, /<AlertCircle/);
+});
+

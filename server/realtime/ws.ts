@@ -424,8 +424,14 @@ async function handleClientEvent(ws: ExtWebSocket, userId: string, event: any): 
     }
 
     case 'call:invite': {
+      // [CALL_TRACE] Server: right when it receives the call-initiate event
+      console.log('[CALL_TRACE][SERVER] Received call:invite event from user:', userId, {
+        rawEvent: event,
+      });
+
       const targetId = (event.recipientUserId || event.targetUserId) as string | undefined;
       if (!targetId || typeof targetId !== 'string') {
+        console.warn('[CALL_TRACE][SERVER] call:invite rejected: INVALID_RECIPIENT');
         sendJson(ws, {
           type: 'error',
           code: 'INVALID_RECIPIENT',
@@ -435,6 +441,7 @@ async function handleClientEvent(ws: ExtWebSocket, userId: string, event: any): 
       }
 
       if (targetId === userId) {
+        console.warn('[CALL_TRACE][SERVER] call:invite rejected: CANNOT_CALL_SELF');
         sendJson(ws, {
           type: 'error',
           code: 'CANNOT_CALL_SELF',
@@ -444,6 +451,7 @@ async function handleClientEvent(ws: ExtWebSocket, userId: string, event: any): 
       }
 
       if (!isAcceptedFriendship(userId, targetId)) {
+        console.warn('[CALL_TRACE][SERVER] call:invite rejected: FRIENDSHIP_REQUIRED between', userId, 'and', targetId);
         sendJson(ws, {
           type: 'error',
           code: 'FRIENDSHIP_REQUIRED',
@@ -484,6 +492,14 @@ async function handleClientEvent(ws: ExtWebSocket, userId: string, event: any): 
         },
         peerName: callerProfile?.name || 'Friend',
       };
+
+      // [CALL_TRACE] Server: right when it attempts to relay/emit to the target socket (log whether socket was found)
+      const targetSockets = getUserConnections(targetId);
+      console.log('[CALL_TRACE][SERVER] Attempting relay to target user:', targetId, {
+        socketsFound: targetSockets.size > 0,
+        activeSocketCount: targetSockets.size,
+        callId,
+      });
 
       broadcastToUser(targetId, invitePayload);
       break;

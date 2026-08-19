@@ -1749,7 +1749,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setConnectionState(e.state as ConnectionState);
     });
 
-    const unsubReady = wsService.on('connection:ready', () => {
+    const unsubReady = wsService.on('connection:ready', (e) => {
+      // [CALL_TRACE] Client (callee/caller): on connection/room-join ready confirmation
+      console.log('[CALL_TRACE][CLIENT] connection:ready confirmed for authenticated user:', currentUser.id, {
+        payload: e,
+        role: currentUser.role,
+      });
+
       // Send sync request for active conversations on connect/reconnect
       const syncReq = conversations.map((c) => ({
         conversationId: conversationKeyFor(c.friendId, currentUser.id),

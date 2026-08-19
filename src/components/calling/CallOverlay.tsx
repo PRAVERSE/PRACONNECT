@@ -144,19 +144,41 @@ export const CallOverlay: React.FC = () => {
 
         {/* Remote avatar placeholder when camera is disabled or call is connecting */}
         {(!isVideoCall || !isConnected || !isRemoteVideoActive) && (
-          <div className="flex flex-col items-center justify-center p-6 text-center z-20">
-            <div className="w-24 h-24 sm:w-32 sm:h-32 rounded-full bg-[var(--emphasis-dim)] border border-[var(--border-hairline)] flex items-center justify-center text-3xl sm:text-5xl font-bold text-[var(--text-primary)] mb-4 shadow-2xl animate-pulse">
-              {session.peerName.charAt(0).toUpperCase()}
-            </div>
+          <div className="flex flex-col items-center justify-center p-6 text-center z-20 max-w-md mx-auto">
+            {session.state === 'failed' ? (
+              <div className="w-20 h-20 sm:w-24 sm:h-24 rounded-full bg-rose-500/20 border border-rose-500/30 flex items-center justify-center text-rose-400 mb-4 shadow-2xl animate-fade-in">
+                <AlertCircle className="w-10 h-10 sm:w-12 sm:h-12" />
+              </div>
+            ) : (
+              <div className="w-24 h-24 sm:w-32 sm:h-32 rounded-full bg-[var(--emphasis-dim)] border border-[var(--border-hairline)] flex items-center justify-center text-3xl sm:text-5xl font-bold text-[var(--text-primary)] mb-4 shadow-2xl animate-pulse">
+                {session.peerName.charAt(0).toUpperCase()}
+              </div>
+            )}
             <h2 className="font-display text-xl sm:text-2xl font-semibold text-[var(--text-primary)]">
-              {session.peerName}
+              {session.state === 'failed' ? 'Call Failed' : session.peerName}
             </h2>
-            <p className="text-sm text-[var(--text-tertiary)] mt-1">
+            <p className={`text-sm mt-2 leading-relaxed ${session.state === 'failed' ? 'text-rose-300 max-w-sm' : 'text-[var(--text-tertiary)]'}`}>
               {getStatusText()}
             </p>
+            {session.state === 'failed' && (
+              <button
+                onClick={() => callingService.dismissError()}
+                className="mt-6 px-6 py-2.5 rounded-full bg-white/15 hover:bg-white/25 text-white text-xs font-semibold uppercase tracking-wider transition-all border border-white/20 cursor-pointer shadow-lg hover:scale-105"
+              >
+                Dismiss
+              </button>
+            )}
           </div>
         )}
       </div>
+
+      {/* ─── NON-BLOCKING IN-CALL NOTICE (e.g. Camera unavailable fallback) ──── */}
+      {session.errorMessage && (session.state === 'calling' || session.state === 'connecting' || session.state === 'connected') && (
+        <div className="absolute top-20 left-1/2 -translate-x-1/2 z-40 bg-amber-500/20 border border-amber-500/40 text-amber-200 text-xs px-4 py-2 rounded-full backdrop-blur-md shadow-lg flex items-center gap-2 animate-fade-in">
+          <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+          <span>{session.errorMessage}</span>
+        </div>
+      )}
 
       {/* ─── 2. TOP-LEFT CALL PARTICIPANT & TIMER BADGE ───────────────────────── */}
       <div className="absolute top-5 left-5 sm:top-6 sm:left-6 z-30 flex items-center gap-3 bg-black/60 backdrop-blur-md px-4 py-2.5 rounded-full border border-white/10 shadow-xl">
