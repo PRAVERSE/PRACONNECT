@@ -11,6 +11,7 @@ import { SettingsView } from './components/views/SettingsView';
 import { ProfileView } from './components/views/ProfileView';
 import { AuthView } from './components/views/AuthView';
 import { RoomView } from './components/room/RoomView';
+import { LegalView } from './components/views/LegalView';
 
 import { CreateRoomModal } from './components/modals/CreateRoomModal';
 import { JoinRoomModal } from './components/modals/JoinRoomModal';
@@ -43,6 +44,7 @@ const MainContent: React.FC = () => {
         {activeTab === 'profile' && <ProfileView />}
         {activeTab === 'auth' && <AuthView />}
         {activeTab === 'room' && <RoomView />}
+        {activeTab === 'legal' && <LegalView />}
       </div>
     </main>
   );
@@ -116,7 +118,7 @@ const AppShell: React.FC = () => {
 };
 
 const AuthGate: React.FC = () => {
-  const { authState } = useApp();
+  const { authState, activeTab } = useApp();
 
   if (authState === 'loading') {
     return (
@@ -135,6 +137,14 @@ const AuthGate: React.FC = () => {
   }
 
   if (authState === 'unauthenticated') {
+    if (activeTab === 'legal') {
+      return (
+        <div className="viewport-fill flex flex-col w-full overflow-y-auto bg-[var(--bg-canvas)] text-[var(--text-primary)] font-sans antialiased relative transition-colors duration-200 px-4 sm:px-8 md:px-16 py-8 md:py-10">
+          <AmbientBackground />
+          <LegalView isStandalone />
+        </div>
+      );
+    }
     return <AuthView />;
   }
 

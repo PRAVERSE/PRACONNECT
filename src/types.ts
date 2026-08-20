@@ -8,7 +8,10 @@ export type NavigationTab =
   | 'settings'
   | 'profile'
   | 'room'
-  | 'auth';
+  | 'auth'
+  | 'legal';
+
+export type LegalTab = 'privacy' | 'terms';
 
 export type RoomCategory = 'Movie' | 'Gaming' | 'Study' | 'Music' | 'Other';
 export type RoomPrivacy = 'public' | 'private';

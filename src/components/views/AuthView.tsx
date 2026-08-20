@@ -34,7 +34,7 @@ type AuthMode =
   | 'new-password';
 
 export const AuthView: React.FC = () => {
-  const { login } = useApp();
+  const { login, openLegal } = useApp();
 
   const [mode, setMode] = useState<AuthMode>('login');
 
@@ -996,21 +996,50 @@ export const AuthView: React.FC = () => {
         )}
       </div>
 
-      {/* Bottom Footer Links */}
-      <footer className="flex items-center justify-center gap-4 text-[11px] text-[var(--text-muted)] pt-8">
-        <a href="#terms" onClick={(e) => e.preventDefault()} className="hover:text-[var(--text-primary)] transition-colors">
-          Terms
-        </a>
-        <span>•</span>
-        <a href="#privacy" onClick={(e) => e.preventDefault()} className="hover:text-[var(--text-primary)] transition-colors">
-          Privacy
-        </a>
-        <span>•</span>
-        <a href="#status" onClick={(e) => e.preventDefault()} className="hover:text-[var(--text-primary)] transition-colors flex items-center gap-1.5">
-          <span className="w-1.5 h-1.5 rounded-full bg-[var(--status-success,#10b981)]" />
-          Systems Normal
-        </a>
-      </footer>
+      {/* Bottom Legal Links & Status */}
+      <div className="flex flex-col items-center gap-2.5 pt-8">
+        <p className="text-[11px] text-[var(--text-tertiary)] text-center max-w-sm leading-relaxed">
+          By continuing, you agree to our{' '}
+          <button
+            type="button"
+            onClick={() => openLegal('terms')}
+            className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] underline cursor-pointer"
+          >
+            Terms &amp; Conditions
+          </button>{' '}
+          and{' '}
+          <button
+            type="button"
+            onClick={() => openLegal('privacy')}
+            className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] underline cursor-pointer"
+          >
+            Privacy Policy
+          </button>.
+        </p>
+
+        <footer className="flex items-center justify-center gap-4 text-[11px] text-[var(--text-muted)]">
+          <button
+            type="button"
+            onClick={() => openLegal('terms')}
+            className="hover:text-[var(--text-primary)] transition-colors cursor-pointer"
+          >
+            Terms &amp; Conditions
+          </button>
+          <span>•</span>
+          <button
+            type="button"
+            onClick={() => openLegal('privacy')}
+            className="hover:text-[var(--text-primary)] transition-colors cursor-pointer"
+          >
+            Privacy Policy
+          </button>
+          <span>•</span>
+          <span className="flex items-center gap-1.5 text-[var(--text-muted)]">
+            <span className="w-1.5 h-1.5 rounded-full bg-[var(--status-success,#10b981)]" />
+            Systems Normal
+          </span>
+        </footer>
+      </div>
     </div>
   );
 };

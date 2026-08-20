@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PraConnect — Privacy Policy & Terms</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap"
+    rel="stylesheet">
+  <style>
+    :root {
+      --bg: #08090B;
+      --panel: rgba(255, 255, 255, 0.028);
+      --panel-strong: rgba(255, 255, 255, 0.05);
+      --glass-border: rgba(255, 255, 255, 0.07);
+      --rule: rgba(255, 255, 255, 0.07);
+      --ink: #EDEEF0;
+      --ink-soft: #9DA2AB;
+      --ink-faint: #676B73;
+      --accent: #EDEDEF;
+      --accent-soft: rgba(255, 255, 255, 0.22);
+      --todo-bg: rgba(184, 134, 46, 0.10);
+      --todo-border: rgba(184, 134, 46, 0.45);
+      --todo-text: #E0AF5E;
+      --display: 'Space Grotesk', system-ui, sans-serif;
+      --body: 'Inter', system-ui, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--body);
+      -webkit-font-smoothing: antialiased;
+      position: relative;
+      overflow-x: hidden;
+    }
+
+    /* ambient glow blobs behind the glass panels */
+    body::before,
+    body::after {
+      content: "";
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(110px);
+      z-index: 0;
+      pointer-events: none;
+    }
+
+    body::before {
+      width: 520px;
+      height: 520px;
+      top: -160px;
+      left: -140px;
+      background: radial-gradient(circle, rgba(74, 222, 128, 0.14), transparent 70%);
+    }
+
+    body::after {
+      width: 560px;
+      height: 560px;
+      bottom: -200px;
+      right: -160px;
+      background: radial-gradient(circle, rgba(92, 122, 234, 0.13), transparent 70%);
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    header.top {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: rgba(8, 9, 11, 0.65);
+      backdrop-filter: blur(18px) saturate(140%);
+      -webkit-backdrop-filter: blur(18px) saturate(140%);
+      border-bottom: 1px solid var(--glass-border);
+      padding: 14px 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .brand {
+      font-family: var(--display);
+      font-weight: 700;
+      font-size: 16px;
+      letter-spacing: -0.01em;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .brand::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 10px var(--accent-soft);
+      display: inline-block;
+    }
+
+    nav.tabs {
+      display: flex;
+      gap: 4px;
+      background: var(--panel);
+      border: 1px solid var(--glass-border);
+      border-radius: 10px;
+      padding: 3px;
+      backdrop-filter: blur(10px);
+    }
+
+    nav.tabs button {
+      font-family: var(--body);
+      font-size: 13.5px;
+      font-weight: 500;
+      background: transparent;
+      color: var(--ink-soft);
+      border: 1px solid transparent;
+      border-radius: 7px;
+      padding: 6px 14px;
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+
+    nav.tabs button:hover {
+      color: var(--ink);
+    }
+
+    nav.tabs button.active {
+      color: var(--ink);
+      background: var(--panel-strong);
+      border-color: var(--glass-border);
+    }
+
+    main {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 40px 32px 80px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .glass-card {
+      background: var(--panel);
+      border: 1px solid var(--glass-border);
+      border-radius: 20px;
+      padding: 40px 48px;
+      backdrop-filter: blur(22px) saturate(160%);
+      -webkit-backdrop-filter: blur(22px) saturate(160%);
+      box-shadow: 0 8px 40px rgba(0, 0, 0, 0.35);
+    }
+
+    .doc {
+      display: none;
+    }
+
+    .doc.active {
+      display: block;
+    }
+
+    .doc-title {
+      font-family: var(--display);
+      font-weight: 700;
+      font-size: 26px;
+      letter-spacing: -0.015em;
+      margin: 0 0 3px;
+    }
+
+    .doc-sub {
+      color: var(--ink-faint);
+      font-size: 13px;
+      margin: 0 0 16px;
+    }
+
+    .todo-banner {
+      background: var(--todo-bg);
+      backdrop-filter: blur(10px);
+      border: 1px solid var(--todo-border);
+      border-radius: 10px;
+      padding: 11px 16px;
+      margin-bottom: 22px;
+      font-size: 12.5px;
+      color: var(--todo-text);
+      line-height: 1.5;
+    }
+
+    section {
+      margin-bottom: 18px;
+    }
+
+    h2 {
+      font-family: var(--display);
+      font-weight: 600;
+      font-size: 16px;
+      color: var(--ink);
+      margin: 0 0 8px;
+      padding-bottom: 5px;
+      border-bottom: 1px solid var(--rule);
+    }
+
+    h3 {
+      font-family: var(--display);
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--ink);
+      margin: 10px 0 4px;
+    }
+
+    p {
+      font-size: 14px;
+      line-height: 1.55;
+      color: var(--ink-soft);
+      margin: 0 0 8px;
+    }
+
+    ul {
+      margin: 0 0 8px;
+      padding-left: 18px;
+    }
+
+    li {
+      font-size: 14px;
+      line-height: 1.55;
+      color: var(--ink-soft);
+      margin-bottom: 3px;
+    }
+
+    strong {
+      color: var(--ink);
+      font-weight: 600;
+    }
+
+    mark.todo {
+      background: var(--todo-bg);
+      color: var(--todo-text);
+      border: 1px dashed var(--todo-border);
+      border-radius: 4px;
+      padding: 0 5px;
+      font-size: 0.88em;
+    }
+
+    footer.doc-footer {
+      border-top: 1px solid var(--rule);
+      padding-top: 10px;
+      margin-top: 20px;
+      font-size: 11px;
+      color: var(--ink-faint);
+    }
+
+    @media (max-width: 600px) {
+      header.top {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 12px;
+        padding: 14px 18px;
+      }
+
+      main {
+        padding: 20px 12px 60px;
+      }
+
+      .glass-card {
+        padding: 24px 20px;
+        border-radius: 16px;
+      }
+
+      .doc-title {
+        font-size: 24px;
+      }
+
+      body::before,
+      body::after {
+        width: 320px;
+        height: 320px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <header class="top">
+    <div class="brand">PraConnect</div>
+    <nav class="tabs">
+      <button class="active" onclick="switchDoc('privacy', this)">Privacy Policy</button>
+      <button onclick="switchDoc('terms', this)">Terms & Conditions</button>
+    </nav>
+  </header>
+
+  <main>
+    <div class="glass-card">
+
+      <!-- PRIVACY POLICY -->
+      <article class="doc active" id="doc-privacy">
+        <h1 class="doc-title">Privacy Policy</h1>
+        <p class="doc-sub">Last updated August 20, 2026</p>
+
+        <div class="todo-banner">
+          <strong>Legal review note:</strong> This draft reflects PraConnect's current product features and data flows.
+          Before public launch, confirm the legal entity/address, applicable jurisdiction, exact retention periods,
+          age/consent flow, hosting region, and specific third-party providers with qualified counsel.
+        </div>
+
+        <section>
+          <p>PraConnect ("PraConnect", "we", "us", or "our") operates the PraConnect application and website (the
+            "Service"). This Privacy Policy explains what information we collect, how we use it, how we protect it, and
+            the choices available to you.</p>
+          <p>By using the Service, you acknowledge the practices described in this policy.</p>
+        </section>
+
+        <section>
+          <h2>1. Information we collect</h2>
+          <h3>1.1 Account and profile information</h3>
+          <ul>
+            <li><strong>Name</strong> — used to create and display your profile.</li>
+            <li><strong>Email address</strong> — used for authentication, verification, and service communications. Your
+              email address is not displayed to other users through public profiles, search, friends, messaging, rooms,
+              or realtime events.</li>
+            <li><strong>Username, bio, and avatar</strong> — used to identify and present your profile.</li>
+            <li><strong>Session information</strong> — used to maintain secure authenticated access.</li>
+          </ul>
+
+          <h3>1.2 Friends and social activity</h3>
+          <ul>
+            <li>Friend requests, accepted friendships, room invitations, and related relationship state.</li>
+            <li>Online/offline presence and, where enabled, last-seen information.</li>
+          </ul>
+
+          <h3>1.3 Messages and shared files</h3>
+          <ul>
+            <li><strong>Direct messages</strong> — message content and metadata needed for messaging, delivery/read
+              state, synchronization, search, replies, edits, reactions, pins, stars, forwarding, and deletion features.
+            </li>
+            <li><strong>Chat attachments</strong> — images, videos, documents, and other supported files shared in
+              conversations.</li>
+            <li><strong>Room chat</strong> — messages and related room activity.</li>
+          </ul>
+
+          <h3>1.4 Media Library and watch rooms</h3>
+          <ul>
+            <li>Room membership, host/member state, room codes, invitations, playback state, and room chat.</li>
+            <li>Media metadata required for the Admin Media Library and room playback experience.</li>
+          </ul>
+
+          <h3>1.5 Calls and device permissions</h3>
+          <ul>
+            <li><strong>Camera</strong> — requested when you start or join a video call.</li>
+            <li><strong>Microphone</strong> — requested when you start or join an audio or video call.</li>
+            <li><strong>Call metadata</strong> — limited signaling information such as participants, call state,
+              timestamps, and duration may be processed to establish, secure, maintain, and troubleshoot calls.</li>
+          </ul>
+          <p>PraConnect does not intentionally record or store the audio or video content of 1-to-1 calls. WebRTC may
+            establish a direct peer connection or use a TURN relay when direct connectivity is unavailable.</p>
+
+          <h3>1.6 Realtime and notifications</h3>
+          <ul>
+            <li>WebSocket/SSE connection state used for messaging, presence, typing, room updates, and call signaling.
+            </li>
+            <li>Web Push subscription information when browser notifications are enabled.</li>
+          </ul>
+
+          <h3>1.7 Technical information</h3>
+          <ul>
+            <li>IP address and basic connection information needed to operate and secure the Service.</li>
+            <li>Browser/device and diagnostic information when needed for security, troubleshooting, or reliability.
+            </li>
+            <li>Operational logs needed to investigate errors, abuse, and service reliability.</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2>2. How we use information</h2>
+          <ul>
+            <li>Create, authenticate, and maintain accounts.</li>
+            <li>Provide profiles, friendships, messaging, rooms, media playback, and calling.</li>
+            <li>Deliver messages, invitations, notifications, and realtime updates.</li>
+            <li>Protect accounts, prevent abuse, enforce access controls, and maintain service security.</li>
+            <li>Troubleshoot reliability, performance, and technical issues.</li>
+            <li>Comply with applicable legal obligations.</li>
+          </ul>
+          <p>We do not sell your personal data to advertisers.</p>
+        </section>
+
+        <section>
+          <h2>3. Messages, media, and calls</h2>
+          <h3>3.1 Messages</h3>
+          <p>PraConnect stores direct messages so conversations, delivery/read states, synchronization, search, and
+            related features can work across sessions. PraConnect does not currently provide end-to-end encryption for
+            direct messages.</p>
+
+          <h3>3.2 Media</h3>
+          <p>Files shared in chat and videos published to the Media Library are stored as needed to provide those
+            features. Large Media Library videos are streamed using partial HTTP range requests rather than being fully
+            downloaded before playback.</p>
+
+          <h3>3.3 Calls</h3>
+          <p>PraConnect uses WebRTC for 1-to-1 audio and video calls. Signaling is handled through PraConnect's realtime
+            infrastructure. Network conditions may require a TURN relay to carry media traffic. PraConnect does not
+            intentionally record calls.</p>
+        </section>
+
+        <section>
+          <h2>4. Camera, microphone, and browser permissions</h2>
+          <ul>
+            <li>Camera and microphone access is requested only when a calling feature needs it.</li>
+            <li>PraConnect does not intentionally access the camera or microphone while the Service is closed.</li>
+            <li>You can revoke browser/device permissions at any time, although calling features may stop working.</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2>5. Sharing and service providers</h2>
+          <p>PraConnect may use third-party infrastructure for services such as email delivery, push delivery,
+            hosting/storage, network traversal or relay, and related operations. Those providers may process limited
+            information required to provide their services.</p>
+          <p>We do not sell chat content or call content to advertisers.</p>
+          <p>The final published policy should list the actual providers and legal entity responsible for PraConnect
+            once deployment details are finalized.</p>
+        </section>
+
+        <section>
+          <h2>6. Security</h2>
+          <ul>
+            <li>Data in transit is protected using HTTPS/TLS where supported by the Service.</li>
+            <li>Authenticated requests are protected by server-side session and authorization checks.</li>
+            <li>Private information such as email addresses is not included in public user objects or normal
+              social/realtime payloads.</li>
+            <li>Large media is streamed instead of being buffered as a complete file in application memory.</li>
+          </ul>
+          <p>No method of transmission or storage is completely secure, and we cannot guarantee absolute security.</p>
+        </section>
+
+        <section>
+          <h2>7. Data retention</h2>
+          <p>We retain information only for as long as reasonably necessary to provide the Service, maintain security,
+            comply with legal obligations, resolve disputes, and enforce our Terms.</p>
+          <ul>
+            <li>Account and profile information is generally retained while your account remains active.</li>
+            <li>Messages and shared content may remain until deleted, expired by a feature, or removed with the account,
+              subject to applicable legal and operational requirements.</li>
+            <li>Disappearing messages are removed according to the timer configured for the conversation.</li>
+            <li>Some security, audit, and backup records may persist for a limited additional period.</li>
+          </ul>
+          <p>Exact retention periods should be finalized before public launch.</p>
+        </section>
+
+        <section>
+          <h2>8. Your rights and choices</h2>
+          <p>Depending on where you live, you may have rights to access, correct, delete, or obtain a copy of your
+            personal data, withdraw consent where consent is the legal basis, and raise complaints with the applicable
+            data protection authority.</p>
+          <p>Privacy and account requests can be sent to <a
+              href="mailto:praverse.auth@gmail.com">praverse.auth@gmail.com</a>.</p>
+        </section>
+
+        <section>
+          <h2>9. Children and age requirements</h2>
+          <p>PraConnect must follow the minimum-age and consent requirements that apply in the user's jurisdiction. In
+            India, the Digital Personal Data Protection Act defines a child as a person who has not completed eighteen
+            years of age and requires verifiable parental or guardian consent for processing children's personal data,
+            subject to statutory exemptions. citeturn339637search19turn339637search20</p>
+          <p>The final PraConnect age gate and parental-consent flow should be confirmed and implemented before public
+            launch.</p>
+        </section>
+
+        <section>
+          <h2>10. International processing</h2>
+          <p>Your information may be processed in countries where PraConnect or its service providers operate, subject
+            to applicable data-transfer laws and safeguards.</p>
+          <p>The final published policy should identify the actual hosting/storage region and any material cross-border
+            transfer arrangements.</p>
+        </section>
+
+        <section>
+          <h2>11. Changes to this policy</h2>
+          <p>We may update this policy as the Service changes or legal requirements develop. We will update the "Last
+            updated" date when material changes are made.</p>
+        </section>
+
+        <section>
+          <h2>12. Contact</h2>
+          <p>Privacy questions: <a href="mailto:praverse.auth@gmail.com">praverse.auth@gmail.com</a></p>
+        </section>
+
+        <footer class="doc-footer">
+          This is a product-policy draft, not legal advice. Before public launch, have it reviewed by qualified counsel
+          for the jurisdictions in which PraConnect will operate.
+        </footer>
+      </article>
+
+      <!-- TERMS & CONDITIONS -->
+      <article class="doc" id="doc-terms">
+        <h1 class="doc-title">Terms & Conditions</h1>
+        <p class="doc-sub">Last updated August 20, 2026</p>
+
+        <section>
+          <p>Welcome to PraConnect. These Terms & Conditions ("Terms") govern your use of the PraConnect application and
+            website (the "Service"). By creating an account or using the Service, you agree to these Terms.</p>
+          <p>If you do not agree to these Terms, do not use the Service.</p>
+        </section>
+
+        <section>
+          <h2>1. Eligibility</h2>
+          <p>You may use PraConnect only if you meet the minimum-age and any parental-consent requirements that apply
+            where you live. Where applicable law requires verified parental or guardian consent, the Service must obtain
+            that consent before processing the relevant user's personal data.</p>
+        </section>
+
+        <section>
+          <h2>2. Account registration</h2>
+          <ul>
+            <li>Provide accurate information when creating or updating your account.</li>
+            <li>Use an email address you control for authentication and verification.</li>
+            <li>Keep your account credentials and session access secure.</li>
+            <li>Do not impersonate another person or misuse another user's account.</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2>3. Friends, messaging, rooms, and content</h2>
+          <ul>
+            <li>You are responsible for content you send through direct messages, room chat, attachments, and shared
+              media.</li>
+            <li>You may only access private conversations, rooms, media, and calling features you are authorized to
+              access.</li>
+            <li>Room hosts and participants must use shared content lawfully and respect other users' rights.</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2>4. Camera and microphone</h2>
+          <p>Certain features require camera and/or microphone access. You can deny or revoke permissions in your
+            browser or device settings. Revoking them may disable audio/video calling.</p>
+        </section>
+
+        <section>
+          <h2>5. Acceptable use</h2>
+          <p>You agree not to:</p>
+          <ul>
+            <li>Harass, threaten, abuse, or intentionally harm other users.</li>
+            <li>Share unlawful, defamatory, infringing, or otherwise prohibited content.</li>
+            <li>Record or distribute another person's audio/video without the consent required by applicable law.</li>
+            <li>Impersonate another person or misuse another user's account.</li>
+            <li>Attempt to bypass authentication, authorization, rate limits, or other security controls.</li>
+            <li>Interfere with the Service, its infrastructure, or another user's access.</li>
+            <li>Use the Service to distribute malware or other harmful code.</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2>6. Calls</h2>
+          <p>PraConnect provides 1-to-1 audio/video calls using WebRTC. Signaling and call authorization are handled by
+            PraConnect, while media may travel directly between participants or through a TURN relay when required by
+            network conditions.</p>
+          <p>PraConnect does not intentionally record or store call audio/video.</p>
+        </section>
+
+        <section>
+          <h2>7. User content and intellectual property</h2>
+          <p>You retain ownership of content you create, subject to rights others may have in that content.</p>
+          <p>You grant PraConnect the limited rights necessary to host, store, transmit, process, display, synchronize,
+            and deliver your content solely to operate the features you use.</p>
+          <p>PraConnect's software, branding, interface, and original materials remain protected by applicable
+            intellectual-property laws.</p>
+        </section>
+
+        <section>
+          <h2>8. Third-party services</h2>
+          <p>PraConnect may depend on third-party infrastructure for hosting, email delivery, push notifications,
+            network traversal/relay, storage, or other operational functions. Third-party availability and policies may
+            affect the Service.</p>
+        </section>
+
+        <section>
+          <h2>9. Suspension and termination</h2>
+          <p>PraConnect may restrict, suspend, or terminate access when reasonably necessary for security, abuse
+            prevention, legal compliance, serious violations of these Terms, or protection of other users and the
+            Service.</p>
+          <p>You may request account deletion by contacting <a
+              href="mailto:praverse.auth@gmail.com">praverse.auth@gmail.com</a>, subject to verification and applicable
+            legal/retention requirements.</p>
+        </section>
+
+        <section>
+          <h2>10. Service availability</h2>
+          <ul>
+            <li>The Service is provided on an "as available" basis.</li>
+            <li>We do not guarantee uninterrupted or error-free operation.</li>
+            <li>Network conditions, browsers, device permissions, third-party services, and maintenance may affect
+              availability.</li>
+          </ul>
+        </section>
+
+        <section>
+          <h2>11. Limitation of liability</h2>
+          <p>To the maximum extent permitted by applicable law, PraConnect will not be liable for indirect, incidental,
+            special, consequential, or similar losses arising from use of the Service, subject to any rights or remedies
+            that cannot lawfully be excluded.</p>
+        </section>
+
+        <section>
+          <h2>12. Indemnification</h2>
+          <p>To the extent permitted by applicable law, you agree to be responsible for claims or losses arising from
+            your unlawful use of the Service or violation of these Terms.</p>
+        </section>
+
+        <section>
+          <h2>13. Governing law</h2>
+          <p>The governing law and dispute venue must be finalized based on the legal entity operating PraConnect and
+            the jurisdictions in which the Service is offered.</p>
+        </section>
+
+        <section>
+          <h2>14. Changes to these Terms</h2>
+          <p>We may update these Terms as the Service or applicable law changes. Material updates will be reflected by
+            changing the "Last updated" date.</p>
+        </section>
+
+        <section>
+          <h2>15. Contact</h2>
+          <p>Questions about these Terms: <a href="mailto:praverse.auth@gmail.com">praverse.auth@gmail.com</a></p>
+        </section>
+
+        <footer class="doc-footer">
+          This is a product-policy draft, not legal advice. Before public launch, have it reviewed by qualified counsel
+          for the jurisdictions in which PraConnect will operate.
+        </footer>
+      </article>
+
+    </div>
+  </main>
+
+  <script>
+    function switchDoc(name, btn) {
+      document.querySelectorAll('nav.tabs button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      document.querySelectorAll('.doc').forEach(d => d.classList.remove('active'));
+      document.getElementById('doc-' + name).classList.add('active');
+      window.scrollTo({ top: 0, behavior: 'instant' });
+    }
+  </script>
+
+</body>
+
+</html>

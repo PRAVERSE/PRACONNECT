@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Check, ChevronDown } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, Shield, FileText } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { ToggleSwitch } from '../common/ToggleSwitch';
 import { PageHeader } from '../common/PageHeader';
@@ -7,7 +7,7 @@ import { GlassPanel } from '../common/GlassPanel';
 import { SectionLabel } from '../common/SectionLabel';
 
 export const SettingsView: React.FC = () => {
-  const { userSettings, updateSettings } = useApp();
+  const { userSettings, updateSettings, openLegal } = useApp();
   const [shortcutsModalOpen, setShortcutsModalOpen] = useState(false);
   const [savedMsg, setSavedMsg] = useState(false);
   const [requestsOpen, setRequestsOpen] = useState(false);
@@ -251,6 +251,55 @@ export const SettingsView: React.FC = () => {
                 }}
                 label="Default Mic Muted"
               />
+            </div>
+          </GlassPanel>
+        </section>
+
+        {/* ─── 5. LEGAL ───────────────────────────────────────────────────────── */}
+        <section style={{ animation: 'rise 640ms var(--ease) 460ms both' }}>
+          <SectionLabel>Legal</SectionLabel>
+
+          <GlassPanel className="p-4 sm:p-5 divide-y divide-[var(--border-hairline)]">
+            {/* Privacy Policy */}
+            <div className="pb-4 flex items-center justify-between gap-6">
+              <div className="min-w-0">
+                <div className="font-display text-[15px] font-semibold text-[var(--text-primary)] flex items-center gap-2">
+                  <Shield className="w-4 h-4 text-[var(--text-secondary)]" />
+                  <span>Privacy Policy</span>
+                </div>
+                <div className="text-xs text-[var(--text-secondary)] mt-0.5">
+                  Understand what data we collect, how it&apos;s used, and your rights
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => openLegal('privacy')}
+                className="btn-secondary text-xs px-4 py-2 shrink-0 flex items-center gap-1.5 cursor-pointer"
+              >
+                <span>View Policy</span>
+                <ChevronRight className="w-3.5 h-3.5 text-[var(--text-tertiary)]" />
+              </button>
+            </div>
+
+            {/* Terms & Conditions */}
+            <div className="pt-4 flex items-center justify-between gap-6">
+              <div className="min-w-0">
+                <div className="font-display text-[15px] font-semibold text-[var(--text-primary)] flex items-center gap-2">
+                  <FileText className="w-4 h-4 text-[var(--text-secondary)]" />
+                  <span>Terms &amp; Conditions</span>
+                </div>
+                <div className="text-xs text-[var(--text-secondary)] mt-0.5">
+                  Review terms of service, acceptable use, and platform guidelines
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => openLegal('terms')}
+                className="btn-secondary text-xs px-4 py-2 shrink-0 flex items-center gap-1.5 cursor-pointer"
+              >
+                <span>View Terms</span>
+                <ChevronRight className="w-3.5 h-3.5 text-[var(--text-tertiary)]" />
+              </button>
             </div>
           </GlassPanel>
         </section>

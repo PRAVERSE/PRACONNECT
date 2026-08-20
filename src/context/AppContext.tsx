@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import {
   NavigationTab,
+  LegalTab,
   RoomItem,
   RoomTab,
   Participant,
@@ -108,6 +109,8 @@ import { wsService, ConnectionState } from '../services/websocket';
 interface AppContextType {
   activeTab: NavigationTab;
   setActiveTab: (tab: NavigationTab) => void;
+  legalTab: LegalTab;
+  openLegal: (tab?: LegalTab) => void;
   
   // Auth state
   authState: 'loading' | 'authenticated' | 'unauthenticated';
@@ -427,7 +430,80 @@ function getPeerUserIdFromConversationKey(conversationId: string | undefined, cu
 }
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [activeTab, setActiveTab] = useState<NavigationTab>('dashboard');
+  // Parse initial route from URL for direct /legal access or refresh
+  const parseInitialRoute = (): { tab: NavigationTab; legalDoc: LegalTab } => {
+    try {
+      const path = window.location.pathname;
+      const search = new URLSearchParams(window.location.search);
+      const hash = window.location.hash;
+      if (path.startsWith('/legal') || hash === '#privacy' || hash === '#terms') {
+        const legalDoc: LegalTab =
+          search.get('tab') === 'terms' || path.includes('terms') || hash === '#terms'
+            ? 'terms'
+            : 'privacy';
+        return { tab: 'legal', legalDoc };
+      }
+    } catch {
+      // Fallback if window is undefined or parsing fails
+    }
+    return { tab: 'dashboard', legalDoc: 'privacy' };
+  };
+
+  const initialRoute = parseInitialRoute();
+  const [activeTab, setActiveTabState] = useState<NavigationTab>(initialRoute.tab);
+  const [legalTab, setLegalTab] = useState<LegalTab>(initialRoute.legalDoc);
+
+  const openLegal = useCallback((tab: LegalTab = 'privacy') => {
+    setLegalTab(tab);
+    setActiveTabState('legal');
+    try {
+      const url = `/legal?tab=${tab}`;
+      if (window.location.pathname !== '/legal' || new URLSearchParams(window.location.search).get('tab') !== tab) {
+        window.history.pushState({ tab: 'legal', legalTab: tab }, '', url);
+      }
+    } catch {
+      // Ignore history errors
+    }
+  }, []);
+
+  const setActiveTab = useCallback((tab: NavigationTab) => {
+    setActiveTabState(tab);
+    try {
+      if (tab === 'legal') {
+        window.history.pushState({ tab: 'legal', legalTab }, '', `/legal?tab=${legalTab}`);
+      } else if (window.location.pathname.startsWith('/legal')) {
+        window.history.pushState({ tab }, '', '/');
+      }
+    } catch {
+      // Ignore history errors
+    }
+  }, [legalTab]);
+
+  // Sync state when user navigates using browser back / forward buttons
+  useEffect(() => {
+    const handlePopState = () => {
+      try {
+        const path = window.location.pathname;
+        const search = new URLSearchParams(window.location.search);
+        const hash = window.location.hash;
+        if (path.startsWith('/legal') || hash === '#privacy' || hash === '#terms') {
+          const doc: LegalTab =
+            search.get('tab') === 'terms' || path.includes('terms') || hash === '#terms'
+              ? 'terms'
+              : 'privacy';
+          setLegalTab(doc);
+          setActiveTabState('legal');
+        } else {
+          setActiveTabState((prev) => (prev === 'legal' ? 'dashboard' : prev));
+        }
+      } catch {
+        // Ignore errors
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
   
   // Session & Authentication State
   const [authState, setAuthState] = useState<'loading' | 'authenticated' | 'unauthenticated'>('loading');
@@ -2427,6 +2503,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       value={{
         activeTab,
         setActiveTab,
+        legalTab,
+        openLegal,
         authState,
         isAuthenticated,
         currentUser,
