@@ -169,6 +169,12 @@ export interface ChatMediaAttachment {
   hasThumbnail?: boolean;
 }
 
+export interface MessageReactionGroup {
+  emoji: string;
+  count: number;
+  userIds: string[];
+}
+
 export interface DirectMessage {
   id: string;
   senderId: string;
@@ -194,6 +200,9 @@ export interface DirectMessage {
   expiresAt?: string | null;
   vanish?: boolean;
   reaction?: string | null;
+  reactions?: MessageReactionGroup[];
+  deliveredAt?: string | null;
+  readAt?: string | null;
 }
 
 export interface DMConversation {

@@ -244,11 +244,18 @@ class CallingService {
       return false;
     }
 
-    // 2. Concurrently acquire local media and initialize peer connection
+    // 2. Concurrently acquire local media and initialize peer connection + CREATE OFFER
     this.pcInitPromise = (async () => {
       try {
         const { stream, fallbackToAudio, notice } = await this.acquireMediaWithFallback(type);
         this.localStream = stream;
+
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('[CALL DEBUG] local tracks', {
+            audio: this.localStream.getAudioTracks().length,
+            video: this.localStream.getVideoTracks().length,
+          });
+        }
 
         if (this.currentSession && this.currentSession.callId === callId) {
           if (fallbackToAudio) {
@@ -264,12 +271,27 @@ class CallingService {
 
         await this.initPeerConnection();
 
-        // If an offer arrived while acquiring media/initializing PC, process it now
-        if (this.pendingOffer && this.currentSession && this.currentSession.callId === this.pendingOffer.callId) {
-          const offerToProcess = this.pendingOffer;
-          this.pendingOffer = null;
-          await this.handleOffer(offerToProcess);
+        if (!this.pc || !this.currentSession || this.currentSession.callId !== callId) return;
+
+        // Caller creates offer
+        const offer = await this.pc.createOffer();
+        await this.pc.setLocalDescription(offer);
+
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('[CALL DEBUG] Caller created offer:', {
+            callId,
+            targetUserId: peerUserId,
+            hasAudio: offer.sdp?.includes('m=audio'),
+            hasVideo: offer.sdp?.includes('m=video'),
+          });
         }
+
+        wsService.send({
+          type: 'sdp:offer',
+          callId,
+          targetUserId: peerUserId,
+          sdp: offer,
+        });
       } catch (err: any) {
         console.error('[CALL_TRACE][CLIENT_CALLER] Local media acquisition failed:', err);
         const userMessage = this.formatMediaErrorMessage(err);
@@ -302,12 +324,23 @@ class CallingService {
     this.clearCallTimeoutTimer();
     this.updateSession(() => ({ state: 'connecting' }), 'ACCEPT_CALL');
 
+    const callId = this.currentSession.callId;
+    const peerUserId = this.currentSession.peerUserId;
+
     this.pcInitPromise = (async () => {
       try {
         const { stream, fallbackToAudio, notice } = await this.acquireMediaWithFallback(this.currentSession!.type);
         this.localStream = stream;
 
-        if (this.currentSession) {
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('[CALL DEBUG] callee local media acquired');
+          console.log('[CALL DEBUG] local tracks', {
+            audio: this.localStream.getAudioTracks().length,
+            video: this.localStream.getVideoTracks().length,
+          });
+        }
+
+        if (this.currentSession && this.currentSession.callId === callId) {
           if (fallbackToAudio) {
             this.updateSession(() => ({
               type: 'audio',
@@ -319,35 +352,33 @@ class CallingService {
           }
         }
 
+        // Callee initializes RTCPeerConnection and adds its local tracks
         await this.initPeerConnection();
 
-        if (!this.currentSession) return;
+        if (!this.pc || !this.currentSession || this.currentSession.callId !== callId) return;
 
+        // Callee sends call:accept confirmation to caller
         wsService.send({
           type: 'call:accept',
-          callId: this.currentSession.callId,
-          targetUserId: this.currentSession.peerUserId,
+          callId,
+          targetUserId: peerUserId,
         });
 
-        // Callee creates offer
-        const offer = await this.pc!.createOffer();
-        await this.pc!.setLocalDescription(offer);
-
-        wsService.send({
-          type: 'sdp:offer',
-          callId: this.currentSession.callId,
-          targetUserId: this.currentSession.peerUserId,
-          sdp: offer,
-        });
+        // Callee processes caller's offer and generates SDP answer
+        if (this.pendingOffer && this.pendingOffer.callId === callId) {
+          const offerToProcess = this.pendingOffer;
+          this.pendingOffer = null;
+          await this.handleOffer(offerToProcess);
+        }
       } catch (err: any) {
         console.error('[CALL_TRACE][CLIENT_CALLEE] acceptCall media acquisition failed:', err);
         const userMessage = this.formatMediaErrorMessage(err);
 
-        if (this.currentSession) {
+        if (this.currentSession && this.currentSession.callId === callId) {
           wsService.send({
             type: 'call:reject',
-            callId: this.currentSession.callId,
-            targetUserId: this.currentSession.peerUserId,
+            callId,
+            targetUserId: peerUserId,
             reason: 'MEDIA_ERROR',
           });
 
@@ -447,20 +478,28 @@ class CallingService {
       this.localStream.getTracks().forEach((track) => {
         this.pc!.addTrack(track, this.localStream!);
       });
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[CALL DEBUG] local tracks added', {
+          audioSenders: this.pc.getSenders().filter((s) => s.track?.kind === 'audio').length,
+          videoSenders: this.pc.getSenders().filter((s) => s.track?.kind === 'video').length,
+        });
+      }
     }
 
     this.remoteStream = new MediaStream();
 
     this.pc.ontrack = (event) => {
       const roleTag = (this.role || 'PEER').toUpperCase();
-      console.log(`[CALL_TRACE][${roleTag}] pc.ontrack fired:`, {
-        role: this.role,
-        callId: this.currentSession?.callId,
-        kind: event.track?.kind,
-        readyState: event.track?.readyState,
-        trackId: event.track?.id,
-        streamId: event.streams?.[0]?.id,
-      });
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[CALL DEBUG] ontrack', {
+          callId: this.currentSession?.callId,
+          role: this.role,
+          kind: event.track?.kind,
+          streamCount: event.streams ? event.streams.length : 0,
+          trackId: event.track?.id,
+          readyState: event.track?.readyState,
+        });
+      }
 
       if (event.streams && event.streams[0]) {
         event.streams[0].getTracks().forEach((track) => {
@@ -592,10 +631,21 @@ class CallingService {
 
   private async handleOffer(event: any): Promise<void> {
     if (!this.pc || !this.currentSession || this.currentSession.callId !== event.callId) return;
-    console.log('[CALL_TRACE] Handling sdp:offer from peer:', event.senderUserId);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[CALL DEBUG] Callee handling sdp:offer from peer:', event.senderUserId);
+    }
     await this.setRemoteDescriptionAndDrainCandidates(event.sdp);
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[CALL DEBUG] Callee created answer:', {
+        callId: event.callId,
+        targetUserId: event.senderUserId,
+        hasAudio: answer.sdp?.includes('m=audio'),
+        hasVideo: answer.sdp?.includes('m=video'),
+      });
+    }
 
     wsService.send({
       type: 'sdp:answer',
@@ -683,9 +733,10 @@ class CallingService {
       }
 
       case 'sdp:offer': {
+        // Callee receives caller's SDP offer
         if (this.currentSession && this.currentSession.callId === event.callId) {
           if (!this.pc) {
-            console.log('[CALL_TRACE] Received sdp:offer before PC initialized, queueing offer');
+            console.log('[CALL DEBUG] Received sdp:offer before PC initialized, queueing offer');
             this.pendingOffer = event;
             if (this.pcInitPromise) {
               await this.pcInitPromise;
@@ -698,7 +749,11 @@ class CallingService {
       }
 
       case 'sdp:answer': {
+        // Caller receives callee's SDP answer
         if (this.currentSession && this.currentSession.callId === event.callId && this.pc) {
+          if (process.env.NODE_ENV !== 'production') {
+            console.log('[CALL DEBUG] Caller processing sdp:answer from callee');
+          }
           await this.setRemoteDescriptionAndDrainCandidates(event.sdp);
         }
         break;

@@ -15,6 +15,7 @@ import {
   isAcceptedFriendship,
   sendDirectMessage,
   editDirectMessage,
+  toggleMessageReaction,
   updateDeliveryWatermark,
   updateReadWatermark,
   syncMessagesAfterSequence,
@@ -41,8 +42,27 @@ export interface ActiveCallSession {
 /** Server-authoritative in-memory registry of active call sessions. */
 export const activeCallSessions = new Map<string, ActiveCallSession>();
 
+/** Sweep stale call sessions older than 5 minutes. */
+export function sweepStaleCallSessions(now = Date.now()): void {
+  for (const [callId, session] of activeCallSessions.entries()) {
+    if (now - session.createdAt > 300_000) {
+      activeCallSessions.delete(callId);
+    }
+  }
+}
+
 /** In-memory typing timeouts per user+conversation. */
 const typingTimeouts = new Map<string, NodeJS.Timeout>();
+
+/** Clean all typing timers associated with a specific user. */
+export function clearUserTypingTimers(userId: string): void {
+  for (const [key, timer] of typingTimeouts.entries()) {
+    if (key.startsWith(`${userId}:`)) {
+      clearTimeout(timer);
+      typingTimeouts.delete(key);
+    }
+  }
+}
 
 /** Bounded in-memory ephemeral store for vanish mode (non-durable across restarts). */
 const vanishSessions = new Map<string, DirectMessage[]>();
@@ -183,19 +203,26 @@ export function setupWebSocketServer(httpServer: HttpServer): WebSocketServer {
 
     ws.on('close', () => {
       if (ws.userId) {
-        unregisterConnection(ws.userId, ws);
+        const becameOffline = unregisterConnection(ws.userId, ws);
+        if (becameOffline) {
+          clearUserTypingTimers(ws.userId);
+        }
       }
     });
 
     ws.on('error', () => {
       if (ws.userId) {
-        unregisterConnection(ws.userId, ws);
+        const becameOffline = unregisterConnection(ws.userId, ws);
+        if (becameOffline) {
+          clearUserTypingTimers(ws.userId);
+        }
       }
     });
   });
 
-  // Heartbeat ping every 25s
+  // Heartbeat ping every 25s and sweep stale call sessions
   heartbeatInterval = setInterval(() => {
+    sweepStaleCallSessions();
     wss.clients.forEach((client: ExtWebSocket) => {
       if (client.isAlive === false) {
         if (client.userId) unregisterConnection(client.userId, client);
@@ -305,14 +332,16 @@ async function handleClientEvent(ws: ExtWebSocket, userId: string, event: any): 
 
       const seq = Number(throughSequenceId);
       if (Number.isInteger(seq) && seq > 0) {
-        updateDeliveryWatermark(userId, peerId, seq);
-        // Inform peer (sender) that recipient has delivered through sequenceId
-        broadcastToUser(peerId, {
-          type: 'message:delivery',
-          conversationId,
-          throughSequenceId: seq,
-          recipientId: userId,
-        });
+        const res = updateDeliveryWatermark(userId, peerId, seq);
+        if (res.ok && res.newWatermark === seq) {
+          // Inform peer (sender) that recipient has delivered through sequenceId
+          broadcastToUser(peerId, {
+            type: 'message:delivery',
+            conversationId,
+            throughSequenceId: seq,
+            recipientId: userId,
+          });
+        }
       }
       break;
     }
@@ -324,9 +353,9 @@ async function handleClientEvent(ws: ExtWebSocket, userId: string, event: any): 
 
       const seq = Number(throughSequenceId);
       if (Number.isInteger(seq) && seq > 0) {
-        updateReadWatermark(userId, peerId, seq);
+        const res = updateReadWatermark(userId, peerId, seq);
         const privacy = getUserPrivacySettings(userId);
-        if (privacy.readReceipts) {
+        if (res.ok && privacy.readReceipts && res.newWatermark === seq) {
           // Inform peer (sender) that recipient has read messages through sequenceId
           broadcastToUser(peerId, {
             type: 'messages:read',
@@ -414,12 +443,24 @@ async function handleClientEvent(ws: ExtWebSocket, userId: string, event: any): 
     }
 
     case 'message:reaction': {
-      const { conversationId, messageId, reaction } = event;
-      const peerId = getPeerUserIdFromConversation(conversationId, userId);
-      if (!peerId || !isAcceptedFriendship(userId, peerId)) return;
-      const payload = { type: 'message:reaction', conversationId, messageId, reaction, userId };
-      broadcastToUser(userId, payload);
-      broadcastToUser(peerId, payload);
+      const { messageId, emoji, reaction } = event;
+      const cleanEmoji = emoji || reaction;
+      if (!messageId || typeof cleanEmoji !== 'string') return;
+      const res = toggleMessageReaction(userId, messageId, cleanEmoji);
+      if (res.ok && res.conversationId) {
+        const peerId = res.peerId || getPeerUserIdFromConversation(res.conversationId, userId);
+        const payload = {
+          type: 'message:reaction',
+          conversationId: res.conversationId,
+          messageId,
+          emoji: res.emoji,
+          action: res.action,
+          reactions: res.reactions,
+          userId,
+        };
+        broadcastToUser(userId, payload);
+        if (peerId) broadcastToUser(peerId, payload);
+      }
       break;
     }
 

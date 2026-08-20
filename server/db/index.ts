@@ -9,9 +9,14 @@ const dbPath = process.env.DATABASE_PATH ?? path.join(process.cwd(), 'praconnect
 
 export const db = new Database(dbPath);
 
-// Enable WAL mode for better concurrent read performance
+// Enable WAL mode and high-performance settings
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+db.pragma('synchronous = NORMAL');
+db.pragma('temp_store = MEMORY');
+db.pragma('cache_size = -64000'); // 64MB memory page cache
+db.pragma('mmap_size = 268435456'); // 256MB memory mapped I/O
+db.pragma('busy_timeout = 5000'); // 5 second busy wait timeout
 
 // Helper to check existing table columns safely
 function getTableColumns(tableName: string): string[] {
@@ -30,6 +35,9 @@ if (existingUsersCols.length > 0) {
   }
   if (!existingUsersCols.includes('lastSeenAt')) {
     db.exec('ALTER TABLE users ADD COLUMN lastSeenAt TEXT');
+  }
+  if (!existingUsersCols.includes('bio')) {
+    db.exec('ALTER TABLE users ADD COLUMN bio TEXT');
   }
 }
 

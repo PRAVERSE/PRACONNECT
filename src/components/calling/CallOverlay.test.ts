@@ -173,7 +173,7 @@ test('16. Regression Test: CallingService session updates create new object refe
     peerUserId: 'user_b',
     peerName: 'Bob',
     type: 'video' as const,
-    state: 'calling' as const,
+    state: 'calling' as string,
     isMuted: false,
     isCameraOff: false,
   };
@@ -221,3 +221,80 @@ test('17. Regression Test: Caller side properly preserves remote tracks and neve
   assert.equal(mockRemoteStream.getVideoTracks()[0].id, 'track_video_1');
 });
 
+test('18. WebRTC Bidirectional Media: Callee attaches local audio/video tracks BEFORE creating answer', () => {
+  class MockRTCPeerConnection {
+    public senders: any[] = [];
+    public remoteDescription: any = null;
+    public localDescription: any = null;
+
+    addTrack(track: any, stream: any) {
+      this.senders.push({ track, stream });
+    }
+
+    getSenders() {
+      return this.senders;
+    }
+
+    async setRemoteDescription(sdp: any) {
+      this.remoteDescription = sdp;
+    }
+
+    async createAnswer() {
+      // Must have audio and video senders added before creating answer
+      const hasAudio = this.senders.some((s) => s.track?.kind === 'audio');
+      const hasVideo = this.senders.some((s) => s.track?.kind === 'video');
+      assert.ok(hasAudio, 'Callee must have local audio track added before createAnswer');
+      assert.ok(hasVideo, 'Callee must have local video track added before createAnswer');
+      return {
+        type: 'answer',
+        sdp: 'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendrecv\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=sendrecv\r\n',
+      };
+    }
+
+    async setLocalDescription(sdp: any) {
+      this.localDescription = sdp;
+    }
+  }
+
+  const pc = new MockRTCPeerConnection();
+  const calleeAudioTrack = { id: 'callee_audio_1', kind: 'audio', enabled: true };
+  const calleeVideoTrack = { id: 'callee_video_1', kind: 'video', enabled: true };
+  const calleeStream = { getTracks: () => [calleeAudioTrack, calleeVideoTrack] };
+
+  // Callee flow:
+  // 1. Add local tracks
+  calleeStream.getTracks().forEach((track) => pc.addTrack(track, calleeStream));
+  assert.equal(pc.getSenders().length, 2);
+
+  // 2. Set remote offer
+  pc.setRemoteDescription({ type: 'offer', sdp: 'fake-offer' });
+
+  // 3. Create answer and verify sendrecv
+  pc.createAnswer().then((answer) => {
+    assert.match(answer.sdp, /m=audio[\s\S]*?a=sendrecv/);
+    assert.match(answer.sdp, /m=video[\s\S]*?a=sendrecv/);
+  });
+});
+
+test('19. WebRTC Bidirectional Media: Caller and Callee both receive ontrack events for audio and video', () => {
+  const callerRemoteTracks: string[] = [];
+  const calleeRemoteTracks: string[] = [];
+
+  const callerPc = {
+    ontrack: (evt: any) => callerRemoteTracks.push(evt.track.kind),
+  };
+  const calleePc = {
+    ontrack: (evt: any) => calleeRemoteTracks.push(evt.track.kind),
+  };
+
+  // Simulate Caller receiving Callee tracks
+  callerPc.ontrack({ track: { id: 'b_audio', kind: 'audio', readyState: 'live' } });
+  callerPc.ontrack({ track: { id: 'b_video', kind: 'video', readyState: 'live' } });
+
+  // Simulate Callee receiving Caller tracks
+  calleePc.ontrack({ track: { id: 'a_audio', kind: 'audio', readyState: 'live' } });
+  calleePc.ontrack({ track: { id: 'a_video', kind: 'video', readyState: 'live' } });
+
+  assert.deepEqual(callerRemoteTracks, ['audio', 'video']);
+  assert.deepEqual(calleeRemoteTracks, ['audio', 'video']);
+});

@@ -247,3 +247,52 @@ export async function logoutApi(): Promise<void> {
     // Ignore network error on logout
   }
 }
+
+export interface UpdateProfileData {
+  name?: string;
+  username?: string;
+  avatar?: string;
+  avatarUrl?: string;
+  bio?: string;
+}
+
+export interface UpdateProfileResponse {
+  ok?: boolean;
+  user?: AuthUser;
+  profile?: {
+    name: string;
+    username: string;
+    avatar: string;
+    bio: string;
+    email: string;
+  };
+  error?: {
+    code: string;
+    message: string;
+  };
+}
+
+/** Update user profile via PATCH /api/profile */
+export async function updateProfileApi(data: UpdateProfileData): Promise<UpdateProfileResponse> {
+  try {
+    const res = await fetch('/api/profile', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(data),
+    });
+    const result = (await res.json().catch(() => ({}))) as UpdateProfileResponse;
+    if (!res.ok) {
+      return {
+        ok: false,
+        error: result.error || { code: 'UPDATE_FAILED', message: 'Failed to update profile.' },
+      };
+    }
+    return { ok: true, user: result.user, profile: result.profile };
+  } catch {
+    return {
+      ok: false,
+      error: { code: 'NETWORK_ERROR', message: 'Unable to connect to the server. Please check your connection.' },
+    };
+  }
+}

@@ -645,7 +645,10 @@ export const RoomView: React.FC = () => {
     };
   }, [mediaDiagnosticError, mediaErrorMessage, clearMediaError]);
 
-  // Reset video error when current media changes and verify URL reachability
+  // Diagnostic tracking for Room Media Playback Performance
+  const mediaSelectionTimeRef = useRef<number>(0);
+
+  // Reset video error when current media changes, verify reachability and track startup performance
   useEffect(() => {
     setVideoError(false);
     setVideoErrorInfo(null);
@@ -654,45 +657,86 @@ export const RoomView: React.FC = () => {
     setMovieSoundBlocked(false);
     setMovieAudioWarning(null);
 
-    if (currentRoom?.currentMedia?.url) {
-      const videoUrl = currentRoom.currentMedia.url;
-      const sameOrigin = isSameOrigin(videoUrl);
+    const media = currentRoom?.currentMedia;
+    if (!media) return;
+
+    mediaSelectionTimeRef.current = performance.now();
+
+    const isLibrary = media.mediaType === 'library' || Boolean(media.mediaId);
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[ROOM VIDEO DEBUG] currentMedia', {
+        mediaId: media.mediaId ?? null,
+        title: media.title ?? 'Untitled',
+        mimeType: media.mimeType ?? null,
+        mediaType: media.mediaType ?? null,
+        duration: media.duration ?? null,
+      });
+      if (isLibrary) {
+        console.log('[ROOM LIBRARY DEBUG] selected', {
+          mediaId: media.mediaId,
+          title: media.title,
+          status: 'ready',
+          published: true,
+        });
+      }
+      console.log('[ROOM MEDIA DEBUG] selected', {
+        mediaId: media.mediaId ?? null,
+        title: media.title ?? 'Untitled',
+        mimeType: media.mimeType ?? null,
+        mediaType: media.mediaType ?? null,
+        duration: media.duration ?? null,
+      });
+    }
+
+    const effectiveUrl =
+      isLibrary && media.mediaId
+        ? buildMediaDownloadUrl(media.mediaId)
+        : media.url;
+
+    if (effectiveUrl) {
+      if (process.env.NODE_ENV !== 'production') {
+        const elapsed = performance.now() - mediaSelectionTimeRef.current;
+        console.log('[ROOM VIDEO DEBUG] stream-url', {
+          mediaId: media.mediaId ?? null,
+          url: effectiveUrl,
+        });
+        if (isLibrary) {
+          console.log('[ROOM LIBRARY DEBUG] direct-stream', {
+            mediaId: media.mediaId,
+            url: effectiveUrl,
+          });
+          console.log('[ROOM LIBRARY DEBUG] conversion-bypassed');
+        }
+        console.log('[ROOM MEDIA DEBUG] source-ready', {
+          mediaId: media.mediaId ?? null,
+          elapsedMs: elapsed.toFixed(2),
+        });
+      }
+
+      const sameOrigin = isSameOrigin(effectiveUrl);
       const credentialsMode: RequestCredentials = sameOrigin ? 'include' : 'omit';
 
-      console.log('[Diagnostics] Movie URL:', videoUrl);
-      console.log('[VIDEO SOURCE]', {
-        src: videoUrl,
-        origin: window.location.origin,
-        isSameOrigin: sameOrigin,
-        credentialsMode,
-      });
-
-      fetch(videoUrl, {
-        method: 'HEAD',
-        credentials: credentialsMode,
-      })
-        .then((res) => {
-          console.log('[Diagnostics] Movie status:', res.status);
-          console.log('[Diagnostics] Movie content-type:', res.headers.get('content-type'));
-          console.log('[Diagnostics] Movie content-length:', res.headers.get('content-length'));
-          console.log('[Diagnostics] Movie accept-ranges:', res.headers.get('accept-ranges'));
-        })
-        .catch((err) => {
-          console.error('[Diagnostics] Movie request failed:', err);
-        });
-
-      fetch(videoUrl, {
+      fetch(effectiveUrl, {
         headers: { Range: 'bytes=0-1023' },
         credentials: credentialsMode,
       })
         .then((res) => {
-          console.log('[Media Range Check] status:', res.status, '(expect 206)');
-          console.log('  content-range:', res.headers.get('content-range'));
-          console.log('  accept-ranges:', res.headers.get('accept-ranges'));
+          if (process.env.NODE_ENV !== 'production') {
+            const elapsed = performance.now() - mediaSelectionTimeRef.current;
+            console.log('[ROOM MEDIA DEBUG] range-request', {
+              status: res.status,
+              contentRange: res.headers.get('content-range'),
+              acceptRanges: res.headers.get('accept-ranges'),
+              contentLength: res.headers.get('content-length'),
+              contentType: res.headers.get('content-type'),
+              elapsedMs: elapsed.toFixed(2),
+            });
+          }
         })
-        .catch((err) => console.warn('[Media Range Check failed]:', err));
+        .catch((err) => console.warn('[ROOM MEDIA DEBUG] Range check failed:', err));
     }
-  }, [currentRoom?.currentMedia?.url, currentRoom?.currentMedia?.title]);
+  }, [currentRoom?.currentMedia?.mediaId, currentRoom?.currentMedia?.url, currentRoom?.currentMedia?.title]);
 
   // Compute expected server playback position with elapsed time calculation
   const getExpectedServerPosition = (playback?: { isPlaying: boolean; position: number; updatedAt?: string }) => {
@@ -777,7 +821,7 @@ export const RoomView: React.FC = () => {
   // Phase C library media: the room stores only a mediaId reference; every
   // participant streams the playable MP4 through their own session.
   const mediaSrc =
-    currentRoom.currentMedia?.mediaType === 'library'
+    currentRoom.currentMedia?.mediaType === 'library' || Boolean(currentRoom.currentMedia?.mediaId)
       ? currentRoom.currentMedia.mediaId
         ? buildMediaDownloadUrl(currentRoom.currentMedia.mediaId)
         : ''
@@ -1347,12 +1391,47 @@ export const RoomView: React.FC = () => {
                       src={mediaSrc}
                       poster={currentRoom.currentMedia.poster}
                       className={`w-full h-full object-contain ${videoError ? 'opacity-20 blur-xs' : ''}`}
+                      preload="metadata"
+                      playsInline
                       onLoadStart={() => {
+                        if (process.env.NODE_ENV !== 'production') {
+                          console.log('[ROOM VIDEO DEBUG] loadstart', {
+                            src: videoRef.current?.src,
+                            currentSrc: videoRef.current?.currentSrc,
+                          });
+                        }
                         console.log('[Video] onLoadStart:', videoRef.current?.currentSrc);
                       }}
                       onLoadedMetadata={() => {
                         const v = videoRef.current;
                         if (v) {
+                          const elapsed = mediaSelectionTimeRef.current
+                            ? performance.now() - mediaSelectionTimeRef.current
+                            : 0;
+                          if (process.env.NODE_ENV !== 'production') {
+                            console.log('[ROOM VIDEO DEBUG] metadata', {
+                              duration: v.duration,
+                              videoWidth: v.videoWidth,
+                              videoHeight: v.videoHeight,
+                            });
+                            if (currentRoom?.currentMedia?.mediaType === 'library' || Boolean(currentRoom?.currentMedia?.mediaId)) {
+                              console.log('[ROOM LIBRARY DEBUG] metadata-loaded', {
+                                duration: v.duration,
+                                videoWidth: v.videoWidth,
+                                videoHeight: v.videoHeight,
+                                elapsedMs: elapsed.toFixed(2),
+                              });
+                            }
+                            console.log('[ROOM MEDIA DEBUG] metadata-loaded', {
+                              duration: v.duration,
+                              videoWidth: v.videoWidth,
+                              videoHeight: v.videoHeight,
+                              readyState: v.readyState,
+                              networkState: v.networkState,
+                              elapsedMs: elapsed.toFixed(2),
+                            });
+                          }
+
                           console.group('[Video] onLoadedMetadata');
                           console.log('  duration:', v.duration);
                           console.log('  videoWidth:', v.videoWidth);
@@ -1379,8 +1458,38 @@ export const RoomView: React.FC = () => {
                           }
                         }
                       }}
-                      onCanPlay={() => console.log('[Video] onCanPlay')}
+                      onCanPlay={() => {
+                        const elapsed = mediaSelectionTimeRef.current
+                          ? performance.now() - mediaSelectionTimeRef.current
+                          : 0;
+                        if (process.env.NODE_ENV !== 'production') {
+                          console.log('[ROOM VIDEO DEBUG] canplay', {
+                            readyState: videoRef.current?.readyState,
+                          });
+                          if (currentRoom?.currentMedia?.mediaType === 'library' || Boolean(currentRoom?.currentMedia?.mediaId)) {
+                            console.log('[ROOM LIBRARY DEBUG] first-frame', {
+                              source: 'canplay',
+                              elapsedMs: elapsed.toFixed(2),
+                            });
+                          }
+                          console.log('[ROOM MEDIA DEBUG] first-frame (canplay)', {
+                            elapsedMs: elapsed.toFixed(2),
+                          });
+                        }
+                        console.log('[Video] onCanPlay');
+                      }}
                       onPlaying={() => {
+                        const elapsed = mediaSelectionTimeRef.current
+                          ? performance.now() - mediaSelectionTimeRef.current
+                          : 0;
+                        if (process.env.NODE_ENV !== 'production') {
+                          console.log('[ROOM VIDEO DEBUG] playing', {
+                            currentTime: videoRef.current?.currentTime,
+                          });
+                          console.log('[ROOM MEDIA DEBUG] playing', {
+                            elapsedMs: elapsed.toFixed(2),
+                          });
+                        }
                         console.log('[Video] onPlaying');
                         setIsPlaying(true);
                         setVideoError(false);
@@ -1405,6 +1514,13 @@ export const RoomView: React.FC = () => {
                       onError={(event) => {
                         const video = event.currentTarget;
                         const error = video.error;
+
+                        if (process.env.NODE_ENV !== 'production') {
+                          console.log('[ROOM VIDEO DEBUG] error', {
+                            code: error?.code,
+                            message: error?.message,
+                          });
+                        }
 
                         console.error('[Diagnostics] VIDEO ERROR', {
                           code: error?.code,
@@ -1448,6 +1564,20 @@ export const RoomView: React.FC = () => {
                         }
                       }}
                       onLoadedData={() => {
+                        const elapsed = mediaSelectionTimeRef.current
+                          ? performance.now() - mediaSelectionTimeRef.current
+                          : 0;
+                        if (process.env.NODE_ENV !== 'production') {
+                          if (currentRoom?.currentMedia?.mediaType === 'library' || Boolean(currentRoom?.currentMedia?.mediaId)) {
+                            console.log('[ROOM LIBRARY DEBUG] first-frame', {
+                              source: 'loadeddata',
+                              elapsedMs: elapsed.toFixed(2),
+                            });
+                          }
+                          console.log('[ROOM MEDIA DEBUG] first-frame (loadeddata)', {
+                            elapsedMs: elapsed.toFixed(2),
+                          });
+                        }
                         setVideoError(false);
                         setVideoErrorInfo(null);
                       }}
@@ -1510,7 +1640,9 @@ export const RoomView: React.FC = () => {
                       </div>
                     )}
                   </>
-                ) : currentRoom.currentMedia ? (
+                ) : mediaConversion?.status === 'processing' && currentRoom.currentMedia?.mediaType !== 'library' ? (
+                  renderPreparingOverlay(mediaConversion.title)
+                ) : currentRoom.currentMedia && isRawMkvUrl(currentRoom.currentMedia?.url ?? '') ? (
                   /* A raw MKV should never reach <video src> — the server
                      publishes the converted MP4 only. If a legacy path ever
                      sets an MKV URL, show preparation status instead of the

@@ -62,6 +62,44 @@ interface UserRow {
   createdAt: string;
 }
 
+interface JoinedSessionRow {
+  s_id: string;
+  s_userId: string;
+  s_tokenHash: string;
+  s_expiresAt: string;
+  s_createdAt: string;
+  s_lastUsedAt: string;
+  u_id: string;
+  u_name: string;
+  u_username: string;
+  u_email: string;
+  u_avatarUrl: string | null;
+  u_emailVerified: number;
+  u_role: string;
+  u_createdAt: string;
+}
+
+// ─── Pre-compiled statements ──────────────────────────────────────────────────
+const insertSessionStmt = db.prepare(`
+  INSERT INTO sessions (id, userId, tokenHash, expiresAt, createdAt, lastUsedAt)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+
+const getSessionUserStmt = db.prepare<[string, string], JoinedSessionRow>(`
+  SELECT s.id AS s_id, s.userId AS s_userId, s.tokenHash AS s_tokenHash,
+         s.expiresAt AS s_expiresAt, s.createdAt AS s_createdAt, s.lastUsedAt AS s_lastUsedAt,
+         u.id AS u_id, u.name AS u_name, u.username AS u_username, u.email AS u_email,
+         u.avatarUrl AS u_avatarUrl, u.emailVerified AS u_emailVerified, u.role AS u_role,
+         u.createdAt AS u_createdAt
+  FROM sessions s
+  JOIN users u ON u.id = s.userId
+  WHERE s.tokenHash = ? AND s.expiresAt > ?
+`);
+
+const touchSessionStmt = db.prepare(`UPDATE sessions SET lastUsedAt = ? WHERE id = ?`);
+const deleteSessionStmt = db.prepare(`DELETE FROM sessions WHERE tokenHash = ?`);
+const deleteAllUserSessionsStmt = db.prepare(`DELETE FROM sessions WHERE userId = ?`);
+
 // ─── Session operations ──────────────────────────────────────────────────────
 
 /** Create a new session for a user. Returns the raw token to send as a cookie. */
@@ -71,48 +109,63 @@ export async function createSession(userId: string): Promise<string> {
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
 
-  db.prepare(`
-    INSERT INTO sessions (id, userId, tokenHash, expiresAt, createdAt, lastUsedAt)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(generateId(), userId, tokenHash, expiresAt, now, now);
+  insertSessionStmt.run(generateId(), userId, tokenHash, expiresAt, now, now);
 
   return token;
 }
 
-/** Look up a session by raw token. Updates lastUsedAt. Returns null if invalid/expired. */
+/** Look up a session by raw token. Updates lastUsedAt if stale (>60s). Returns null if invalid/expired. */
 export async function getSessionUser(
   token: string
 ): Promise<{ session: SessionRow; user: UserRow } | null> {
   const tokenHash = await sha256Hex(token);
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
 
-  const session = db
-    .prepare<string[], SessionRow>(`SELECT * FROM sessions WHERE tokenHash = ? AND expiresAt > ?`)
-    .get(tokenHash, now);
+  const row = getSessionUserStmt.get(tokenHash, now);
+  if (!row) return null;
 
-  if (!session) return null;
+  // Throttle touching lastUsedAt to avoid constant disk writes on read requests
+  const lastUsedMs = Date.parse(row.s_lastUsedAt);
+  if (isNaN(lastUsedMs) || nowMs - lastUsedMs > 60_000) {
+    try {
+      touchSessionStmt.run(now, row.s_id);
+    } catch {
+      // Ignore transient errors
+    }
+  }
 
-  // Touch lastUsedAt
-  db.prepare(`UPDATE sessions SET lastUsedAt = ? WHERE id = ?`).run(now, session.id);
-
-  const user = db
-    .prepare<string[], UserRow>(`SELECT * FROM users WHERE id = ?`)
-    .get(session.userId);
-
-  if (!user) return null;
-
-  return { session, user };
+  return {
+    session: {
+      id: row.s_id,
+      userId: row.s_userId,
+      tokenHash: row.s_tokenHash,
+      expiresAt: row.s_expiresAt,
+      createdAt: row.s_createdAt,
+      lastUsedAt: row.s_lastUsedAt,
+    },
+    user: {
+      id: row.u_id,
+      name: row.u_name,
+      username: row.u_username,
+      email: row.u_email,
+      avatarUrl: row.u_avatarUrl,
+      emailVerified: row.u_emailVerified,
+      role: row.u_role,
+      createdAt: row.u_createdAt,
+    },
+  };
 }
 
 /** Delete a specific session (logout). */
 export async function deleteSession(token: string): Promise<void> {
   const tokenHash = await sha256Hex(token);
-  db.prepare(`DELETE FROM sessions WHERE tokenHash = ?`).run(tokenHash);
+  deleteSessionStmt.run(tokenHash);
 }
 
 /** Delete ALL sessions for a user (e.g., after password reset). */
 export function deleteAllUserSessions(userId: string): void {
-  db.prepare(`DELETE FROM sessions WHERE userId = ?`).run(userId);
+  deleteAllUserSessionsStmt.run(userId);
 }
 
 // ─── Cookie helpers ──────────────────────────────────────────────────────────

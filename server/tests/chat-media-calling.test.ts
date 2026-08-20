@@ -1,6 +1,7 @@
 // server/tests/chat-media-calling.test.ts
 // Comprehensive integration test suite for 50 MB chat file sharing & 1-on-1 WebRTC video call signaling.
 
+import os from 'node:os';
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -8,32 +9,39 @@ import path from 'node:path';
 import http from 'node:http';
 import { Readable } from 'node:stream';
 import WebSocket from 'ws';
-import { createApp } from '../app';
-import { db } from '../db/index';
-import { generateId } from '../auth/auth';
-import { setupWebSocketServer, closeWebSocketServer } from '../realtime/ws';
-import {
+import { serve } from '@hono/node-server';
+
+const TMP_ROOT = path.join(os.tmpdir(), `praconnect-cmc-${process.pid}-${Date.now()}`);
+fs.mkdirSync(TMP_ROOT, { recursive: true });
+
+process.env.NODE_ENV = 'test';
+process.env.DATABASE_PATH = path.join(TMP_ROOT, 'test.db');
+process.env.CHAT_MEDIA_STORAGE_DIR = path.join(TMP_ROOT, 'uploads_chat');
+
+const { db, closeDatabase } = await import('../db/index');
+const { createApp } = await import('../app');
+const { generateId } = await import('../auth/auth');
+const { setupWebSocketServer, closeWebSocketServer } = await import('../realtime/ws');
+const {
   startChatMediaUpload,
   uploadChatMediaChunk,
   completeChatMediaUpload,
   readChatMediaStream,
   checkAndCleanupUnreferencedMedia,
   CHAT_MAX_FILE_SIZE_BYTES,
-} from '../social/mediaService';
-import {
+} = await import('../social/mediaService');
+const {
   sendDirectMessage,
   forwardMessage,
   deleteMessageForEveryone,
-} from '../social/service';
+} = await import('../social/service');
+const { createSession, SESSION_COOKIE_NAME } = await import('../auth/session');
 
-const TEST_DIR = path.join(process.cwd(), 'uploads', 'test_chat_media_calling');
-process.env.CHAT_MEDIA_STORAGE_DIR = TEST_DIR;
+const TEST_DIR = process.env.CHAT_MEDIA_STORAGE_DIR!;
 
 let server: http.Server;
 let baseUrl: string;
 let wsUrl: string;
-
-import { createSession, SESSION_COOKIE_NAME } from '../auth/session';
 
 async function createTestUser(id: string, name: string, username: string, email: string) {
   db.prepare(
@@ -60,8 +68,6 @@ let userA: TestUser;
 let userB: TestUser;
 let userC: TestUser;
 
-import { serve } from '@hono/node-server';
-
 before(async () => {
   await fs.promises.mkdir(TEST_DIR, { recursive: true });
   const app = createApp();
@@ -81,7 +87,10 @@ before(async () => {
 after(async () => {
   closeWebSocketServer();
   await new Promise<void>((resolve) => server.close(() => resolve()));
-  await fs.promises.rm(TEST_DIR, { recursive: true, force: true }).catch(() => {});
+  try {
+    closeDatabase?.();
+  } catch {}
+  await fs.promises.rm(TMP_ROOT, { recursive: true, force: true }).catch(() => {});
 });
 
 describe('Chat File Sharing (50 MB Limit) Tests', () => {

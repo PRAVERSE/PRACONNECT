@@ -304,35 +304,42 @@ export interface FriendListItem {
   currentRoomName: string | null;
 }
 
+// ─── Pre-compiled statements for social service ──────────────────────────────
+const listFriendsWithPresenceStmt = db.prepare<[string, string, string], {
+  friendshipId: string;
+  requesterId: string;
+  recipientId: string;
+  uid: string;
+  name: string;
+  username: string;
+  avatarUrl: string | null;
+  currentRoomCode: string | null;
+  currentRoomName: string | null;
+}>(`
+  SELECT f.id AS friendshipId, f.requesterId, f.recipientId,
+         u.id AS uid, u.name, u.username, u.avatarUrl,
+         r.code AS currentRoomCode, r.name AS currentRoomName
+  FROM friendships f
+  JOIN users u ON u.id = CASE WHEN f.requesterId = ? THEN f.recipientId ELSE f.requesterId END
+  LEFT JOIN roomMembers m ON m.userId = u.id AND m.leftAt IS NULL
+  LEFT JOIN rooms r ON r.id = m.roomId AND r.emptySince IS NULL
+  WHERE f.status = 'accepted' AND (f.requesterId = ? OR f.recipientId = ?)
+`);
+
 /** Accepted friends with live presence (active room membership). */
 export function listFriends(userId: string): FriendListItem[] {
-  const rows = db
-    .prepare(
-      `SELECT f.*, u.id AS uid, u.name, u.username, u.avatarUrl
-       FROM friendships f
-       JOIN users u ON (f.requesterId = u.id AND f.requesterId != ?) OR (f.recipientId = u.id AND f.recipientId != ?)
-       WHERE f.status = 'accepted' AND (f.requesterId = ? OR f.recipientId = ?)`
-    )
-    .all(userId, userId, userId, userId) as (FriendshipRow & UserRow)[];
+  const rows = listFriendsWithPresenceStmt.all(userId, userId, userId);
 
   return rows.map((row) => {
     const otherId = row.requesterId === userId ? row.recipientId : row.requesterId;
-    const presence = db
-      .prepare(
-        `SELECT r.code, r.name FROM roomMembers m
-         JOIN rooms r ON r.id = m.roomId
-         WHERE m.userId = ? AND m.leftAt IS NULL AND r.emptySince IS NULL
-         LIMIT 1`
-      )
-      .get(otherId) as { code: string; name: string } | undefined;
     return {
       id: otherId,
       name: row.name,
       username: row.username,
       avatar: row.avatarUrl ?? row.name.charAt(0).toUpperCase(),
-      online: Boolean(presence),
-      currentRoomCode: presence?.code ?? null,
-      currentRoomName: presence?.name ?? null,
+      online: Boolean(row.currentRoomCode) || isUserOnlineNow(otherId),
+      currentRoomCode: row.currentRoomCode ?? null,
+      currentRoomName: row.currentRoomName ?? null,
     };
   });
 }
@@ -396,6 +403,12 @@ export function conversationIdFor(a: string, b: string): string {
   return a < b ? `${a}:${b}` : `${b}:${a}`;
 }
 
+export interface MessageReactionGroup {
+  emoji: string;
+  count: number;
+  userIds: string[];
+}
+
 export interface DirectMessage {
   id: string;
   senderId: string;
@@ -423,6 +436,7 @@ export interface DirectMessage {
   editedAt?: string | null;
   expiresAt?: string | null;
   vanish?: boolean;
+  reactions?: MessageReactionGroup[];
 }
 
 export interface ConversationSummary {
@@ -499,13 +513,55 @@ export function getMessageAccess(userId: string, messageId: string): MessageAcce
  *  sendDirectMessage / listDirectMessages. Conversations deleted for the
  *  current user are hidden; per-user settings (pinned/archived/favourite/
  *  locked/unread) ride along. Pinned conversations sort above the rest. */
-export function listConversations(userId: string): ConversationSummary[] {
-  const peerRows = db
-    .prepare(
-      `SELECT DISTINCT CASE WHEN senderId = ? THEN recipientId ELSE senderId END AS peerId
-       FROM directMessages WHERE senderId = ? OR recipientId = ?`
+// ─── Pre-compiled statements for conversations ────────────────────────────────
+const findPeersWithMessagesStmt = db.prepare<[string, string, string], { peerId: string }>(`
+  SELECT DISTINCT CASE WHEN senderId = ? THEN recipientId ELSE senderId END AS peerId
+  FROM directMessages WHERE senderId = ? OR recipientId = ?
+`);
+
+const getConversationDeletionStmt = db.prepare<[string, string], { 1: number }>(
+  'SELECT 1 FROM conversationDeletions WHERE userId = ? AND conversationId = ?'
+);
+
+const getLastMessageInConversationStmt = db.prepare<[string, string], Pick<DirectMessageRow, 'text' | 'senderId' | 'createdAt' | 'deletedForEveryone' | 'sequenceId'>>(`
+  SELECT dm.text, dm.senderId, dm.createdAt, dm.deletedForEveryone, dm.sequenceId
+  FROM directMessages dm
+  WHERE dm.conversationId = ?
+    AND NOT EXISTS (
+      SELECT 1 FROM messageDeletions md
+      WHERE md.messageId = dm.id AND md.userId = ?
     )
-    .all(userId, userId, userId) as { peerId: string }[];
+  ORDER BY COALESCE(dm.sequenceId, 0) DESC, dm.createdAt DESC LIMIT 1
+`);
+
+const getPeerRoomPresenceStmt = db.prepare<[string], { 1: number }>(`
+  SELECT 1 FROM roomMembers m JOIN rooms r ON r.id = m.roomId
+  WHERE m.userId = ? AND m.leftAt IS NULL AND r.emptySince IS NULL LIMIT 1
+`);
+
+const getConversationSettingsStmt = db.prepare<[string, string], ConversationSettingsRow>(
+  'SELECT * FROM conversationUserSettings WHERE userId = ? AND conversationId = ?'
+);
+
+const getUnreadCountStmt = db.prepare<[string, string, string, string | null, string | null], { n: number }>(`
+  SELECT COUNT(*) AS n FROM directMessages dm
+  WHERE dm.senderId = ? AND dm.recipientId = ? AND dm.deletedForEveryone = 0
+    AND NOT EXISTS (
+      SELECT 1 FROM messageDeletions md
+      WHERE md.messageId = dm.id AND md.userId = ?
+    )
+    AND (? IS NULL OR dm.createdAt > ?)
+`);
+
+/** Accepted-friends-only conversation list. Historical messages from a
+ *  relationship that is no longer accepted are never surfaced here — a
+ *  stranger (or a user with a pending/rejected friendship) must not be able to
+ *  infer a conversation existed. Sending is separately enforced in
+ *  sendDirectMessage / listDirectMessages. Conversations deleted for the
+ *  current user are hidden; per-user settings (pinned/archived/favourite/
+ *  locked/unread) ride along. Pinned conversations sort above the rest. */
+export function listConversations(userId: string): ConversationSummary[] {
+  const peerRows = findPeersWithMessagesStmt.all(userId, userId, userId);
 
   const summaries: ConversationSummary[] = [];
   for (const { peerId } of peerRows) {
@@ -513,34 +569,20 @@ export function listConversations(userId: string): ConversationSummary[] {
     const peer = getUserById(peerId);
     if (!peer) continue;
     const conversationId = conversationIdFor(userId, peerId);
-    const hidden = db.prepare('SELECT 1 FROM conversationDeletions WHERE userId = ? AND conversationId = ?').get(userId, conversationId);
+    const hidden = getConversationDeletionStmt.get(userId, conversationId);
     if (hidden) continue;
 
-    const last = db
-      .prepare(
-        `SELECT text, senderId, createdAt, deletedForEveryone, sequenceId FROM directMessages
-         WHERE conversationId = ?
-         ORDER BY COALESCE(sequenceId, 0) DESC, createdAt DESC LIMIT 1`
-      )
-      .get(conversationId) as Pick<DirectMessageRow, 'text' | 'senderId' | 'createdAt' | 'deletedForEveryone' | 'sequenceId'> | undefined;
-    const presence = db
-      .prepare(
-        `SELECT 1 FROM roomMembers m JOIN rooms r ON r.id = m.roomId
-         WHERE m.userId = ? AND m.leftAt IS NULL AND r.emptySince IS NULL LIMIT 1`
-      )
-      .get(peerId);
+    const last = getLastMessageInConversationStmt.get(conversationId, userId);
+    const presence = getPeerRoomPresenceStmt.get(peerId);
+    const settings = getConversationSettingsStmt.get(userId, conversationId);
 
-    const settings = db
-      .prepare('SELECT * FROM conversationUserSettings WHERE userId = ? AND conversationId = ?')
-      .get(userId, conversationId) as ConversationSettingsRow | undefined;
-
-    const unread = (db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM directMessages
-         WHERE senderId = ? AND recipientId = ? AND deletedForEveryone = 0
-           AND (? IS NULL OR createdAt > ?)`
-      )
-      .get(peerId, userId, settings?.lastReadAt ?? null, settings?.lastReadAt ?? null) as { n: number }).n;
+    const unread = getUnreadCountStmt.get(
+      peerId,
+      userId,
+      userId,
+      settings?.lastReadAt ?? null,
+      settings?.lastReadAt ?? null
+    )?.n ?? 0;
 
     summaries.push({
       friendId: peerId,
@@ -637,26 +679,38 @@ export function listDirectMessages(
   };
 }
 
+// ─── Pre-compiled statements for direct messages & reactions ─────────────────
+const getDmOriginStmt = db.prepare<[string], Pick<DirectMessageRow, 'id' | 'senderId' | 'text' | 'createdAt' | 'deletedForEveryone'>>(`
+  SELECT id, senderId, text, createdAt, deletedForEveryone FROM directMessages WHERE id = ?
+`);
+
+const getDmDeletedForMeStmt = db.prepare<[string, string], { 1: number }>(`
+  SELECT 1 FROM messageDeletions WHERE messageId = ? AND userId = ?
+`);
+
+const getChatMediaAttachmentStmt = db.prepare<[string], { id: string; originalName: string; mimeType: string; sizeBytes: number; thumbnailKey: string | null }>(`
+  SELECT id, originalName, mimeType, sizeBytes, thumbnailKey FROM chatMedia WHERE id = ?
+`);
+
+const getMessageReactionsStmt = db.prepare<[string], { emoji: string; userId: string; createdAt: string }>(`
+  SELECT emoji, userId, createdAt FROM messageReactions WHERE messageId = ? ORDER BY createdAt ASC
+`);
+
+const getMaxSequenceInConversationStmt = db.prepare<[string], { maxSeq: number | null }>(`
+  SELECT MAX(sequenceId) AS maxSeq FROM directMessages WHERE conversationId = ?
+`);
+
 function mapDirectMessage(userId: string, row: DirectMessageRow): DirectMessage {
-  const replyRow = row.replyToMessageId
-    ? (db.prepare('SELECT id, senderId, text, createdAt, deletedForEveryone FROM directMessages WHERE id = ?').get(row.replyToMessageId) as
-        | Pick<DirectMessageRow, 'id' | 'senderId' | 'text' | 'createdAt' | 'deletedForEveryone'>
-        | undefined)
-    : undefined;  const replyDeletedForMe = row.replyToMessageId
-    ? Boolean(db.prepare('SELECT 1 FROM messageDeletions WHERE messageId = ? AND userId = ?').get(row.replyToMessageId, userId))
+  const replyRow = row.replyToMessageId ? getDmOriginStmt.get(row.replyToMessageId) : undefined;
+  const replyDeletedForMe = row.replyToMessageId
+    ? Boolean(getDmDeletedForMeStmt.get(row.replyToMessageId, userId))
     : false;
-  const fwdRow = row.forwardedFromMessageId
-    ? (db.prepare('SELECT id, senderId, text, createdAt, deletedForEveryone FROM directMessages WHERE id = ?').get(row.forwardedFromMessageId) as
-        | Pick<DirectMessageRow, 'id' | 'senderId' | 'text' | 'createdAt' | 'deletedForEveryone'>
-        | undefined)
-    : undefined;
+  const fwdRow = row.forwardedFromMessageId ? getDmOriginStmt.get(row.forwardedFromMessageId) : undefined;
   const fwdDeletedForMe = row.forwardedFromMessageId
-    ? Boolean(db.prepare('SELECT 1 FROM messageDeletions WHERE messageId = ? AND userId = ?').get(row.forwardedFromMessageId, userId))
+    ? Boolean(getDmDeletedForMeStmt.get(row.forwardedFromMessageId, userId))
     : false;
   const attachmentRow = (row as any).attachmentId
-    ? (db
-        .prepare('SELECT id, originalName, mimeType, sizeBytes, thumbnailKey FROM chatMedia WHERE id = ?')
-        .get((row as any).attachmentId) as { id: string; originalName: string; mimeType: string; sizeBytes: number; thumbnailKey: string | null } | undefined)
+    ? getChatMediaAttachmentStmt.get((row as any).attachmentId)
     : undefined;
 
   return {
@@ -684,6 +738,7 @@ function mapDirectMessage(userId: string, row: DirectMessageRow): DirectMessage 
     editedAt: (row as any).editedAt ?? null,
     expiresAt: (row as any).expiresAt ?? null,
     vanish: Boolean((row as any).vanish),
+    reactions: getMessageReactions(row.id),
   };
 }
 
@@ -914,6 +969,79 @@ export function listStarredMessages(userId: string): StarredMessageItem[] {
     }));
 }
 
+// ─── Message reactions ───────────────────────────────────────────────────────
+
+export function getMessageReactions(messageId: string): MessageReactionGroup[] {
+  try {
+    const rows = getMessageReactionsStmt.all(messageId);
+
+    const groups = new Map<string, string[]>();
+    for (const row of rows) {
+      const list = groups.get(row.emoji) ?? [];
+      list.push(row.userId);
+      groups.set(row.emoji, list);
+    }
+
+    return Array.from(groups.entries()).map(([emoji, userIds]) => ({
+      emoji,
+      count: userIds.length,
+      userIds,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export interface ToggleReactionResult {
+  ok: boolean;
+  action?: 'added' | 'removed';
+  reactions?: MessageReactionGroup[];
+  conversationId?: string;
+  messageId?: string;
+  emoji?: string;
+  userId?: string;
+  peerId?: string;
+  error?: SocialError;
+}
+
+export function toggleMessageReaction(userId: string, messageId: string, emoji: string): ToggleReactionResult {
+  const cleanEmoji = typeof emoji === 'string' ? emoji.trim() : '';
+  if (!cleanEmoji || cleanEmoji.length > 8) {
+    return { ok: false, error: Errors.validation('Invalid emoji reaction.') };
+  }
+
+  const access = getMessageAccess(userId, messageId);
+  if (!access.ok) return { ok: false, error: access.error };
+
+  const existing = db
+    .prepare('SELECT id FROM messageReactions WHERE messageId = ? AND userId = ? AND emoji = ?')
+    .get(messageId, userId, cleanEmoji) as { id: string } | undefined;
+
+  let action: 'added' | 'removed';
+  if (existing) {
+    db.prepare('DELETE FROM messageReactions WHERE id = ?').run(existing.id);
+    action = 'removed';
+  } else {
+    const id = generateId();
+    db.prepare(
+      'INSERT INTO messageReactions (id, messageId, conversationId, userId, emoji, createdAt) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(id, messageId, access.conversationId, userId, cleanEmoji, nowIso());
+    action = 'added';
+  }
+
+  const reactions = getMessageReactions(messageId);
+  return {
+    ok: true,
+    action,
+    reactions,
+    conversationId: access.conversationId,
+    messageId,
+    emoji: cleanEmoji,
+    userId,
+    peerId: access.peerId,
+  };
+}
+
 // ─── Delete for me / for everyone ────────────────────────────────────────────
 
 /** Delete-for-me only hides the message for the acting user; the other
@@ -1140,12 +1268,13 @@ export function updateDeliveryWatermark(
   const found = settingsRowFor(userId, friendId);
   if (!found.ok) return { ok: false, error: found.error };
 
-  const maxSeqRow = db
-    .prepare('SELECT MAX(sequenceId) AS maxSeq FROM directMessages WHERE conversationId = ?')
-    .get(found.conversationId) as { maxSeq: number | null } | undefined;
-  const maxAvailable = maxSeqRow?.maxSeq ?? 0;
-
   const current = found.row.deliveredThroughSequenceId;
+  if (throughSequenceId <= current) {
+    return { ok: true, newWatermark: current };
+  }
+
+  const maxSeqRow = getMaxSequenceInConversationStmt.get(found.conversationId);
+  const maxAvailable = maxSeqRow?.maxSeq ?? 0;
   const target = Math.min(Math.max(current, throughSequenceId), maxAvailable);
 
   if (target > current) {
@@ -1164,13 +1293,15 @@ export function updateReadWatermark(
   const found = settingsRowFor(userId, friendId);
   if (!found.ok) return { ok: false, error: found.error };
 
-  const maxSeqRow = db
-    .prepare('SELECT MAX(sequenceId) AS maxSeq FROM directMessages WHERE conversationId = ?')
-    .get(found.conversationId) as { maxSeq: number | null } | undefined;
-  const maxAvailable = maxSeqRow?.maxSeq ?? 0;
-
   const currentRead = found.row.readThroughSequenceId;
   const currentDelivered = found.row.deliveredThroughSequenceId;
+  if (throughSequenceId <= currentRead && throughSequenceId <= currentDelivered) {
+    return { ok: true, newWatermark: currentRead };
+  }
+
+  const maxSeqRow = getMaxSequenceInConversationStmt.get(found.conversationId);
+  const maxAvailable = maxSeqRow?.maxSeq ?? 0;
+
   const targetRead = Math.min(Math.max(currentRead, throughSequenceId), maxAvailable);
   const targetDelivered = Math.max(currentDelivered, targetRead);
 
@@ -1277,16 +1408,23 @@ function lockKey(userId: string, conversationId: string): string {
 }
 
 export function isChatVerified(userId: string, conversationId: string, now = Date.now()): boolean {
-  const expiry = verifiedChatLocks.get(lockKey(userId, conversationId));
+  const key = lockKey(userId, conversationId);
+  const expiry = verifiedChatLocks.get(key);
   if (expiry === undefined) return false;
   if (expiry <= now) {
-    verifiedChatLocks.delete(lockKey(userId, conversationId));
+    verifiedChatLocks.delete(key);
     return false;
   }
   return true;
 }
 
 export function markChatVerified(userId: string, conversationId: string, now = Date.now()): void {
+  // Prune expired locks if map grows large
+  if (verifiedChatLocks.size > 200) {
+    for (const [k, exp] of verifiedChatLocks.entries()) {
+      if (exp <= now) verifiedChatLocks.delete(k);
+    }
+  }
   verifiedChatLocks.set(lockKey(userId, conversationId), now + CHAT_LOCK_VERIFY_TTL_MS);
 }
 

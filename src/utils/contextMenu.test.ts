@@ -139,37 +139,13 @@ test('buildConversationMenuItems reflects per-user state', () => {
     { friendId: 'b', name: 'B', archived: true, pinned: false, favourite: true, locked: false, unreadCount: 0 },
     { conversationKey: 'a:b', lists: [] }
   );
-  assert.deepEqual(items.map((i) => i.id), ['archive', 'lock', 'pin', 'read', 'favourite', 'lists', 'clear', 'delete']);
-  assert.equal(items.find((i) => i.id === 'archive')!.label, 'Unarchive');
+  assert.deepEqual(items.map((i) => i.id), ['pin', 'read', 'favourite', 'clear', 'delete']);
   assert.equal(items.find((i) => i.id === 'pin')!.label, 'Pin chat');
   assert.equal(items.find((i) => i.id === 'read')!.label, 'Mark as unread');
   assert.equal(items.find((i) => i.id === 'favourite')!.label, 'Remove from favourites');
-  assert.equal(items.find((i) => i.id === 'lock')!.label, 'Lock chat');
   assert.equal(items.find((i) => i.id === 'clear')!.danger, true);
   assert.equal(items.find((i) => i.id === 'delete')!.danger, true);
   assert.equal(items.find((i) => i.id === 'clear')!.separatorBefore, true);
-});
-
-test('buildConversationMenuItems lists membership toggles per list', () => {
-  const items = buildConversationMenuItems(
-    { friendId: 'b', name: 'B', archived: false, pinned: false, favourite: false, locked: true, unreadCount: 3 },
-    {
-      conversationKey: 'a:b',
-      lists: [
-        { id: 'l1', name: 'Work', conversationIds: ['a:b'] },
-        { id: 'l2', name: 'Friends', conversationIds: ['x:y'] },
-      ],
-    }
-  );
-  const sub = items.find((i) => i.id === 'lists')!.submenu!;
-  assert.equal(sub.length, 3);
-  assert.equal(sub[0].id, 'list:l1');
-  assert.equal(sub[0].label, 'Remove from Work');
-  assert.equal(sub[1].id, 'list:l2');
-  assert.equal(sub[1].label, 'Add to Friends');
-  assert.equal(sub[2].id, 'list:new');
-  assert.equal(sub[2].label, 'New list');
-  assert.equal(items.find((i) => i.id === 'read')!.label, 'Mark as read');
 });
 
 // ─── selection helpers ───────────────────────────────────────────────────────

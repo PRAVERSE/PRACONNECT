@@ -82,24 +82,45 @@ export const RoomErrors = {
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
+interface MemberJoinedRow extends MemberRow {
+  name: string | null;
+  username: string | null;
+  avatarUrl: string | null;
+}
+
+// ─── Pre-compiled statements ──────────────────────────────────────────────────
+const getRoomStmt = db.prepare<[string, string], RoomRow>(
+  'SELECT * FROM rooms WHERE id = ? OR code = ? COLLATE NOCASE'
+);
+
+const getMemberStmt = db.prepare<[string, string], MemberRow>(
+  'SELECT * FROM roomMembers WHERE roomId = ? AND userId = ?'
+);
+
+const getUserBriefStmt = db.prepare<[string], { id: string; name: string; username: string; avatarUrl: string | null }>(
+  'SELECT id, name, username, avatarUrl FROM users WHERE id = ?'
+);
+
+const getActiveMembersWithUsersStmt = db.prepare<[string], MemberJoinedRow>(`
+  SELECT m.*, u.name, u.username, u.avatarUrl
+  FROM roomMembers m
+  JOIN users u ON u.id = m.userId
+  WHERE m.roomId = ? AND m.leftAt IS NULL
+  ORDER BY m.joinedAt ASC
+`);
+
+const touchActivityStmt = db.prepare('UPDATE rooms SET lastActivityAt = ? WHERE id = ?');
+
 function nowIso(): string {
   return new Date().toISOString();
 }
 
 function getRoom(roomIdOrCode: string): RoomRow | null {
-  return (
-    (db
-      .prepare('SELECT * FROM rooms WHERE id = ? OR code = ? COLLATE NOCASE')
-      .get(roomIdOrCode, roomIdOrCode) as RoomRow | undefined) ?? null
-  );
+  return getRoomStmt.get(roomIdOrCode, roomIdOrCode) ?? null;
 }
 
 function getMember(roomId: string, userId: string): MemberRow | null {
-  return (
-    db
-      .prepare('SELECT * FROM roomMembers WHERE roomId = ? AND userId = ?')
-      .get(roomId, userId) as MemberRow | undefined
-  ) ?? null;
+  return getMemberStmt.get(roomId, userId) ?? null;
 }
 
 function activeMemberCount(roomId: string): number {
@@ -122,7 +143,7 @@ function rejoinExpiresAtIso(room: { emptySince: string | null }): string | null 
 }
 
 function touchActivity(roomId: string): void {
-  db.prepare('UPDATE rooms SET lastActivityAt = ? WHERE id = ?').run(nowIso(), roomId);
+  touchActivityStmt.run(nowIso(), roomId);
 }
 
 // ─── Public payload shapes (sanitized) ───────────────────────────────────────
@@ -180,16 +201,13 @@ export interface RoomPayload {
   isHost: boolean;
 }
 
-function memberPayload(m: MemberRow): RoomMemberPayload {
-  const user = db
-    .prepare('SELECT id, name, username, avatarUrl FROM users WHERE id = ?')
-    .get(m.userId) as { id: string; name: string; username: string; avatarUrl: string | null } | undefined;
+function memberJoinedPayload(m: MemberJoinedRow): RoomMemberPayload {
   return {
     id: m.id,
     userId: m.userId,
-    name: user?.name ?? 'Unknown',
-    username: user?.username ?? 'user',
-    avatarUrl: user?.avatarUrl ?? null,
+    name: m.name ?? 'Unknown',
+    username: m.username ?? 'user',
+    avatarUrl: m.avatarUrl ?? null,
     role: m.role === 'host' ? 'host' : 'member',
     micOn: m.micOn === 1,
     cameraOn: m.cameraOn === 1,
@@ -232,13 +250,9 @@ function parseMedia(json: string | null): RoomPayload['currentMedia'] {
 export function roomPayload(roomId: string, viewerUserId: string | null): RoomPayload | null {
   const room = getRoom(roomId);
   if (!room) return null;
-  const host = db
-    .prepare('SELECT id, name, username, avatarUrl FROM users WHERE id = ?')
-    .get(room.hostUserId) as { id: string; name: string; username: string; avatarUrl: string | null } | undefined;
+  const host = getUserBriefStmt.get(room.hostUserId);
 
-  const members = (db
-    .prepare('SELECT * FROM roomMembers WHERE roomId = ? AND leftAt IS NULL ORDER BY joinedAt ASC')
-    .all(roomId) as MemberRow[]).map(memberPayload);
+  const members = getActiveMembersWithUsersStmt.all(roomId).map(memberJoinedPayload);
 
   const playback = (() => {
     try {
@@ -386,61 +400,70 @@ export function createRoom(hostUserId: string, input: CreateRoomInput): RoomPayl
 }
 
 export function joinRoom(roomIdOrCode: string, userId: string): { ok: true; payload: RoomPayload } | { ok: false; error: RoomError } {
-  const room = getRoom(roomIdOrCode);
-  if (!room) return { ok: false, error: RoomErrors.notFound() };
+  const executeJoin = db.transaction((): { ok: true; payload: RoomPayload } | { ok: false; error: RoomError } => {
+    const room = getRoom(roomIdOrCode);
+    if (!room) return { ok: false, error: RoomErrors.notFound() };
 
-  // The 5-minute rejoin window has closed even though the cleanup worker may
-  // not have swept the row yet: an expired room can never be joined.
-  if (isRoomExpired(room)) {
-    return { ok: false, error: RoomErrors.gone() };
-  }
+    // The 5-minute rejoin window has closed even though the cleanup worker may
+    // not have swept the row yet: an expired room can never be joined.
+    if (isRoomExpired(room)) {
+      return { ok: false, error: RoomErrors.gone() };
+    }
 
-  const existing = getMember(room.id, userId);
-  if (existing && !existing.leftAt) {
-    // Already a member — refresh activity and return current state.
-    touchActivity(room.id);
+    const existing = getMember(room.id, userId);
+    if (existing && !existing.leftAt) {
+      // Already a member — refresh activity and return current state.
+      touchActivity(room.id);
+      return { ok: true, payload: roomPayload(room.id, userId)! };
+    }
+
+    // A host-removed member cannot re-enter by reconnecting. Only an ordinary
+    // leave (leftAt set, removedAt NULL) may be reversed by a fresh join.
+    if (existing?.removedAt) {
+      return { ok: false, error: RoomErrors.removed() };
+    }
+
+    const currentActives = activeMemberCount(room.id);
+    if (currentActives >= room.maxParticipants) {
+      return { ok: false, error: RoomErrors.full() };
+    }
+
+    const now = nowIso();
+    const shouldBeHost = currentActives === 0;
+
+    if (shouldBeHost) {
+      // Reset any previous host role on other members to avoid conflicting host flags
+      db.prepare("UPDATE roomMembers SET role = 'member' WHERE roomId = ? AND role = 'host'").run(room.id);
+    }
+
+    if (existing && existing.leftAt) {
+      db.prepare(
+        `UPDATE roomMembers SET leftAt = NULL, joinedAt = ?, role = ?, micOn = 0, cameraOn = 0, screenShareOn = 0 WHERE id = ?`
+      ).run(now, shouldBeHost ? 'host' : 'member', existing.id);
+    } else {
+      db.prepare(
+        `INSERT INTO roomMembers (id, roomId, userId, role, micOn, cameraOn, screenShareOn, joinedAt)
+         VALUES (?, ?, ?, ?, 0, 0, 0, ?)`
+      ).run(generateId(), room.id, userId, shouldBeHost ? 'host' : 'member', now);
+    }
+
+    // Phase 6.11: record/reopen the durable participation. Reconnects and
+    // duplicate joins update the same row — never a new participation record.
+    recordHistoryJoin(room.id, userId, shouldBeHost ? 'host' : 'member', now);
+
+    // Cancels empty-room cleanup.
+    if (shouldBeHost) {
+      db.prepare("UPDATE rooms SET hostUserId = ?, emptySince = NULL, status = 'LIVE', lastActivityAt = ? WHERE id = ?").run(userId, now, room.id);
+      // The empty room was revived: undo the "ended" markers on its history row.
+      resumeRoomHistory(room.id);
+    } else {
+      db.prepare('UPDATE rooms SET emptySince = NULL, lastActivityAt = ? WHERE id = ?').run(now, room.id);
+    }
+
     return { ok: true, payload: roomPayload(room.id, userId)! };
-  }
+  });
 
-  // A host-removed member cannot re-enter by reconnecting. Only an ordinary
-  // leave (leftAt set, removedAt NULL) may be reversed by a fresh join.
-  if (existing?.removedAt) {
-    return { ok: false, error: RoomErrors.removed() };
-  }
-
-  const currentActives = activeMemberCount(room.id);
-  if (currentActives >= room.maxParticipants) {
-    return { ok: false, error: RoomErrors.full() };
-  }
-
-  const now = nowIso();
-  const shouldBeHost = currentActives === 0;
-
-  if (existing && existing.leftAt) {
-    db.prepare(
-      `UPDATE roomMembers SET leftAt = NULL, joinedAt = ?, role = ?, micOn = 0, cameraOn = 0, screenShareOn = 0 WHERE id = ?`
-    ).run(now, shouldBeHost ? 'host' : 'member', existing.id);
-  } else {
-    db.prepare(
-      `INSERT INTO roomMembers (id, roomId, userId, role, micOn, cameraOn, screenShareOn, joinedAt)
-       VALUES (?, ?, ?, ?, 0, 0, 0, ?)`
-    ).run(generateId(), room.id, userId, shouldBeHost ? 'host' : 'member', now);
-  }
-
-  // Phase 6.11: record/reopen the durable participation. Reconnects and
-  // duplicate joins update the same row — never a new participation record.
-  recordHistoryJoin(room.id, userId, shouldBeHost ? 'host' : 'member', now);
-
-  // Cancels empty-room cleanup.
-  if (shouldBeHost) {
-    db.prepare('UPDATE rooms SET hostUserId = ?, emptySince = NULL, lastActivityAt = ? WHERE id = ?').run(userId, now, room.id);
-    // The empty room was revived: undo the "ended" markers on its history row.
-    resumeRoomHistory(room.id);
-  } else {
-    db.prepare('UPDATE rooms SET emptySince = NULL, lastActivityAt = ? WHERE id = ?').run(now, room.id);
-  }
-
-  return { ok: true, payload: roomPayload(room.id, userId)! };
+  return executeJoin();
 }
 
 export function leaveRoom(roomId: string, userId: string): { ok: true; payload: RoomPayload } | { ok: false; error: RoomError } {

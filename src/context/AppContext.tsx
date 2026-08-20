@@ -29,7 +29,7 @@ import {
   initialScheduledParties,
   initialWatchHistory
 } from '../data/mockData';
-import { getCurrentUser, logoutApi, AuthUser } from '../api/auth';
+import { getCurrentUser, logoutApi, updateProfileApi, AuthUser } from '../api/auth';
 import {
   fetchRoomsApi,
   fetchRoomApi,
@@ -201,6 +201,7 @@ interface AppContextType {
     privacy: RoomPrivacy;
     maxMembers: number;
     description?: string;
+    inviteFriendIds?: string[];
   }) => Promise<RoomItem | null>;
   leaveRoom: () => Promise<void>;
   sendRoomChatMessage: (text: string) => void;
@@ -255,6 +256,7 @@ interface AppContextType {
   unpinMessage: (messageId: string) => Promise<boolean>;
   starMessage: (messageId: string) => Promise<boolean>;
   unstarMessage: (messageId: string) => Promise<boolean>;
+  toggleReaction: (messageId: string, emoji: string) => Promise<void>;
   deleteMessageForMe: (messageId: string) => Promise<boolean>;
   deleteMessageForEveryone: (messageId: string) => Promise<boolean>;
 
@@ -299,7 +301,7 @@ interface AppContextType {
   userProfile: UserProfile;
   userSettings: UserSettings;
   updateSettings: (newSettings: Partial<UserSettings>) => void;
-  updateProfile: (newProfile: Partial<UserProfile>) => void;
+  updateProfile: (newProfile: Partial<UserProfile>) => Promise<{ ok: boolean; error?: string }>;
   
   // Modals
   createRoomModalOpen: boolean;
@@ -343,6 +345,7 @@ function mapServerRoomToItem(r: ServerRoom, currentUserId: string | null): RoomI
           duration: r.currentMedia.duration,
           type: (r.currentMedia.type as 'video' | 'stream') || 'video',
           mediaType: r.currentMedia.mediaType,
+          mediaId: r.currentMedia.mediaId,
           sourceUserId: r.currentMedia.sourceUserId,
           mimeType: r.currentMedia.mimeType,
         }
@@ -385,18 +388,28 @@ function mapFriendListItemToFriend(item: FriendListItem): Friend {
   };
 }
 
-function mapDirectMessageItem(item: DirectMessageItem): DirectMessage {
+function mapDirectMessageItem(item: any): DirectMessage {
   return {
     id: item.id,
     senderId: item.senderId,
     text: item.text,
     timestamp: new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     createdAt: item.createdAt,
+    conversationId: item.conversationId,
+    sequenceId: item.sequenceId,
     replyToMessageId: item.replyToMessageId,
     forwardedFromMessageId: item.forwardedFromMessageId,
     deletedForEveryone: Boolean(item.deletedForEveryone),
     replyTo: item.replyTo ?? null,
     forwardedFrom: item.forwardedFrom ?? null,
+    attachmentId: item.attachmentId ?? null,
+    attachment: item.attachment ?? null,
+    editedAt: item.editedAt ?? null,
+    expiresAt: item.expiresAt ?? null,
+    vanish: Boolean(item.vanish),
+    reaction: item.reaction ?? null,
+    reactions: item.reactions ?? [],
+    status: item.status,
   };
 }
 
@@ -982,6 +995,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     privacy: RoomPrivacy;
     maxMembers: number;
     description?: string;
+    inviteFriendIds?: string[];
   }): Promise<RoomItem | null> => {
     const res = await createRoomApi({
       name: params.name,
@@ -989,6 +1003,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       privacy: params.privacy,
       maxParticipants: params.maxMembers,
       description: params.description,
+      inviteFriendIds: params.inviteFriendIds,
     });
 
     if (!res.ok || !res.data) {
@@ -1088,12 +1103,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!currentRoom || !currentRoom.isHost) {
       return { ok: false, error: 'Only the room host can change media.' };
     }
+    setMediaConversion(null);
+    setMediaErrorMessage(null);
     const res = await setRoomLibraryMediaApi(currentRoom.id, mediaId);
     if (!res.ok) {
       const msg = res.error?.message || 'Could not select that media.';
       setMediaErrorMessage(msg);
       return { ok: false, error: msg };
     }
+    setMediaConversion(null);
+    setMediaErrorMessage(null);
     return { ok: true };
   };
 
@@ -1373,6 +1392,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return res.ok;
   }, []);
 
+  const toggleReaction = useCallback(
+    async (messageId: string, emoji: string) => {
+      if (!currentUser?.id || !activeDMId) return;
+      const conversationId = conversationKeyFor(activeDMId, currentUser.id);
+      wsService.sendReaction(conversationId, messageId, emoji);
+    },
+    [currentUser?.id, activeDMId]
+  );
+
   const deleteMessageForMe = useCallback(async (messageId: string) => {
     const res = await deleteMessageForMeApi(messageId);
     if (res.ok) {
@@ -1443,6 +1471,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const res = await clearChatApi(friendId);
     if (res.ok) {
       setDmConversations((prev) => ({ ...prev, [friendId]: [] }));
+      setConversations((prev) =>
+        prev.map((c) => (c.friendId === friendId ? { ...c, lastMessage: null, unreadCount: 0 } : c))
+      );
       refreshConversationList();
     }
     return res.ok;
@@ -1735,6 +1766,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [isAuthenticated, currentUser?.id, refreshSocial, pushNotification]);
 
+  const conversationsRef = useRef(conversations);
+  conversationsRef.current = conversations;
+
   // ─── Real-time WebSocket connection & event handlers ─────────────────────
   useEffect(() => {
     if (!isAuthenticated || !currentUser?.id) {
@@ -1757,7 +1791,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
 
       // Send sync request for active conversations on connect/reconnect
-      const syncReq = conversations.map((c) => ({
+      const syncReq = conversationsRef.current.map((c) => ({
         conversationId: conversationKeyFor(c.friendId, currentUser.id),
         lastSequenceId: c.lastSequenceId ?? 0,
       }));
@@ -1909,6 +1943,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
     });
 
+    const unsubReaction = wsService.on('message:reaction', (e) => {
+      const { messageId, reactions } = e;
+      if (messageId && Array.isArray(reactions)) {
+        setDmConversations((prev) => {
+          const next: Record<string, DirectMessage[]> = {};
+          for (const [friendId, msgs] of Object.entries(prev)) {
+            const list = (msgs ?? []) as DirectMessage[];
+            next[friendId] = list.map((m) =>
+              m.id === messageId ? { ...m, reactions } : m
+            );
+          }
+          return next;
+        });
+      }
+    });
+
     return () => {
       unsubState();
       unsubReady();
@@ -1920,6 +1970,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       unsubPresence();
       unsubSync();
       unsubError();
+      unsubReaction();
     };
   }, [isAuthenticated, currentUser?.id, conversations]);
 
@@ -2020,8 +2071,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setUserSettings((prev) => ({ ...prev, ...newSettings }));
   };
 
-  const updateProfile = (newProfile: Partial<UserProfile>) => {
-    setUserProfile((prev) => ({ ...prev, ...newProfile }));
+  const updateProfile = async (newProfile: Partial<UserProfile>): Promise<{ ok: boolean; error?: string }> => {
+    const res = await updateProfileApi({
+      name: newProfile.name,
+      username: newProfile.username,
+      avatarUrl: newProfile.avatar,
+      bio: newProfile.bio,
+    });
+    if (res.ok && res.user) {
+      setCurrentUser(res.user);
+      setUserProfile((prev) => ({
+        ...prev,
+        name: res.user!.name,
+        username: res.user!.username,
+        avatar: res.user!.avatarUrl || res.user!.name.charAt(0).toUpperCase() || 'U',
+        bio: res.profile?.bio ?? newProfile.bio ?? prev.bio,
+        email: res.user!.email,
+      }));
+      return { ok: true };
+    }
+    return { ok: false, error: res.error?.message || 'Failed to update profile.' };
   };
 
   // ─── Real-Time SSE Listener for Active Room ────────────────────────────────
@@ -2360,6 +2429,7 @@ participants,
         unpinMessage,
         starMessage,
         unstarMessage,
+        toggleReaction,
         deleteMessageForMe,
         deleteMessageForEveryone,
         setConversationArchived,

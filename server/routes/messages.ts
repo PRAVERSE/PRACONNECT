@@ -36,6 +36,8 @@ import {
   starMessage,
   unstarMessage,
   listStarredMessages,
+  toggleMessageReaction,
+  getMessageReactions,
   deleteMessageForMe,
   deleteMessageForEveryone,
   editDirectMessage,
@@ -427,6 +429,35 @@ messages.delete('/:messageId/star', (c) => {
   const result = unstarMessage(userId, c.req.param('messageId'));
   if (!result.ok) return serviceError(c, result.error!.code, result.error!.message);
   return c.json({ ok: true, starred: false });
+});
+
+// ─── Message reactions ───────────────────────────────────────────────────────
+
+messages.post('/:messageId/reactions', async (c) => {
+  const userId = c.get('userId');
+  const tooMany = rateLimit(c, `dmReaction:${userId}`, 'dmSend');
+  if (tooMany) return tooMany;
+
+  const body = await c.req.json().catch(() => ({}));
+  const emoji = typeof (body as any)?.emoji === 'string' ? (body as any).emoji : '';
+  const result = toggleMessageReaction(userId, c.req.param('messageId'), emoji);
+  if (!result.ok) return serviceError(c, result.error!.code, result.error!.message);
+
+  return c.json({
+    ok: true,
+    action: result.action,
+    reactions: result.reactions,
+    emoji: result.emoji,
+  });
+});
+
+messages.get('/:messageId/reactions', (c) => {
+  const userId = c.get('userId');
+  const access = getMessageAccess(userId, c.req.param('messageId'));
+  if (!access.ok) return serviceError(c, access.error.code, access.error.message);
+
+  const reactions = getMessageReactions(c.req.param('messageId'));
+  return c.json({ ok: true, reactions });
 });
 
 // ─── Delete for me / for everyone ────────────────────────────────────────────

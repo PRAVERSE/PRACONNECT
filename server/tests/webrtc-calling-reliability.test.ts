@@ -2,20 +2,26 @@
 // Comprehensive integration test suite for real-world WebRTC reliability: STUN/TURN endpoint,
 // short-lived credentials, candidate queueing, and signaling authorization.
 
+import os from 'node:os';
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { serve } from '@hono/node-server';
-import { createApp } from '../app';
-import { db } from '../db/index';
-import { createSession, SESSION_COOKIE_NAME } from '../auth/session';
-import {
+
+const TMP_ROOT = path.join(os.tmpdir(), `praconnect-webrtc-${process.pid}-${Date.now()}`);
+fs.mkdirSync(TMP_ROOT, { recursive: true });
+
+process.env.NODE_ENV = 'test';
+process.env.DATABASE_PATH = path.join(TMP_ROOT, 'test.db');
+
+const { db, closeDatabase } = await import('../db/index');
+const { createApp } = await import('../app');
+const { createSession, SESSION_COOKIE_NAME } = await import('../auth/session');
+const {
   generateTurnCredentials,
   getIceServersForUser,
-} from '../routes/calling';
-
-const TEST_DIR = path.join(process.cwd(), 'scratch', `test_webrtc_rel_${Date.now()}`);
+} = await import('../routes/calling');
 
 let server: any;
 let baseUrl: string;
@@ -38,7 +44,6 @@ interface TestUser {
 let userA: TestUser;
 
 before(async () => {
-  await fs.promises.mkdir(TEST_DIR, { recursive: true });
   const app = createApp();
   server = serve({ fetch: app.fetch, port: 0 }) as any;
 
@@ -50,7 +55,10 @@ before(async () => {
 
 after(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
-  await fs.promises.rm(TEST_DIR, { recursive: true, force: true }).catch(() => {});
+  try {
+    closeDatabase?.();
+  } catch {}
+  await fs.promises.rm(TMP_ROOT, { recursive: true, force: true }).catch(() => {});
 });
 
 describe('WebRTC Reliability & ICE Configuration Tests', () => {

@@ -42,21 +42,40 @@ export const ProfileView: React.FC = () => {
   const [bio, setBio] = useState(userProfile.bio);
   const [avatar, setAvatar] = useState(userProfile.avatar);
   const [email, setEmail] = useState(userProfile.email);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
-  const handleSave = (e: React.FormEvent) => {
+  useEffect(() => {
+    if (editModalOpen) {
+      setName(userProfile.name);
+      setUsername(userProfile.username);
+      setBio(userProfile.bio);
+      setAvatar(userProfile.avatar);
+      setEmail(userProfile.email);
+      setSaveError(null);
+    }
+  }, [editModalOpen, userProfile]);
+
+  const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    setSaveError(null);
+    setSaving(true);
     const trimmedAvatar = avatar.trim();
     const finalAvatar = isImageUrl(trimmedAvatar)
       ? trimmedAvatar
       : trimmedAvatar.charAt(0).toUpperCase() || (name.trim().charAt(0).toUpperCase() || 'U');
 
-    updateProfile({
+    const res = await updateProfile({
       name: name.trim(),
       username: username.trim(),
       bio: bio.trim(),
       avatar: finalAvatar,
-      email: email.trim()
     });
+    setSaving(false);
+    if (res && !res.ok) {
+      setSaveError(res.error || 'Failed to save profile changes.');
+      return;
+    }
     setEditModalOpen(false);
   };
 
@@ -261,6 +280,12 @@ export const ProfileView: React.FC = () => {
 
             <h2 className="font-['Sora',sans-serif] text-base font-bold text-[#EDEDEF] mb-4">Edit Profile</h2>
 
+            {saveError && (
+              <div className="p-3 mb-4 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs">
+                {saveError}
+              </div>
+            )}
+
             <form onSubmit={handleSave} className="space-y-4 text-xs">
               <div>
                 <label className="block text-[11px] font-semibold text-[#9A9AA2] uppercase tracking-wider mb-1.5">Display Name</label>
@@ -274,17 +299,6 @@ export const ProfileView: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-[11px] font-semibold text-[#9A9AA2] uppercase tracking-wider mb-1.5">Email Address</label>
-                <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  className="w-full h-10 px-3.5 bg-transparent border border-white/15 rounded-[10px] text-xs text-[#EDEDEF] focus:outline-none focus:border-[#F6B8D0]"
-                  required
-                />
-              </div>
-
-              <div>
                 <label className="block text-[11px] font-semibold text-[#9A9AA2] uppercase tracking-wider mb-1.5">Username</label>
                 <input
                   type="text"
@@ -292,6 +306,29 @@ export const ProfileView: React.FC = () => {
                   onChange={(e) => setUsername(e.target.value)}
                   className="w-full h-10 px-3.5 bg-transparent border border-white/15 rounded-[10px] text-xs text-[#EDEDEF] focus:outline-none focus:border-[#F6B8D0]"
                   required
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-semibold text-[#9A9AA2] uppercase tracking-wider mb-1.5">Bio (Optional)</label>
+                <textarea
+                  value={bio}
+                  onChange={(e) => setBio(e.target.value)}
+                  placeholder="Tell your squad about yourself..."
+                  rows={2}
+                  maxLength={500}
+                  className="w-full p-2.5 bg-transparent border border-white/15 rounded-[10px] text-xs text-[#EDEDEF] focus:outline-none focus:border-[#F6B8D0] resize-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-semibold text-[#9A9AA2] uppercase tracking-wider mb-1.5">Email Address (Private)</label>
+                <input
+                  type="email"
+                  value={email}
+                  disabled
+                  title="Email is private and linked to your login credentials"
+                  className="w-full h-10 px-3.5 bg-white/5 border border-white/10 rounded-[10px] text-xs text-[#9A9AA2] cursor-not-allowed"
                 />
               </div>
 
@@ -323,9 +360,10 @@ export const ProfileView: React.FC = () => {
                 </button>
                 <button
                   type="submit"
-                  className="btn-primary text-xs px-5 py-2"
+                  disabled={saving}
+                  className="btn-primary text-xs px-5 py-2 cursor-pointer disabled:opacity-50"
                 >
-                  Save Changes
+                  {saving ? 'Saving…' : 'Save Changes'}
                 </button>
               </div>
             </form>

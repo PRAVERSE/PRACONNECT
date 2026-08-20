@@ -122,6 +122,7 @@ export async function createRoomApi(params: {
   privacy?: string;
   maxParticipants?: number;
   description?: string;
+  inviteFriendIds?: string[];
 }): Promise<RoomApiResponse<ServerRoom>> {
   try {
     const res = await fetch('/api/rooms', {

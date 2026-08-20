@@ -19,7 +19,8 @@ export const schema = `
     updatedAt    TEXT NOT NULL,
     -- Phase 1 realtime: ISO time the user last went fully offline, set by the
     -- presence system when their last live connection closes.
-    lastSeenAt   TEXT
+    lastSeenAt   TEXT,
+    bio          TEXT
   );
 
   CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email
@@ -47,6 +48,9 @@ export const schema = `
 
   CREATE INDEX IF NOT EXISTS idx_sessions_user_id
     ON sessions (userId);
+
+  CREATE INDEX IF NOT EXISTS idx_sessions_expires_at
+    ON sessions (expiresAt);
 
   CREATE TABLE IF NOT EXISTS emailOtps (
     id          TEXT PRIMARY KEY,
@@ -139,6 +143,12 @@ export const schema = `
     ON rooms (emptySince)
     WHERE emptySince IS NOT NULL;
 
+  CREATE INDEX IF NOT EXISTS idx_rooms_last_activity
+    ON rooms (lastActivityAt DESC);
+
+  CREATE INDEX IF NOT EXISTS idx_rooms_privacy_activity
+    ON rooms (privacy, lastActivityAt DESC);
+
   CREATE TABLE IF NOT EXISTS roomMembers (
     id            TEXT PRIMARY KEY,
     roomId        TEXT NOT NULL,
@@ -161,6 +171,12 @@ export const schema = `
   CREATE INDEX IF NOT EXISTS idx_room_members_user
     ON roomMembers (userId);
 
+  CREATE INDEX IF NOT EXISTS idx_room_members_user_active
+    ON roomMembers (userId, leftAt);
+
+  CREATE INDEX IF NOT EXISTS idx_room_members_active
+    ON roomMembers (roomId, leftAt);
+
   CREATE TABLE IF NOT EXISTS roomEvents (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     roomId       TEXT NOT NULL,
@@ -172,6 +188,9 @@ export const schema = `
 
   CREATE INDEX IF NOT EXISTS idx_room_events_room
     ON roomEvents (roomId, id);
+
+  CREATE INDEX IF NOT EXISTS idx_room_events_cleanup
+    ON roomEvents (roomId, createdAt);
 
   -- ─── Phase 6.2: Upload ownership metadata ─────────────────────────────────
   -- Created only for finalized uploads — media serving authorizes against the
@@ -229,6 +248,9 @@ export const schema = `
 
   CREATE INDEX IF NOT EXISTS idx_room_history_host
     ON roomHistory (hostUserId);
+
+  CREATE INDEX IF NOT EXISTS idx_room_history_created
+    ON roomHistory (createdAt DESC);
 
   CREATE TABLE IF NOT EXISTS roomHistoryMembers (
     id              TEXT PRIMARY KEY,
@@ -318,12 +340,18 @@ export const schema = `
   CREATE INDEX IF NOT EXISTS idx_direct_messages_conversation
     ON directMessages (senderId, recipientId, createdAt);
 
+  CREATE INDEX IF NOT EXISTS idx_direct_messages_sender
+    ON directMessages (senderId, createdAt);
+
   CREATE INDEX IF NOT EXISTS idx_direct_messages_recipient
     ON directMessages (recipientId, createdAt);
 
   -- Realtime sync/resume: fetch messages after a watermark or order by sequence.
   CREATE INDEX IF NOT EXISTS idx_direct_messages_conversation_sequence
     ON directMessages (conversationId, sequenceId);
+
+  CREATE INDEX IF NOT EXISTS idx_direct_messages_conv_seq
+    ON directMessages (conversationId, sequenceId DESC, createdAt DESC);
 
   CREATE INDEX IF NOT EXISTS idx_direct_messages_expires
     ON directMessages (expiresAt)
@@ -450,6 +478,25 @@ export const schema = `
 
   CREATE INDEX IF NOT EXISTS idx_starred_messages_message
     ON starredMessages (messageId);
+
+  -- ─── Message Reactions (Social response emojis on direct messages) ─────────
+  CREATE TABLE IF NOT EXISTS messageReactions (
+    id             TEXT PRIMARY KEY,
+    messageId      TEXT NOT NULL,
+    conversationId TEXT NOT NULL,
+    userId         TEXT NOT NULL,
+    emoji          TEXT NOT NULL,
+    createdAt      TEXT NOT NULL,
+    FOREIGN KEY (messageId) REFERENCES directMessages (id) ON DELETE CASCADE,
+    FOREIGN KEY (userId) REFERENCES users (id) ON DELETE CASCADE,
+    UNIQUE (messageId, userId, emoji)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_message_reactions_message
+    ON messageReactions (messageId);
+
+  CREATE INDEX IF NOT EXISTS idx_message_reactions_conv
+    ON messageReactions (conversationId);
 
   -- "Delete for me" is a per-user tombstone: shared rows are never destroyed,
   -- each user's message queries exclude rows tombstoned for them.

@@ -40,6 +40,8 @@ import {
 import type { MediaInput, RoomPayload, RoomError } from '../rooms/service';
 import { emit, emitEphemeral, openEventStream, replayEventsWithMeta } from '../rooms/realtime';
 import { getClientIp, rateLimit } from '../rate-limit';
+import { sendWatchInvite, isAcceptedFriendship } from '../social/service';
+import { emitUserEvent } from '../social/realtime';
 
 // Upload limits. The per-file byte counter is authoritative; Content-Length
 // and the total-body counter are coarse early gates (see upload route below).
@@ -254,6 +256,9 @@ rooms.get('/:id', (c) => {
 
 rooms.post('/', async (c) => {
   const userId = c.get('userId');
+  const createLimit = rateLimit(c, `roomCreate:user:${userId}`, 'roomCreate');
+  if (createLimit) return createLimit;
+
   const body = await readJson(c);
   if (!body) return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
 
@@ -275,6 +280,18 @@ rooms.post('/', async (c) => {
   }
 
   emit(payload.id, 'room:update', { room: payload });
+
+  if (Array.isArray(body.inviteFriendIds) && body.inviteFriendIds.length > 0) {
+    for (const friendId of body.inviteFriendIds) {
+      if (typeof friendId === 'string' && friendId !== userId && isAcceptedFriendship(userId, friendId)) {
+        const invRes = sendWatchInvite(userId, friendId, payload.id);
+        if (invRes.ok && invRes.invite) {
+          emitUserEvent(friendId, 'watch:invite', { invite: invRes.invite });
+        }
+      }
+    }
+  }
+
   return c.json({ room: payload }, 201);
 });
 
@@ -341,10 +358,26 @@ rooms.post('/:id/media/library', async (c) => {
     return c.json(apiError('VALIDATION_ERROR', 'mediaId is required.'), 400);
   }
 
-  const { getPublishedMedia } = await import('../media/service');
-  const item = getPublishedMedia(mediaId);
+  const { getAdminMedia } = await import('../media/service');
+  const item = getAdminMedia(mediaId);
   if (!item) {
-    return c.json(apiError('NOT_FOUND', 'That media is not available in the library.'), 404);
+    return c.json(apiError('MEDIA_NOT_FOUND', 'That media is not available in the library.'), 404);
+  }
+  if (item.status !== 'ready') {
+    return c.json(apiError('MEDIA_NOT_READY', 'That media is not ready for playback.'), 404);
+  }
+  if (!item.published) {
+    return c.json(apiError('MEDIA_UNAVAILABLE', 'That media is not published.'), 404);
+  }
+  if (!item.playableKey) {
+    return c.json(apiError('MEDIA_UNAVAILABLE', 'Playable media is missing.'), 404);
+  }
+
+  const { getMediaStorage } = await import('../storage/mediaStorage');
+  const storage = getMediaStorage();
+  const stat = await storage.stat(item.playableKey);
+  if (!stat) {
+    return c.json(apiError('MEDIA_UNAVAILABLE', 'Playable media file is missing from storage.'), 404);
   }
 
   const media: MediaInput = {
@@ -490,6 +523,9 @@ export function inspectVideoContainer(buffer: Buffer): 'mp4' | 'webm' | 'mov' | 
 rooms.post('/:id/media/upload', async (c) => {
   const roomId = c.req.param('id');
   const userId = c.get('userId');
+  const uploadLimit = rateLimit(c, `mediaUpload:user:${userId}`, 'mediaUpload');
+  if (uploadLimit) return uploadLimit;
+
   const guard = activeMemberGuard(c, roomId, userId);
   if (guard) return guard;
 

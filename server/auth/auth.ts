@@ -70,6 +70,7 @@ export interface SafeUser {
   username: string;
   email: string;
   avatarUrl: string | null;
+  bio?: string | null;
   emailVerified: boolean;
   /** Phase A: 'admin' (server-promoted owner) or 'user'. Always read from the
    *  database row — a role supplied by the client is never trusted. */
@@ -85,6 +86,7 @@ export function sanitizeUser(row: Record<string, unknown>): SafeUser {
     username: row.username as string,
     email: row.email as string,
     avatarUrl: (row.avatarUrl as string | null) ?? null,
+    bio: (row.bio as string | null) ?? null,
     emailVerified: row.emailVerified === 1,
     role: row.role === 'admin' ? 'admin' : 'user',
     createdAt: row.createdAt as string,

@@ -50,6 +50,7 @@ import type { LockDialogMode } from '../messages/LockDialog';
 import { ListsModal } from '../messages/ListsModal';
 import { ImageViewerModal } from '../common/ImageViewerModal';
 import { callingService } from '../../services/calling';
+import { wsService } from '../../services/websocket';
 import { useLongPress } from '../../hooks/useLongPress';
 import {
   buildMessageMenuItems,
@@ -84,6 +85,7 @@ export const MessagesView: React.FC = () => {
     unpinMessage,
     starMessage,
     unstarMessage,
+    toggleReaction,
     deleteMessageForMe,
     deleteMessageForEveryone,
     setConversationArchived,
@@ -145,6 +147,8 @@ export const MessagesView: React.FC = () => {
   const [viewingImage, setViewingImage] = useState<{ src: string; name?: string } | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const chatScrollContainerRef = useRef<HTMLDivElement>(null);
+  const readAckTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const modalInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadAbortRef = useRef<boolean>(false);
@@ -295,6 +299,55 @@ export const MessagesView: React.FC = () => {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
   }, [activeDMId, messages.length, activeInvites.length]);
+
+  // Viewport tracking for Delivered vs Read (Two-State Ticks)
+  useEffect(() => {
+    if (!activeDMId || !activeConversationKey || messages.length === 0) return;
+
+    if (activeConversation && (activeConversation.unreadCount ?? 0) > 0) {
+      void markConversationRead(activeDMId);
+    }
+
+    const container = chatScrollContainerRef.current;
+    if (!container || typeof IntersectionObserver === 'undefined') return;
+
+    let maxVisibleIncomingSeq = 0;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        let changed = false;
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            const seq = Number(entry.target.getAttribute('data-sequence-id') || 0);
+            const isIncoming = entry.target.getAttribute('data-is-incoming') === 'true';
+            if (isIncoming && seq > maxVisibleIncomingSeq) {
+              maxVisibleIncomingSeq = seq;
+              changed = true;
+            }
+          }
+        }
+
+        if (changed && maxVisibleIncomingSeq > 0 && activeConversationKey) {
+          if (readAckTimeoutRef.current) clearTimeout(readAckTimeoutRef.current);
+          readAckTimeoutRef.current = setTimeout(() => {
+            wsService.sendReadAck(activeConversationKey, maxVisibleIncomingSeq);
+          }, 300);
+        }
+      },
+      {
+        root: container,
+        threshold: 0.2,
+      }
+    );
+
+    const messageEls = container.querySelectorAll('[data-msg-item="true"]');
+    messageEls.forEach((el) => observer.observe(el));
+
+    return () => {
+      observer.disconnect();
+      if (readAckTimeoutRef.current) clearTimeout(readAckTimeoutRef.current);
+    };
+  }, [activeDMId, activeConversationKey, messages, activeConversation?.unreadCount, markConversationRead]);
 
   useEffect(() => {
     if (isNewChatOpen) {
@@ -523,6 +576,13 @@ export const MessagesView: React.FC = () => {
       case 'delete-for-everyone':
         setConfirmAction({ kind: 'delete-for-everyone', messageId: msg.id });
         break;
+      default: {
+        if (item.id.startsWith('react:')) {
+          const emoji = item.id.slice(6);
+          void toggleReaction(msg.id, emoji);
+        }
+        break;
+      }
     }
   };
 
@@ -946,7 +1006,9 @@ export const MessagesView: React.FC = () => {
                       <span className="truncate">@{activeFriend.username}</span>
                       <span>·</span>
                       {isPeerTyping ? (
-                        <span className="text-[var(--emphasis-strong)] font-medium italic animate-pulse">typing...</span>
+                        <span className="text-[var(--emphasis-strong)] font-medium italic animate-pulse">
+                          {activeFriend.name.split(' ')[0]} is typing...
+                        </span>
                       ) : (
                         <span className="flex items-center gap-1.5">
                           <span
@@ -1061,7 +1123,7 @@ export const MessagesView: React.FC = () => {
                 </div>
               )}
 
-              <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-4 sm:px-6 py-5 space-y-3">
+              <div ref={chatScrollContainerRef} className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-4 sm:px-6 py-5 space-y-3">
                 {activeInvites.length > 0 &&
                   activeInvites.map((invite) => {
                     const status = inviteStatusLabel(invite.id);
@@ -1136,8 +1198,39 @@ export const MessagesView: React.FC = () => {
                     return (
                       <div
                         key={msg.id}
-                        className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}
+                        data-msg-item="true"
+                        data-sequence-id={msg.sequenceId ?? 0}
+                        data-is-incoming={!isMe}
+                        className={`group relative flex flex-col ${isMe ? 'items-end' : 'items-start'}`}
                       >
+                        {/* ─── Hover / Touch Reaction Emoji Picker Bar ─── */}
+                        {!deleted && (
+                          <div
+                            className={`absolute -top-7 ${isMe ? 'right-2' : 'left-2'} z-20 hidden group-hover:flex items-center gap-0.5 px-2 py-1 rounded-full bg-[var(--bg-elevated)] border border-[var(--border-hairline)] shadow-xl backdrop-blur-md transition-all animate-fade-in`}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {['❤️', '😂', '👍', '😮', '😢', '🙏'].map((emoji) => {
+                              const isReacted = currentUser?.id && msg.reactions?.some((r) => r.emoji === emoji && r.userIds.includes(currentUser.id));
+                              return (
+                                <button
+                                  key={emoji}
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void toggleReaction(msg.id, emoji);
+                                  }}
+                                  className={`text-sm p-1 rounded-full hover:scale-125 transition-transform cursor-pointer ${
+                                    isReacted ? 'bg-[var(--emphasis-dim)] scale-110' : 'hover:bg-white/10'
+                                  }`}
+                                  title={`React with ${emoji}`}
+                                >
+                                  {emoji}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+
                         <div
                           role="button"
                           tabIndex={0}
@@ -1238,6 +1331,35 @@ export const MessagesView: React.FC = () => {
                             <Pin className="inline-block w-3 h-3 ml-1.5 text-[var(--text-tertiary)]" aria-hidden="true" />
                           )}
                         </div>
+
+                        {/* ─── Stacked Reaction Badges on Bubble ─── */}
+                        {msg.reactions && msg.reactions.length > 0 && (
+                          <div className={`flex flex-wrap gap-1 mt-1.5 ${isMe ? 'justify-end' : 'justify-start'}`}>
+                            {msg.reactions.map((r) => {
+                              const isMyReaction = currentUser?.id ? r.userIds.includes(currentUser.id) : false;
+                              return (
+                                <button
+                                  key={r.emoji}
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void toggleReaction(msg.id, r.emoji);
+                                  }}
+                                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-xs transition-transform active:scale-95 cursor-pointer border ${
+                                    isMyReaction
+                                      ? 'bg-[var(--emphasis-dim)] border-[var(--emphasis-strong)] text-[var(--text-primary)] shadow-xs'
+                                      : 'bg-[var(--bg-elevated)]/80 border-[var(--border-hairline)] text-[var(--text-secondary)] hover:border-[var(--border-strong)]'
+                                  }`}
+                                  title={`${r.count} reaction${r.count > 1 ? 's' : ''}${isMyReaction ? ' (Click to remove)' : ' (Click to add)'}`}
+                                >
+                                  <span>{r.emoji}</span>
+                                  {r.count > 1 && <span className="text-[10px] font-semibold">{r.count}</span>}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+
                         <div className="flex items-center gap-1 mt-1 px-1">
                           <span className="text-[10px] text-[var(--text-tertiary)] font-mono">
                             {msg.timestamp}

@@ -244,6 +244,26 @@ function whereForQuery(q: string): { clause: string; params: string[] } {
   };
 }
 
+// ─── Pre-compiled statements for media queries ────────────────────────────────
+const countPublishedMediaStmt = db.prepare<[], { n: number }>(
+  "SELECT COUNT(*) AS n FROM media m WHERE m.published = 1 AND m.status = 'ready'"
+);
+
+const getPublishedMediaPageStmt = db.prepare<[number, number], Record<string, unknown>>(`
+  SELECT m.* FROM media m
+  WHERE m.published = 1 AND m.status = 'ready'
+  ORDER BY m.createdAt DESC, m.id DESC
+  LIMIT ? OFFSET ?
+`);
+
+const getPublishedMediaByIdStmt = db.prepare<[string], Record<string, unknown>>(`
+  SELECT * FROM media WHERE id = ? AND published = 1 AND status = 'ready'
+`);
+
+const getAdminMediaByIdStmt = db.prepare<[string], Record<string, unknown>>(`
+  SELECT m.*, u.name AS creatorName FROM media m JOIN users u ON u.id = m.createdByUserId WHERE m.id = ?
+`);
+
 /** Published + ready items for normal users, newest first. */
 export function listPublishedMedia(opts: {
   q?: string;
@@ -253,22 +273,29 @@ export function listPublishedMedia(opts: {
   const p = normalizePage(opts.page, opts.pageSize);
   if (!p) return null;
   const q = (opts.q ?? '').trim();
-  const { clause, params } = whereForQuery(q);
 
-  const total = (
-    db
-      .prepare(`SELECT COUNT(*) AS n FROM media m WHERE m.published = 1 AND m.status = 'ready'${clause}`)
-      .get(...params) as { n: number }
-  ).n;
+  let total: number;
+  let rows: Record<string, unknown>[];
 
-  const rows = db
-    .prepare(
-      `SELECT m.* FROM media m
-       WHERE m.published = 1 AND m.status = 'ready'${clause}
-       ORDER BY m.createdAt DESC, m.id DESC
-       LIMIT ? OFFSET ?`
-    )
-    .all(...params, p.pageSize, (p.page - 1) * p.pageSize) as unknown as Record<string, unknown>[];
+  if (!q) {
+    total = countPublishedMediaStmt.get()?.n ?? 0;
+    rows = getPublishedMediaPageStmt.all(p.pageSize, (p.page - 1) * p.pageSize);
+  } else {
+    const { clause, params } = whereForQuery(q);
+    total = (
+      db
+        .prepare(`SELECT COUNT(*) AS n FROM media m WHERE m.published = 1 AND m.status = 'ready'${clause}`)
+        .get(...params) as { n: number }
+    ).n;
+    rows = db
+      .prepare(
+        `SELECT m.* FROM media m
+         WHERE m.published = 1 AND m.status = 'ready'${clause}
+         ORDER BY m.createdAt DESC, m.id DESC
+         LIMIT ? OFFSET ?`
+      )
+      .all(...params, p.pageSize, (p.page - 1) * p.pageSize) as unknown as Record<string, unknown>[];
+  }
 
   return {
     items: rows.map(rowToMedia),
@@ -317,17 +344,13 @@ export function listAdminMedia(opts: {
 
 /** A single item visible to normal users (published + ready), or null. */
 export function getPublishedMedia(id: string): MediaRow | null {
-  const row = db
-    .prepare(`SELECT * FROM media WHERE id = ? AND published = 1 AND status = 'ready'`)
-    .get(id) as Record<string, unknown> | undefined;
+  const row = getPublishedMediaByIdStmt.get(id);
   return row ? rowToMedia(row) : null;
 }
 
 /** Any item by id, with the creator's name (admin view), or null. */
 export function getAdminMedia(id: string): MediaRow | null {
-  const row = db
-    .prepare(`SELECT m.*, u.name AS creatorName FROM media m JOIN users u ON u.id = m.createdByUserId WHERE m.id = ?`)
-    .get(id) as Record<string, unknown> | undefined;
+  const row = getAdminMediaByIdStmt.get(id);
   return row ? rowToMedia(row) : null;
 }
 

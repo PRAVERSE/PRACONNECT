@@ -105,7 +105,7 @@ function downloadHeaders(
   const headers: Record<string, string> = {
     'Content-Type': item.mimeType ?? 'application/octet-stream',
     'Accept-Ranges': 'bytes',
-    'Cache-Control': 'private, no-store',
+    'Cache-Control': 'private, max-age=86400',
   };
   if (range) {
     headers['Content-Range'] = `bytes ${range.start}-${range.end}/${size}`;

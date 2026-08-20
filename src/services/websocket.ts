@@ -206,7 +206,7 @@ class WebSocketService {
 
     const stopTimer = setTimeout(() => {
       this.sendTypingStop(conversationId);
-    }, 2000);
+    }, 5000);
     this.typingStopTimers.set(conversationId, stopTimer);
   }
 
@@ -252,6 +252,15 @@ class WebSocketService {
       type: 'messages:read',
       conversationId,
       throughSequenceId,
+    });
+  }
+
+  public sendReaction(conversationId: string, messageId: string, emoji: string): boolean {
+    return this.send({
+      type: 'message:reaction',
+      conversationId,
+      messageId,
+      emoji,
     });
   }
 

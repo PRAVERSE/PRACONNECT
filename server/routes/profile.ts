@@ -8,9 +8,107 @@ import type { Context } from 'hono';
 import { requireAuth } from '../middleware/auth';
 import { db } from '../db/index';
 import { getUserRoomStats } from '../rooms/history';
+import { validateName, validateUsername, sanitizeUser, apiError } from '../auth/auth';
+import { nowIso } from '../rooms/time';
+
+const RESTRICTED_USERNAMES = new Set([
+  'admin', 'administrator', 'root', 'system', 'support',
+  'praconnect', 'api', 'bot', 'mod', 'moderator', 'null', 'undefined'
+]);
 
 const profile = new Hono();
 profile.use('*', requireAuth);
+
+profile.get('/', (c: Context) => {
+  const userId = c.get('userId');
+  const row = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as Record<string, unknown> | undefined;
+  if (!row) return c.json(apiError('USER_NOT_FOUND', 'User not found.'), 404);
+  const safeUser = sanitizeUser(row);
+  return c.json({
+    user: safeUser,
+    profile: {
+      name: safeUser.name,
+      username: safeUser.username,
+      avatar: safeUser.avatarUrl || safeUser.name.charAt(0).toUpperCase() || 'U',
+      bio: (row.bio as string) ?? '',
+      email: safeUser.email,
+    },
+  });
+});
+
+profile.patch('/', async (c: Context) => {
+  const userId = c.get('userId');
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body !== 'object') {
+    return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
+  }
+
+  const existingRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as Record<string, unknown> | undefined;
+  if (!existingRow) return c.json(apiError('USER_NOT_FOUND', 'User not found.'), 404);
+
+  let newName = existingRow.name as string;
+  let newUsername = existingRow.username as string;
+  let newAvatarUrl = (existingRow.avatarUrl as string | null) ?? null;
+  let newBio = (existingRow.bio as string | null) ?? null;
+
+  if (typeof body.name === 'string') {
+    const trimmedName = body.name.trim();
+    const nameErr = validateName(trimmedName);
+    if (nameErr) return c.json(apiError('VALIDATION_ERROR', nameErr), 400);
+    newName = trimmedName;
+  }
+
+  if (typeof body.username === 'string') {
+    const trimmedUsername = body.username.trim();
+    const usernameErr = validateUsername(trimmedUsername);
+    if (usernameErr) return c.json(apiError('VALIDATION_ERROR', usernameErr), 400);
+
+    if (RESTRICTED_USERNAMES.has(trimmedUsername.toLowerCase())) {
+      return c.json(apiError('VALIDATION_ERROR', 'This username is reserved and cannot be used.'), 400);
+    }
+
+    const duplicate = db
+      .prepare('SELECT id FROM users WHERE lower(username) = lower(?) AND id != ?')
+      .get(trimmedUsername, userId);
+    if (duplicate) {
+      return c.json(apiError('USERNAME_TAKEN', 'An account with this username already exists.'), 409);
+    }
+    newUsername = trimmedUsername;
+  }
+
+  if (typeof body.avatarUrl === 'string') {
+    const trimmed = body.avatarUrl.trim();
+    newAvatarUrl = trimmed.length > 0 ? trimmed.slice(0, 2000) : null;
+  } else if (typeof body.avatar === 'string') {
+    const trimmed = body.avatar.trim();
+    newAvatarUrl = trimmed.length > 0 ? trimmed.slice(0, 2000) : null;
+  }
+
+  if (typeof body.bio === 'string') {
+    const trimmed = body.bio.trim();
+    newBio = trimmed.length > 0 ? trimmed.slice(0, 500) : null;
+  }
+
+  const now = nowIso();
+  db.prepare(
+    'UPDATE users SET name = ?, username = ?, avatarUrl = ?, bio = ?, updatedAt = ? WHERE id = ?'
+  ).run(newName, newUsername, newAvatarUrl, newBio, now, userId);
+
+  const updatedRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as Record<string, unknown>;
+  const safeUser = sanitizeUser(updatedRow);
+
+  return c.json({
+    ok: true,
+    user: safeUser,
+    profile: {
+      name: safeUser.name,
+      username: safeUser.username,
+      avatar: safeUser.avatarUrl || safeUser.name.charAt(0).toUpperCase() || 'U',
+      bio: (updatedRow.bio as string) ?? '',
+      email: safeUser.email,
+    },
+  });
+});
 
 profile.get('/stats', (c: Context) => {
   const userId = c.get('userId');

@@ -192,20 +192,11 @@ export function lockToggleLabel(isLocked: boolean): string {
 }
 
 /** WhatsApp-style conversation context menu. */
-export function buildConversationMenuItems(conversation: ContextMenuConversation, options: ConversationMenuOptions): ContextMenuItem[] {
-  const listItems: ContextMenuItem[] = options.lists.map((list) => {
-    const member = list.conversationIds.includes(options.conversationKey);
-    return { id: `list:${list.id}`, label: `${member ? 'Remove from' : 'Add to'} ${list.name}`, disabled: false };
-  });
-  listItems.push({ id: 'list:new', label: 'New list' });
-
+export function buildConversationMenuItems(conversation: ContextMenuConversation, _options?: ConversationMenuOptions): ContextMenuItem[] {
   return [
-    { id: 'archive', label: archiveToggleLabel(conversation.archived) },
-    { id: 'lock', label: lockToggleLabel(conversation.locked) },
     { id: 'pin', label: chatPinToggleLabel(conversation.pinned) },
     { id: 'read', label: readToggleLabel(conversation.unreadCount) },
     { id: 'favourite', label: favouriteToggleLabel(conversation.favourite) },
-    { id: 'lists', label: 'Add to list', submenu: listItems },
     { id: 'clear', label: 'Clear chat', danger: true, separatorBefore: true },
     { id: 'delete', label: 'Delete chat', danger: true },
   ];

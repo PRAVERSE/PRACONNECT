@@ -3,6 +3,7 @@
 // Covers Chat Media, Chunked Uploads, Text Editing, Deletions, Search,
 // Disappearing Messages, WebPush Subscriptions, WebRTC Call Signaling, and Phase 1 Regressions.
 
+import os from 'node:os';
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -10,39 +11,45 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { Readable } from 'node:stream';
 import { WebSocket } from 'ws';
-import { db } from '../db/index';
-import { createApp } from '../app';
-import { setupWebSocketServer, closeWebSocketServer } from '../realtime/ws';
-import {
+
+const TMP_ROOT = path.join(os.tmpdir(), `praconnect-p2-${process.pid}-${Date.now()}`);
+fs.mkdirSync(TMP_ROOT, { recursive: true });
+
+process.env.NODE_ENV = 'test';
+process.env.DATABASE_PATH = path.join(TMP_ROOT, 'test.db');
+process.env.CHAT_MEDIA_STORAGE_DIR = path.join(TMP_ROOT, 'uploads_chat');
+
+const { db, closeDatabase } = await import('../db/index');
+const { createApp } = await import('../app');
+const { setupWebSocketServer, closeWebSocketServer } = await import('../realtime/ws');
+const {
   startChatMediaUpload,
   uploadChatMediaChunk,
   completeChatMediaUpload,
   readChatMediaStream,
-} from '../social/mediaService';
-import {
+} = await import('../social/mediaService');
+const {
   editDirectMessage,
   searchDirectMessages,
   setDisappearingDuration,
   sendDirectMessage,
   listDirectMessages,
   deleteMessageForEveryone,
-} from '../social/service';
-import {
+} = await import('../social/service');
+const {
   savePushSubscription,
   listUserPushSubscriptions,
   removePushSubscription,
   notifyUserPush,
-} from '../push/pushService';
+} = await import('../push/pushService');
+const { createSession } = await import('../auth/session');
 
 // Test setup
 let server: http.Server;
 let baseUrl: string;
 let wsUrl: string;
 
-const TEST_DIR = path.join(process.cwd(), 'scratch', `test_p2_${Date.now()}`);
-process.env.CHAT_MEDIA_STORAGE_DIR = path.join(TEST_DIR, 'uploads_chat');
-
-import { createSession } from '../auth/session';
+const TEST_DIR = process.env.CHAT_MEDIA_STORAGE_DIR;
 
 async function createTestUser(id: string, name: string, username: string, email: string) {
   db.prepare(
@@ -94,7 +101,10 @@ before(async () => {
 after(async () => {
   closeWebSocketServer();
   await new Promise<void>((resolve) => server.close(() => resolve()));
-  await fs.promises.rm(TEST_DIR, { recursive: true, force: true }).catch(() => {});
+  try {
+    closeDatabase?.();
+  } catch {}
+  await fs.promises.rm(TMP_ROOT, { recursive: true, force: true }).catch(() => {});
 });
 
 describe('Phase 2 — Advanced Messaging Tests', () => {

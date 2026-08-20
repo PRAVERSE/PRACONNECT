@@ -103,12 +103,14 @@ export async function getGoogleUserInfo(accessToken: string): Promise<GoogleUser
 // ─── Username derivation helper ───────────────────────────────────────────────
 
 /**
- * Derive a candidate username from a Google name/email.
+ * Derive a candidate username from a Google display name without ever using or exposing email.
  * The caller should check uniqueness and append a suffix if needed.
  */
-export function deriveUsernameFromGoogle(name: string, email: string): string {
-  // Try to use the local part of the email first (more predictable)
-  const local = email.split('@')[0] ?? '';
-  const base = local.replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 28) || 'user';
-  return base.toLowerCase();
+export function deriveUsernameFromGoogle(name: string, _email?: string): string {
+  const cleanName = (name || '').replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 20).toLowerCase();
+  if (cleanName.length >= 3 && !/^[._-]|[._-]$/.test(cleanName)) {
+    return cleanName;
+  }
+  const suffix = crypto.randomUUID().replace(/-/g, '').slice(0, 6);
+  return `user-${suffix}`;
 }
