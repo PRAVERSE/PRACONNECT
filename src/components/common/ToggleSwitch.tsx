@@ -13,16 +13,16 @@ export const ToggleSwitch: React.FC<ToggleSwitchProps> = ({ checked, onChange, l
     aria-checked={checked}
     aria-label={label}
     onClick={onChange}
-    className={`w-11 h-6 rounded-full relative cursor-pointer flex items-center shrink-0 transition-all duration-200 ${
+    className={`w-11 h-6 rounded-full relative cursor-pointer flex items-center shrink-0 transition-all duration-150 border ${
       checked
-        ? 'bg-[var(--emphasis)] shadow-[0_2px_12px_rgba(255,255,255,0.25)]'
-        : 'bg-[var(--bg-glass)]'
+        ? 'bg-[var(--emphasis)] border-[var(--emphasis)] shadow-[0_2px_12px_var(--emphasis-glow)]'
+        : 'bg-[var(--bg-glass)] border-[var(--border-hairline)]'
     }`}
   >
     <span
-      className={`block w-5 h-5 rounded-full transition-transform duration-200 ${
+      className={`block w-5 h-5 rounded-full transition-transform duration-150 ${
         checked
-          ? 'bg-[var(--bg)] translate-x-[22px]'
+          ? 'bg-[var(--bg)] translate-x-[20px]'
           : 'bg-[var(--text-tertiary)] translate-x-[2px]'
       }`}
     />

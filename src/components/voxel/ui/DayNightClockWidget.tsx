@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Sun, Moon, Play, Pause, FastForward, Sunrise, Sunset, BedDouble, ChevronDown, ChevronUp, Clock } from 'lucide-react';
+import { Sun, Moon, Play, Pause, Sunrise, Sunset, BedDouble, ChevronDown, ChevronUp, Clock } from 'lucide-react';
 
 interface DayNightClockWidgetProps {
   timeOfDay: number;

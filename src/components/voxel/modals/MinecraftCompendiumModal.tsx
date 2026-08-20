@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { Search, BookOpen, Sparkles, X, Compass, Box, Shield, Zap, Heart, Wrench } from 'lucide-react';
-import { MINECRAFT_A_TO_Z, FeatureEntry } from '../../../data/minecraftCompendiumData';
+import { MINECRAFT_A_TO_Z } from '../../../data/minecraftCompendiumData';
 
 interface MinecraftCompendiumModalProps {
   isOpen: boolean;

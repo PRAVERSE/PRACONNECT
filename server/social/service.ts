@@ -412,6 +412,7 @@ export interface MessageReactionGroup {
 export interface DirectMessage {
   id: string;
   senderId: string;
+  recipientId?: string;
   text: string;
   createdAt: string;
   /** Canonical pair id (sorted user ids joined ':') — assigned server-side. */
@@ -716,6 +717,7 @@ function mapDirectMessage(userId: string, row: DirectMessageRow): DirectMessage 
   return {
     id: row.id,
     senderId: row.senderId,
+    recipientId: row.recipientId,
     text: messageTextFor(row),
     createdAt: row.createdAt,
     conversationId: row.conversationId ?? conversationIdFor(row.senderId, row.recipientId),
@@ -770,21 +772,31 @@ export function sendDirectMessage(
     return { ok: false, error: Errors.notFriends() };
   }
   const trimmed = text.trim();
-  if (trimmed.length === 0 && !options.forwardedFromMessageId && !options.attachmentId) {
+  const replyId = typeof options.replyToMessageId === 'string' && options.replyToMessageId.trim()
+    ? options.replyToMessageId.trim()
+    : undefined;
+  const fwdId = typeof options.forwardedFromMessageId === 'string' && options.forwardedFromMessageId.trim()
+    ? options.forwardedFromMessageId.trim()
+    : undefined;
+  const attachId = typeof options.attachmentId === 'string' && options.attachmentId.trim()
+    ? options.attachmentId.trim()
+    : undefined;
+
+  if (trimmed.length === 0 && !fwdId && !attachId) {
     return { ok: false, error: Errors.validation('Message cannot be empty.') };
   }
   if (trimmed.length > 2000) return { ok: false, error: Errors.validation('Message is too long (max 2000 characters).') };
 
-  if (options.replyToMessageId) {
-    const access = getMessageAccess(userId, options.replyToMessageId);
+  if (replyId) {
+    const access = getMessageAccess(userId, replyId);
     if (!access.ok) return { ok: false, error: access.error };
     // The reply must stay inside the same conversation pair.
     if (access.conversationId !== conversationIdFor(userId, friendId)) {
       return { ok: false, error: Errors.validation('Reply target is not in this conversation.') };
     }
   }
-  if (options.forwardedFromMessageId) {
-    const access = getMessageAccess(userId, options.forwardedFromMessageId);
+  if (fwdId) {
+    const access = getMessageAccess(userId, fwdId);
     if (!access.ok) return { ok: false, error: access.error };
   }
 
@@ -823,9 +835,9 @@ export function sendDirectMessage(
       sequenceId,
       trimmed,
       now,
-      options.replyToMessageId ?? null,
-      options.forwardedFromMessageId ?? null,
-      options.attachmentId ?? null,
+      replyId ?? null,
+      fwdId ?? null,
+      attachId ?? null,
       expiresAt,
       options.vanish ? 1 : 0
     );
@@ -839,7 +851,13 @@ export function sendDirectMessage(
   db.prepare('DELETE FROM conversationDeletions WHERE conversationId = ?').run(conversationId);
 
   const row = db.prepare('SELECT * FROM directMessages WHERE id = ?').get(id) as DirectMessageRow;
-  return { ok: true, message: mapDirectMessage(userId, row), sequenceId };
+  const mapped = mapDirectMessage(userId, row);
+
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[DM DEBUG] persisted', { messageId: mapped.id, sequenceId: mapped.sequenceId, conversationId: mapped.conversationId });
+  }
+
+  return { ok: true, message: mapped, sequenceId };
 }
 
 // ─── Message forwarding ──────────────────────────────────────────────────────

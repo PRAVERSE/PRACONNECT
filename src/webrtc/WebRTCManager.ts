@@ -1361,108 +1361,101 @@ export class WebRTCManager {
           return false;
         }
 
-        // Recovery path: when the browser reports ZERO video inputs with
-        // permission granted (or denied), getUserMedia can only ever throw
-        // NotFoundError — hammering it changes nothing. Instead arm a bounded
-        // one-shot devicechange watcher and surface a useful diagnostic.
-        // 'prompt' / unknown permission still attempts getUserMedia once,
-        // because the permission prompt itself can make devices appear.
-        const skipAcquisition = devCounts.videoInputs === 0 && (permissionState === 'granted' || permissionState === 'denied');
-        if (skipAcquisition) {
-          this.setCameraState('FAILED_NO_DEVICE', `videoinput===0 with permission=${permissionState}`);
-          console.log('[CAMERA DEBUG] CAMERA DEVICE NOT EXPOSED BY BROWSER:', {
-            ts: new Date().toISOString(),
-            videoInputsReported: devCounts.videoInputs,
-            audioInputsReported: devCounts.audioInputs,
-            permissionState,
-            managerId: this.managerId,
-            destroyed: this.isDestroyed,
-            action: 'skipping getUserMedia — waiting for devicechange',
-          });
-          console.log('[CAMERA LIFECYCLE] videoinput === 0, permission =', permissionState, '— skipping getUserMedia, arming device recovery watcher');
-          this.setCameraState('WAITING_FOR_DEVICE', 'arming one-shot devicechange watcher');
-          this.armCameraDeviceRecovery();
-          if (permissionState === 'denied') {
-            const deniedDiag: MediaDiagnosticError = {
-              type: 'permission_denied',
-              title: 'Camera Permission Blocked',
-              message: 'Camera permission for localhost:3000 is blocked. Allow camera access in Chrome site settings.',
-              actionableHint: 'Click the lock icon next to localhost:3000 in the address bar, set Camera to Allow, then click Try Again.',
-              originalErrorName: 'NotAllowedError',
-            };
-            this.onError(deniedDiag);
-          } else {
-            const noCamDiag: MediaDiagnosticError = {
-              type: 'device_not_found',
-              title: 'No Camera Detected',
-              message:
-                'The browser reports no camera device (permission is granted, videoinput count is 0). Check Windows camera privacy settings, Device Manager, or VM/remote-session camera pass-through.',
-              actionableHint:
-                'Check OS-level camera availability (Windows Settings > Privacy & security > Camera, Device Manager) — the app will retry automatically when the device reappears.',
-              originalErrorName: 'NotFoundError',
-            };
-            this.onError(noCamDiag);
-          }
-          return false;
-        }
-
         let stream: MediaStream | null = null;
         let lastError: any = null;
 
-        // Try native video constraint first for optimal DirectShow & MediaFoundation driver compatibility
-        const constraintCandidates: (boolean | MediaTrackConstraints)[] = [
-          true,
-          { width: { ideal: 640 }, height: { ideal: 480 } },
-        ];
-
-        // Diagnostic B — immediately BEFORE the getUserMedia call.
-        console.log('[CAMERA DEBUG] getUserMedia requested:', {
-          ts: new Date().toISOString(),
-          constraints: constraintCandidates,
-          videoInputsReported: devCounts.videoInputs,
-          permissionState,
-          managerId: this.managerId,
-          destroyed: this.isDestroyed,
-          cameraState: this.cameraState,
-        });
-
-        for (let i = 0; i < constraintCandidates.length; i++) {
-          console.log(`[CAMERA LIFECYCLE] getUserMedia invocation ${i + 1}/${constraintCandidates.length}:`, {
-            ts: new Date().toISOString(),
-            constraints: constraintCandidates[i],
-            videoInputsReported: devCounts.videoInputs,
-          });
+        // Windows MediaFoundation / DirectShow warm-up:
+        // On many Windows systems the camera driver initialises lazily and the
+        // first 1-2 getUserMedia calls return NotFoundError even though the
+        // device physically exists and Chrome's site permission is granted.
+        // We attempt up to 3 warm-up passes (each with progressive delay) before
+        // falling through to the richer constraint candidates below.
+        const WARMUP_ATTEMPTS = 3;
+        for (let w = 0; w < WARMUP_ATTEMPTS; w++) {
           try {
-            stream = await navigator.mediaDevices.getUserMedia({
-              video: constraintCandidates[i],
-              audio: false,
-            });
+            console.log(`[CAMERA LIFECYCLE] Windows warm-up attempt ${w + 1}/${WARMUP_ATTEMPTS}`);
+            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
             if (this.isDestroyed) {
-              if (stream) {
-                stream.getVideoTracks().forEach((t) => this.stopTrackSafely(t, 'startCamera (manager destroyed mid-flight)', 'camera'));
-              }
+              stream?.getVideoTracks().forEach((t) => this.stopTrackSafely(t, 'startCamera warm-up destroyed', 'camera'));
               return false;
             }
             if (stream && stream.getVideoTracks().length > 0) {
+              console.log(`[CAMERA LIFECYCLE] warm-up succeeded on attempt ${w + 1}`);
               break;
             }
-          } catch (err: any) {
-            lastError = err;
-            const errName = err?.name || '';
-            const errMsg = (err?.message || '').toLowerCase();
-
-            // Fail-fast on permission denied, hardware lock, or driver timeout
+          } catch (wErr: any) {
+            const wErrName = wErr?.name || '';
+            // Abort immediately on hard errors — NotFoundError may resolve on retry
             if (
-              errName === 'NotAllowedError' ||
-              errName === 'PermissionDeniedError' ||
-              errName === 'AbortError' ||
-              errName === 'NotReadableError' ||
-              errMsg.includes('timeout')
+              wErrName === 'NotAllowedError' ||
+              wErrName === 'PermissionDeniedError' ||
+              wErrName === 'OverconstrainedError'
             ) {
-              throw err;
+              throw wErr;
             }
+            lastError = wErr;
+            console.warn(`[CAMERA LIFECYCLE] warm-up attempt ${w + 1} failed (${wErrName}):`, wErr.message);
+            if (w < WARMUP_ATTEMPTS - 1) {
+              // Progressive delay: 400ms → 800ms to let the driver wake up
+              await new Promise((resolve) => setTimeout(resolve, 400 * (w + 1)));
+            }
+          }
+        }
 
-            console.warn(`[WebRTC] getUserMedia attempt ${i + 1} failed (${errName}):`, err.message);
+        // If warm-up already acquired a stream, skip the constraint candidates loop
+        if (!stream || stream.getVideoTracks().length === 0) {
+          // Try native video constraint first for optimal DirectShow & MediaFoundation driver compatibility
+          const constraintCandidates: (boolean | MediaTrackConstraints)[] = [
+            { width: { ideal: 1280 }, height: { ideal: 720 } },
+            { width: { ideal: 640 }, height: { ideal: 480 } },
+            { facingMode: 'user' },
+          ];
+
+          console.log('[CAMERA DEBUG] getUserMedia constraint candidates:', {
+            ts: new Date().toISOString(),
+            videoInputsReported: devCounts.videoInputs,
+            permissionState,
+            managerId: this.managerId,
+          });
+
+          for (let i = 0; i < constraintCandidates.length; i++) {
+            console.log(`[CAMERA LIFECYCLE] getUserMedia invocation ${i + 1}/${constraintCandidates.length}:`, {
+              ts: new Date().toISOString(),
+              constraints: constraintCandidates[i],
+              videoInputsReported: devCounts.videoInputs,
+            });
+            try {
+              stream = await navigator.mediaDevices.getUserMedia({
+                video: constraintCandidates[i],
+                audio: false,
+              });
+              if (this.isDestroyed) {
+                if (stream) {
+                  stream.getVideoTracks().forEach((t) => this.stopTrackSafely(t, 'startCamera (manager destroyed mid-flight)', 'camera'));
+                }
+                return false;
+              }
+              if (stream && stream.getVideoTracks().length > 0) {
+                break;
+              }
+            } catch (err: any) {
+              lastError = err;
+              const errName = err?.name || '';
+              const errMsg = (err?.message || '').toLowerCase();
+
+              // Fail-fast on permission denied, hardware lock, or driver timeout
+              if (
+                errName === 'NotAllowedError' ||
+                errName === 'PermissionDeniedError' ||
+                errName === 'AbortError' ||
+                errName === 'NotReadableError' ||
+                errMsg.includes('timeout')
+              ) {
+                throw err;
+              }
+
+              console.warn(`[WebRTC] getUserMedia attempt ${i + 1} failed (${errName}):`, err.message);
+            }
           }
         }
 
@@ -1673,6 +1666,24 @@ export class WebRTCManager {
             console.log('F. OS/browser issue outside app -> enumeration and permission look fine yet capture fails:', devSummary.videoDeviceCount > 0 && permissionState !== 'denied');
             console.groupEnd();
             if (devSummary.videoDeviceCount === 0) {
+              // Chromium hides videoinput from enumerateDevices when the
+              // permission has not been formally granted yet (prompt state).
+              // In that case the right action is to surface a "please grant
+              // permission" message, NOT "no camera detected".
+              if (permissionState === 'prompt' || permissionState === null) {
+                const promptDiag: MediaDiagnosticError = {
+                  type: 'permission_denied',
+                  title: 'Camera Access Needed',
+                  message:
+                    'Chrome needs permission to access your camera. Click the camera icon in the address bar and select \'Allow\', then click Try Again.',
+                  actionableHint:
+                    'Click the camera/lock icon next to the URL, choose \'Allow\' for Camera, then click Try Again.',
+                  originalErrorName: err?.name,
+                };
+                this.onError(promptDiag);
+                this.setCameraState('IDLE', 'permission prompt required — user can retry after granting');
+                return false;
+              }
               this.setCameraState('FAILED_NO_DEVICE', `NotFoundError with videoDeviceCount===0 (permission=${permissionState})`);
               console.log('[CAMERA DEBUG] CAMERA DEVICE NOT EXPOSED BY BROWSER:', {
                 ts: new Date().toISOString(),
@@ -1689,9 +1700,9 @@ export class WebRTCManager {
                 type: 'device_not_found',
                 title: 'No Camera Detected',
                 message:
-                  'No camera detected. Check OS-level camera permissions for this browser, or that a camera is connected/passed through if running in a VM or remote session.',
+                  'No camera detected. Check Windows Settings > Privacy & security > Camera and ensure camera access is enabled for this browser.',
                 actionableHint:
-                  'Check OS-level camera permissions for this browser, or ensure a camera is connected/passed through.',
+                  'Open Windows Settings > Privacy & security > Camera and confirm camera access is ON for this browser.',
                 originalErrorName: err?.name,
               };
               this.onError(noCamDiag);

@@ -2,14 +2,11 @@ import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import {
   Play,
-  RotateCcw,
   Sun,
   Moon,
   Download,
   Boxes,
-  Sliders,
   Sparkles,
-  Zap,
   Shield,
   Heart,
   Utensils,
@@ -19,20 +16,13 @@ import {
   VolumeX,
   Bed,
   CloudRain,
-  HelpCircle,
-  Eye,
   Clock,
   Flame,
-  Archive,
-  ChevronRight,
-  Sparkle,
   BookOpen,
   Compass,
   Wrench,
   Terminal,
   MoreVertical,
-  Users,
-  Smile,
   X
 } from 'lucide-react';
 import { VoxelEngine, BlockType, BLOCK_CONFIGS } from './engine/VoxelEngine';

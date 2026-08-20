@@ -20,7 +20,6 @@ import {
   updateReadWatermark,
   syncMessagesAfterSequence,
   getUserPrivacySettings,
-  conversationIdFor,
   DirectMessage,
   getUserPublicProfile,
 } from '../social/service';
@@ -268,6 +267,9 @@ async function handleClientEvent(ws: ExtWebSocket, userId: string, event: any): 
 
       const peerId = getPeerUserIdFromConversation(conversationId, userId);
       if (!peerId || !isAcceptedFriendship(userId, peerId)) {
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('[DM DEBUG] error', { code: 'FRIENDSHIP_REQUIRED', clientMessageId });
+        }
         sendJson(ws, {
           type: 'error',
           code: 'FRIENDSHIP_REQUIRED',
@@ -277,13 +279,24 @@ async function handleClientEvent(ws: ExtWebSocket, userId: string, event: any): 
         return;
       }
 
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[DM DEBUG] send', { clientMessageId, conversationId, userId });
+      }
+
+      const replyId = typeof replyToMessageId === 'string' && replyToMessageId.trim() ? replyToMessageId.trim() : undefined;
+      const fwdId = typeof forwardedFromMessageId === 'string' && forwardedFromMessageId.trim() ? forwardedFromMessageId.trim() : undefined;
+      const attachId = typeof attachmentId === 'string' && attachmentId.trim() ? attachmentId.trim() : undefined;
+
       const result = sendDirectMessage(userId, peerId, text ?? '', {
-        replyToMessageId,
-        forwardedFromMessageId,
-        attachmentId,
-        vanish,
+        replyToMessageId: replyId,
+        forwardedFromMessageId: fwdId,
+        attachmentId: attachId,
+        vanish: Boolean(vanish),
       });
       if (!result.ok || !result.message) {
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('[DM DEBUG] error', { code: result.error?.code ?? 'MESSAGE_FAILED', clientMessageId });
+        }
         sendJson(ws, {
           type: 'error',
           code: result.error?.code ?? 'MESSAGE_FAILED',
@@ -294,6 +307,10 @@ async function handleClientEvent(ws: ExtWebSocket, userId: string, event: any): 
       }
 
       const message: DirectMessage = result.message;
+
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[DM DEBUG] ack', { clientMessageId, messageId: message.id });
+      }
 
       // Handle bounded in-memory vanish store
       if (vanish) {
@@ -334,6 +351,9 @@ async function handleClientEvent(ws: ExtWebSocket, userId: string, event: any): 
       if (Number.isInteger(seq) && seq > 0) {
         const res = updateDeliveryWatermark(userId, peerId, seq);
         if (res.ok && res.newWatermark === seq) {
+          if (process.env.NODE_ENV !== 'production') {
+            console.log('[DM DEBUG] delivered', { conversationId, throughSequenceId: seq });
+          }
           // Inform peer (sender) that recipient has delivered through sequenceId
           broadcastToUser(peerId, {
             type: 'message:delivery',
@@ -356,12 +376,16 @@ async function handleClientEvent(ws: ExtWebSocket, userId: string, event: any): 
         const res = updateReadWatermark(userId, peerId, seq);
         const privacy = getUserPrivacySettings(userId);
         if (res.ok && privacy.readReceipts && res.newWatermark === seq) {
+          if (process.env.NODE_ENV !== 'production') {
+            console.log('[DM DEBUG] read', { conversationId, throughSequenceId: seq });
+          }
           // Inform peer (sender) that recipient has read messages through sequenceId
           broadcastToUser(peerId, {
             type: 'messages:read',
             conversationId,
             throughSequenceId: seq,
             readerUserId: userId,
+            readerId: userId,
           });
         }
       }

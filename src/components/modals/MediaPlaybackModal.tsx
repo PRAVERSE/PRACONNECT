@@ -14,10 +14,24 @@ interface MediaPlaybackModalProps {
  * NOT Room integration — Room playback remains a Phase C concern.
  */
 export const MediaPlaybackModal: React.FC<MediaPlaybackModalProps> = ({ item, onClose }) => {
+  const videoRef = React.useRef<HTMLVideoElement>(null);
+
   useEffect(() => {
     if (!item) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
+      if (videoRef.current) {
+        if (e.key === 'j' || e.key === 'J') {
+          e.preventDefault();
+          videoRef.current.currentTime = Math.max(0, videoRef.current.currentTime - 10);
+        } else if (e.key === 'l' || e.key === 'L') {
+          e.preventDefault();
+          videoRef.current.currentTime = Math.min(
+            videoRef.current.duration || 0,
+            videoRef.current.currentTime + 10
+          );
+        }
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
@@ -52,6 +66,7 @@ export const MediaPlaybackModal: React.FC<MediaPlaybackModalProps> = ({ item, on
 
         <div className="relative w-full aspect-video bg-black rounded-xl overflow-hidden border border-[var(--border-hairline)]">
           <video
+            ref={videoRef}
             key={item.id}
             src={buildMediaDownloadUrl(item.id)}
             controls

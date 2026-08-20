@@ -24,7 +24,6 @@ import {
   Maximize,
   Minimize,
   PictureInPicture,
-  Settings,
   Columns,
   GripVertical,
   Users,
@@ -34,7 +33,9 @@ import {
   Shield,
   MoreVertical,
   Volume2 as AudioOn,
-  Loader
+  Loader,
+  RotateCcw,
+  RotateCw
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { RoomFile, Participant, MediaItem } from '../../types';
@@ -783,14 +784,10 @@ export const RoomView: React.FC = () => {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isTheaterMode, setIsTheaterMode] = useState(false);
   const [isPiP, setIsPiP] = useState(false);
-  const [showQualityMenu, setShowQualityMenu] = useState(false);
-  const [selectedQuality, setSelectedQuality] = useState('1080p HD (Auto)');
 
   // Fullscreen Webcam Overlay States
   const [showFullscreenWebcam, setShowFullscreenWebcam] = useState(true);
   const [webcamExpanded, setWebcamExpanded] = useState(false);
-
-  const qualityOptions = ['1080p HD (Auto)', '1080p Full HD', '720p HD', '480p SD', '360p'];
 
   // Whiteboard Canvas State
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -923,6 +920,54 @@ export const RoomView: React.FC = () => {
       });
     }
   };
+
+  // 10s Relative Seek (Forward / Backward)
+  const seekRelative = (deltaSeconds: number) => {
+    if (!isHost) return;
+    const video = getStageVideo();
+    if (video) {
+      const maxDuration = duration || video.duration || 0;
+      const targetTime = Math.max(0, Math.min(maxDuration, (video.currentTime || 0) + deltaSeconds));
+      video.currentTime = targetTime;
+      setCurrentTime(targetTime);
+      setRoomPlayback({
+        isPlaying,
+        position: targetTime,
+      });
+    }
+  };
+
+  // Keyboard shortcuts for video playback (J: -10s backward, L: +10s forward)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+
+      if (!currentRoom?.currentMedia) return;
+
+      const key = e.key.toLowerCase();
+      if (key === 'j') {
+        e.preventDefault();
+        seekRelative(-10);
+      } else if (key === 'l') {
+        e.preventDefault();
+        seekRelative(10);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [currentRoom?.currentMedia, isHost, duration, isPlaying]);
 
   // Fullscreen Mode
   const toggleFullscreen = () => {
@@ -1622,7 +1667,11 @@ export const RoomView: React.FC = () => {
                                 setVideoError(false);
                                 setVideoErrorInfo(null);
                                 if (currentRoom?.currentMedia) {
-                                  setRoomMedia({ ...currentRoom.currentMedia });
+                                  if (currentRoom.currentMedia.mediaType === 'library' && currentRoom.currentMedia.mediaId) {
+                                    void setRoomLibraryMedia(currentRoom.currentMedia.mediaId);
+                                  } else {
+                                    setRoomMedia({ ...currentRoom.currentMedia });
+                                  }
                                 }
                               }}
                               className="px-3.5 h-8 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-xs font-bold rounded-xl transition-all cursor-pointer shadow-md"
@@ -1640,7 +1689,7 @@ export const RoomView: React.FC = () => {
                       </div>
                     )}
                   </>
-                ) : mediaConversion?.status === 'processing' && currentRoom.currentMedia?.mediaType !== 'library' ? (
+                ) : mediaConversion?.status === 'processing' && currentRoom.currentMedia?.mediaType !== 'library' && !currentRoom.currentMedia?.mediaId ? (
                   renderPreparingOverlay(mediaConversion.title)
                 ) : currentRoom.currentMedia && isRawMkvUrl(currentRoom.currentMedia?.url ?? '') ? (
                   /* A raw MKV should never reach <video src> — the server
@@ -1648,9 +1697,7 @@ export const RoomView: React.FC = () => {
                      sets an MKV URL, show preparation status instead of the
                      generic "Unable to Stream Video Source" error. */
                   renderPreparingOverlay()
-                ) : mediaConversion?.status === 'processing' ? (
-                  renderPreparingOverlay(mediaConversion.title)
-                ) : mediaConversion?.status === 'failed' ? (
+                ) : mediaConversion?.status === 'failed' && currentRoom.currentMedia?.mediaType !== 'library' && !currentRoom.currentMedia?.mediaId ? (
                   <div className="absolute inset-0 z-30 bg-black/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center text-white space-y-3">
                     <AlertTriangle className="w-10 h-10 text-rose-400 mx-auto" />
                     <div>
@@ -1819,14 +1866,6 @@ export const RoomView: React.FC = () => {
                   </AnimatePresence>
                 )}
 
-                {/* Top Overlay Badge: Stream Quality */}
-                <div className="absolute top-3 left-3 right-3 flex items-center justify-between pointer-events-none z-20">
-                  {currentRoom.currentMedia && !isLocalMovieMedia && (
-                    <div className="px-2.5 py-1 rounded-full bg-black/75 backdrop-blur-md border border-white/20 text-white text-[10px] font-mono font-bold">
-                      {selectedQuality}
-                    </div>
-                  )}
-                </div>
 
                 {/* Rich Video Player Controls Overlay Bar */}
                 {currentRoom.currentMedia && (
@@ -1857,8 +1896,8 @@ export const RoomView: React.FC = () => {
 
                     {/* Controls Strip */}
                     <div className="flex items-center justify-between">
-                      {/* Left: Play/Pause, Volume, Time */}
-                      <div className="flex items-center gap-3">
+                      {/* Left: Play/Pause, -10s, +10s, Volume, Time */}
+                      <div className="flex items-center gap-2.5">
                         {isHost ? (
                           <button
                             onClick={togglePlay}
@@ -1881,6 +1920,46 @@ export const RoomView: React.FC = () => {
                             ) : (
                               <Play className="w-3.5 h-3.5 fill-current opacity-70 translate-x-0.5" />
                             )}
+                          </div>
+                        )}
+
+                        {/* 10s Backward */}
+                        {isHost ? (
+                          <button
+                            onClick={() => seekRelative(-10)}
+                            className="p-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-all flex items-center gap-1 text-xs font-semibold cursor-pointer active:scale-95"
+                            title="Rewind 10s (J)"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span className="text-[10px] font-mono font-bold">10s</span>
+                          </button>
+                        ) : (
+                          <div
+                            className="p-1.5 rounded-lg bg-white/5 text-[var(--text-secondary)]/40 flex items-center gap-1 text-xs font-semibold cursor-default"
+                            title="Synced with host"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5 opacity-50" />
+                            <span className="text-[10px] font-mono font-bold opacity-50">10s</span>
+                          </div>
+                        )}
+
+                        {/* 10s Forward */}
+                        {isHost ? (
+                          <button
+                            onClick={() => seekRelative(10)}
+                            className="p-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-all flex items-center gap-1 text-xs font-semibold cursor-pointer active:scale-95"
+                            title="Forward 10s (L)"
+                          >
+                            <span className="text-[10px] font-mono font-bold">10s</span>
+                            <RotateCw className="w-3.5 h-3.5" />
+                          </button>
+                        ) : (
+                          <div
+                            className="p-1.5 rounded-lg bg-white/5 text-[var(--text-secondary)]/40 flex items-center gap-1 text-xs font-semibold cursor-default"
+                            title="Synced with host"
+                          >
+                            <span className="text-[10px] font-mono font-bold opacity-50">10s</span>
+                            <RotateCw className="w-3.5 h-3.5 opacity-50" />
                           </div>
                         )}
 
@@ -1918,43 +1997,8 @@ export const RoomView: React.FC = () => {
                         )}
                       </div>
 
-                      {/* Right: Quality, Theater, PiP, Fullscreen */}
+                      {/* Right: Theater, PiP, Fullscreen */}
                       <div className="flex items-center gap-2 relative">
-                        {/* Quality Settings Gear */}
-                        <div className="relative">
-                          <button
-                            onClick={() => setShowQualityMenu(!showQualityMenu)}
-                            className="p-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors cursor-pointer group/gear"
-                            title="Playback Quality Settings"
-                          >
-                            <Settings className="w-4 h-4 text-[var(--text-secondary)] group-hover/gear:text-[var(--text-primary)] transition-colors" />
-                          </button>
-
-                          {showQualityMenu && (
-                            <div className="absolute bottom-10 right-0 w-40 bg-[var(--bg-surface-1)] border border-[var(--border-strong)] text-[var(--text-primary)] rounded-xl p-1.5 shadow-2xl text-xs space-y-1 z-50">
-                              <div className="text-[10px] font-bold text-[var(--text-tertiary)] px-2 py-1 uppercase tracking-wider">
-                                Stream Quality
-                              </div>
-                              {qualityOptions.map((q) => (
-                                <button
-                                  key={q}
-                                  onClick={() => {
-                                    setSelectedQuality(q);
-                                    setShowQualityMenu(false);
-                                  }}
-                                  className={`w-full text-left px-2.5 py-1.5 rounded-lg flex items-center justify-between text-xs font-semibold cursor-pointer ${
-                                    selectedQuality === q
-                                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)] font-bold'
-                                      : 'hover:bg-[var(--bg-surface-2)] text-[var(--text-primary)]'
-                                  }`}
-                                >
-                                  <span>{q}</span>
-                                  {selectedQuality === q && <Check className="w-3.5 h-3.5 text-[var(--accent)]" />}
-                                </button>
-                              ))}
-                            </div>
-                          )}
-                        </div>
 
                         {/* Theater Mode Toggle */}
                         <button

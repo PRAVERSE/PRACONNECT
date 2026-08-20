@@ -34,8 +34,6 @@ import {
   isRoomMember,
   memberStatus,
   getRoomOrNull,
-  cleanupEmptyRooms,
-  RoomErrors,
 } from '../rooms/service';
 import type { MediaInput, RoomPayload, RoomError } from '../rooms/service';
 import { emit, emitEphemeral, openEventStream, replayEventsWithMeta } from '../rooms/realtime';
@@ -403,11 +401,39 @@ rooms.post('/:id/media', async (c) => {
   const body = await readJson(c);
   let media: MediaInput | null = null;
 
-  // Phase 6.10: local movies are shared peer-to-peer via WebRTC. The room
-  // stores only lightweight metadata (title / mime type / duration / source
-  // user) — never the file, never a URL. Blob and file URLs are meaningless
-  // outside the host browser and are explicitly rejected.
-  if (body && body.mediaType === 'local-movie') {
+  if (body && (body.mediaType === 'library' || (body.mediaId && typeof body.mediaId === 'string'))) {
+    const mediaId = typeof body.mediaId === 'string' ? body.mediaId.trim() : '';
+    if (!mediaId) {
+      return c.json(apiError('VALIDATION_ERROR', 'mediaId is required.'), 400);
+    }
+    const { getAdminMedia } = await import('../media/service');
+    const item = getAdminMedia(mediaId);
+    if (!item) {
+      return c.json(apiError('MEDIA_NOT_FOUND', 'That media is not available in the library.'), 404);
+    }
+    if (item.status !== 'ready') {
+      return c.json(apiError('MEDIA_NOT_READY', 'That media is not ready for playback.'), 404);
+    }
+    if (!item.published) {
+      return c.json(apiError('MEDIA_UNAVAILABLE', 'That media is not published.'), 404);
+    }
+    if (!item.playableKey) {
+      return c.json(apiError('MEDIA_UNAVAILABLE', 'Playable media is missing.'), 404);
+    }
+    const { getMediaStorage } = await import('../storage/mediaStorage');
+    const storage = getMediaStorage();
+    const stat = await storage.stat(item.playableKey);
+    if (!stat) {
+      return c.json(apiError('MEDIA_UNAVAILABLE', 'Playable media file is missing from storage.'), 404);
+    }
+    media = {
+      title: item.title,
+      mediaType: 'library',
+      mediaId: item.id,
+      duration: item.durationSeconds ?? undefined,
+      mimeType: item.mimeType ?? undefined,
+    };
+  } else if (body && body.mediaType === 'local-movie') {
     if (typeof body.url === 'string' && body.url.trim() !== '') {
       return c.json(
         apiError(

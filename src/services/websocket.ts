@@ -4,8 +4,6 @@
 // typed event dispatching, and typing throttling. Keeps transport mechanics
 // cleanly separated from React state / AppContext.
 
-import { DirectMessageItem } from '../api/social';
-
 export type ConnectionState = 'CONNECTING' | 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED';
 
 export interface ServerEvent {
@@ -227,7 +225,7 @@ class WebSocketService {
     clientMessageId: string,
     conversationId: string,
     text: string,
-    options?: { replyToMessageId?: string; forwardedFromMessageId?: string }
+    options?: { replyToMessageId?: string; forwardedFromMessageId?: string; attachmentId?: string; vanish?: boolean }
   ): boolean {
     return this.send({
       type: 'message:send',
@@ -236,6 +234,8 @@ class WebSocketService {
       text,
       replyToMessageId: options?.replyToMessageId,
       forwardedFromMessageId: options?.forwardedFromMessageId,
+      attachmentId: options?.attachmentId,
+      vanish: options?.vanish,
     });
   }
 

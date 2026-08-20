@@ -1,5 +1,4 @@
 import React from 'react';
-import { Radio, Users } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 
 export const StatPills: React.FC = () => {

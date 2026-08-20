@@ -426,9 +426,26 @@ export const MediaLibraryView: React.FC = () => {
 
       {/* ─── CONTENT ───────────────────────────────────────────────────────── */}
       {state === 'loading' && (
-        <div className="py-10 flex items-center justify-center gap-2 text-xs text-[var(--text-tertiary)]">
-          <Loader className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
-          Loading your library...
+        <div className="w-full space-y-4 py-2" style={{ animation: 'rise 640ms var(--ease) 220ms both' }}>
+          <div className="flex items-center justify-center gap-2 py-4 text-xs text-[var(--text-tertiary)]">
+            <Loader className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+            <span>Loading your library...</span>
+          </div>
+          {[1, 2, 3, 4].map((n) => (
+            <div
+              key={n}
+              className={`flex items-center gap-4 py-4 ${n > 1 ? 'border-t border-[var(--border-hairline)]' : ''} animate-pulse`}
+            >
+              <div className="w-16 h-10 rounded-lg bg-[var(--bg-glass)] border border-[var(--border-hairline)] shrink-0" />
+              <div className="flex-1 min-w-0 space-y-2">
+                <div className="h-4 bg-[var(--bg-glass)] rounded-md w-1/3" />
+                <div className="h-3 bg-[var(--bg-glass)] rounded-md w-1/4" />
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <div className="w-8 h-8 rounded-full bg-[var(--bg-glass)]" />
+              </div>
+            </div>
+          ))}
         </div>
       )}
 

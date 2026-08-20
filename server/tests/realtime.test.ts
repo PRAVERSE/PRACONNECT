@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer, Server as HttpServer } from 'node:http';
+import type { Server as HttpServer } from 'node:http';
 import WebSocket from 'ws';
 import { Hono } from 'hono';
 

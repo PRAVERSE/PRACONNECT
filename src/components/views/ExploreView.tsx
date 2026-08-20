@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plus, KeyRound, Search, Radio, Users, X, Timer, AlertTriangle } from 'lucide-react';
+import { Plus, KeyRound, Radio, Users, Timer, AlertTriangle } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { UserAvatar } from '../common/UserAvatar';
 import { EmptyState } from '../common/EmptyState';
+import { PageHeader } from '../common/PageHeader';
+import { SearchInput } from '../common/SearchInput';
 import { formatCountdown, isRejoinWindowClosed } from '../../utils/roomCountdown';
 
 export const ExploreView: React.FC = () => {
@@ -73,82 +75,40 @@ export const ExploreView: React.FC = () => {
   return (
     <div className="w-full text-[var(--text-primary)] font-['Inter',sans-serif] select-none">
       {/* ─── PAGE HEADER ──────────────────────────────────────────────────────── */}
-      <header
-        className="flex flex-col md:flex-row md:items-start justify-between gap-6 mb-10"
-        style={{ animation: 'rise 640ms var(--ease) both' }}
-      >
-        <div className="max-w-[620px]">
-          <h1
-            className="font-display font-bold tracking-[-0.02em] text-[clamp(2rem,3.4vw,2.7rem)] leading-[1.1] mb-3"
-            style={{ animation: 'rise 640ms var(--ease) 80ms both' }}
-          >
-            Explore Watch Rooms
-          </h1>
-          <p
-            className="text-[15px] leading-relaxed text-[var(--text-secondary)] max-w-[520px]"
-            style={{ animation: 'rise 640ms var(--ease) 150ms both' }}
-          >
-            Discover live parties, join your squad, or host your own watch session.
-          </p>
-        </div>
+      <PageHeader
+        title="Explore Watch Rooms"
+        subtitle="Discover live parties, join your squad, or host your own watch session."
+        actions={
+          <>
+            <button
+              onClick={() => setCreateRoomModalOpen(true)}
+              className="btn-primary text-sm"
+            >
+              <Plus className="w-4 h-4" aria-hidden="true" />
+              <span>Create Room</span>
+            </button>
 
-        <div
-          className="flex items-center gap-3 shrink-0"
-          style={{ animation: 'rise 640ms var(--ease) 220ms both' }}
-        >
-          <button
-            onClick={() => setCreateRoomModalOpen(true)}
-            className="btn-primary text-sm"
-          >
-            <Plus className="w-4 h-4" aria-hidden="true" />
-            <span>Create Room</span>
-          </button>
-
-          <button
-            onClick={() => setJoinRoomModalOpen(true)}
-            className="btn-secondary text-sm"
-          >
-            <KeyRound className="w-4 h-4" aria-hidden="true" />
-            <span>Enter Code</span>
-          </button>
-        </div>
-      </header>
+            <button
+              onClick={() => setJoinRoomModalOpen(true)}
+              className="btn-secondary text-sm"
+            >
+              <KeyRound className="w-4 h-4" aria-hidden="true" />
+              <span>Enter Code</span>
+            </button>
+          </>
+        }
+      />
 
       {/* ─── SEARCH FIELD ────────────────────────────────────────────────────── */}
-      <div
-        className="mb-10 flex items-center gap-4 max-w-[520px]"
-        style={{ animation: 'rise 640ms var(--ease) 220ms both' }}
-      >
-        <div className="relative flex-1">
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search rooms by name, code, or host..."
-            className="field w-full pl-12 pr-10"
-            aria-label="Search rooms"
-          />
-          <Search
-            className="w-4 h-4 text-[var(--text-tertiary)] absolute left-[18px] top-1/2 -translate-y-1/2 pointer-events-none"
-            aria-hidden="true"
-          />
-          {searchQuery.trim() && (
-            <button
-              onClick={() => setSearchQuery('')}
-              className="absolute right-4 top-1/2 -translate-y-1/2 p-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] rounded-full cursor-pointer transition-colors"
-              aria-label="Clear search"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
-          )}
-        </div>
-
-        {filteredRooms.length > 0 && (
-          <span className="text-xs text-[var(--text-tertiary)] font-mono hidden sm:inline shrink-0">
-            {filteredRooms.length} {filteredRooms.length === 1 ? 'room' : 'rooms'}
-          </span>
-        )}
-      </div>
+      <SearchInput
+        value={searchQuery}
+        onChange={setSearchQuery}
+        placeholder="Search rooms by name, code, or host..."
+        ariaLabel="Search rooms"
+        count={filteredRooms.length}
+        countNoun={{ singular: 'room', plural: 'rooms' }}
+        className="mb-8 max-w-[520px]"
+      />
 
       {joinError && (
         <div

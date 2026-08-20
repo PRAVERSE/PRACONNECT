@@ -19,7 +19,6 @@ import {
   ScheduledParty,
   WatchHistoryItem,
   RoomHistoryStats,
-  MediaItem,
 } from '../types';
 import {
   initialUserProfile,
@@ -221,7 +220,11 @@ interface AppContextType {
   activeDMId: string | null;
   setActiveDMId: (id: string | null) => void;
   dmConversations: Record<string, DirectMessage[]>;
-  sendDirectMessage: (friendId: string, text: string) => void;
+  sendDirectMessage: (
+    friendId: string,
+    text: string,
+    options?: string | { replyToMessageId?: string; forwardedFromMessageId?: string; attachmentId?: string; vanish?: boolean } | null
+  ) => void;
   connectionState: ConnectionState;
   typingByConversation: Record<string, boolean>;
   presenceByUser: Record<string, { online: boolean; lastSeenAt?: string | null }>;
@@ -250,7 +253,7 @@ interface AppContextType {
   // DM context actions (message menu)
   /** Ids of the pinned messages per conversation (shared with the peer). */
   pinnedMessageIds: Record<string, string[]>;
-  sendReply: (friendId: string, text: string, replyToMessageId: string) => void;
+  sendReply: (friendId: string, text: string, replyToMessageId: string, options?: { attachmentId?: string }) => void;
   sendForward: (messageId: string, toFriendId: string) => Promise<boolean>;
   pinMessage: (messageId: string) => Promise<boolean>;
   unpinMessage: (messageId: string) => Promise<boolean>;
@@ -392,6 +395,7 @@ function mapDirectMessageItem(item: any): DirectMessage {
   return {
     id: item.id,
     senderId: item.senderId,
+    recipientId: item.recipientId,
     text: item.text,
     timestamp: new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     createdAt: item.createdAt,
@@ -411,6 +415,15 @@ function mapDirectMessageItem(item: any): DirectMessage {
     reactions: item.reactions ?? [],
     status: item.status,
   };
+}
+
+function getPeerUserIdFromConversationKey(conversationId: string | undefined, currentUserId: string): string {
+  if (conversationId && conversationId.includes(':')) {
+    const parts = conversationId.split(':');
+    if (parts[0] === currentUserId) return parts[1];
+    if (parts[1] === currentUserId) return parts[0];
+  }
+  return '';
 }
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -1092,7 +1105,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const setRoomMedia = async (media: MediaTrack | null) => {
     if (!currentRoom || !currentRoom.isHost) return;
-    await setRoomMediaApi(currentRoom.id, media);
+    if (media?.mediaType === 'library' && media.mediaId) {
+      await setRoomLibraryMedia(media.mediaId);
+      return;
+    }
+    const res = await setRoomMediaApi(currentRoom.id, media);
+    if (res.ok && res.data) {
+      setCurrentRoom(mapServerRoomToItem(res.data, currentUserIdRef.current));
+    }
   };
 
   /** Phase C: host selects a published Media Library item for the room. The
@@ -1110,6 +1130,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const msg = res.error?.message || 'Could not select that media.';
       setMediaErrorMessage(msg);
       return { ok: false, error: msg };
+    }
+    if (res.data) {
+      setCurrentRoom(mapServerRoomToItem(res.data, currentUserIdRef.current));
     }
     setMediaConversion(null);
     setMediaErrorMessage(null);
@@ -1200,22 +1223,53 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setRoomFiles((prev) => [file, ...prev]);
   };
 
-  const sendDirectMessage = (friendId: string, text: string, replyToMessageId?: string | null) => {
-    if (!text.trim() || !currentUser?.id) return;
+  const sendDirectMessage = (
+    friendId: string,
+    text: string,
+    optionsOrReplyTo?: string | { replyToMessageId?: string; forwardedFromMessageId?: string; attachmentId?: string; vanish?: boolean } | null
+  ) => {
+    const hasText = Boolean(text && text.trim());
+    const hasAttachment = Boolean(typeof optionsOrReplyTo === 'object' && optionsOrReplyTo?.attachmentId);
+    if ((!hasText && !hasAttachment) || !currentUser?.id) return;
     const conversationId = conversationKeyFor(friendId, currentUser.id);
     const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const nowIsoStr = new Date().toISOString();
+
+    let replyToMessageId: string | undefined;
+    let forwardedFromMessageId: string | undefined;
+    let attachmentId: string | undefined;
+    let vanish: boolean | undefined;
+
+    if (typeof optionsOrReplyTo === 'string') {
+      replyToMessageId = optionsOrReplyTo.trim() || undefined;
+    } else if (optionsOrReplyTo && typeof optionsOrReplyTo === 'object') {
+      replyToMessageId = typeof optionsOrReplyTo.replyToMessageId === 'string' && optionsOrReplyTo.replyToMessageId.trim()
+        ? optionsOrReplyTo.replyToMessageId.trim()
+        : undefined;
+      forwardedFromMessageId = typeof optionsOrReplyTo.forwardedFromMessageId === 'string' && optionsOrReplyTo.forwardedFromMessageId.trim()
+        ? optionsOrReplyTo.forwardedFromMessageId.trim()
+        : undefined;
+      attachmentId = typeof optionsOrReplyTo.attachmentId === 'string' && optionsOrReplyTo.attachmentId.trim()
+        ? optionsOrReplyTo.attachmentId.trim()
+        : undefined;
+      vanish = optionsOrReplyTo.vanish;
+    }
+
     const optimistic: DirectMessage = {
       id: tempId,
       clientMessageId: tempId,
       senderId: currentUser.id,
-      text: text.trim(),
+      recipientId: friendId,
+      text: text ? text.trim() : '',
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       createdAt: nowIsoStr,
       conversationId,
       sequenceId: 0,
       status: 'sending',
-      replyToMessageId: replyToMessageId ?? undefined,
+      replyToMessageId,
+      forwardedFromMessageId,
+      attachmentId,
+      vanish,
     };
 
     setDmConversations((prev) => ({
@@ -1223,15 +1277,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       [friendId]: [...(prev[friendId] || []), optimistic]
     }));
 
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[DM DEBUG] send', { clientMessageId: tempId, conversationId, friendId });
+    }
+
     const wsSent = wsService.sendDirectMessage(
       tempId,
       conversationId,
-      text.trim(),
-      replyToMessageId ? { replyToMessageId } : undefined
+      text ? text.trim() : '',
+      { replyToMessageId, forwardedFromMessageId, attachmentId, vanish }
     );
 
     if (!wsSent) {
-      sendDirectMessageApi(friendId, text.trim(), replyToMessageId ? { replyToMessageId } : undefined).then((res) => {
+      sendDirectMessageApi(friendId, text ? text.trim() : '', { replyToMessageId, forwardedFromMessageId }).then((res) => {
         if (res.ok && res.data?.message) {
           const serverMsg = mapDirectMessageItem(res.data.message);
           setDmConversations((prev) => ({
@@ -1358,8 +1416,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
   }, []);
 
-  const sendReply = (friendId: string, text: string, replyToMessageId: string) => {
-    sendDirectMessage(friendId, text, replyToMessageId);
+  const sendReply = (friendId: string, text: string, replyToMessageId: string, options?: { attachmentId?: string }) => {
+    sendDirectMessage(friendId, text, { replyToMessageId, ...options });
   };
 
   const sendForward = useCallback(async (messageId: string, toFriendId: string) => {
@@ -1803,62 +1861,83 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const unsubSent = wsService.on('message:sent', (e) => {
       const { clientMessageId, message } = e;
       if (message) {
-        const friendId = message.senderId === currentUser.id ? message.recipientId : message.senderId;
+        const friendId =
+          message.recipientId ||
+          (message.senderId === currentUser.id
+            ? getPeerUserIdFromConversationKey(message.conversationId, currentUser.id)
+            : message.senderId);
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('[DM DEBUG] ack (client received)', { clientMessageId, messageId: message.id, friendId });
+        }
         const mapped = mapDirectMessageItem(message);
-        setDmConversations((prev) => {
-          const list = prev[friendId] || [];
-          const reconciled = list.map((m) =>
-            m.id === clientMessageId || m.clientMessageId === clientMessageId
-              ? { ...mapped, status: 'sent' as const }
-              : m
-          );
-          if (!reconciled.some((m) => m.id === message.id)) {
-            reconciled.push({ ...mapped, status: 'sent' as const });
-          }
-          return { ...prev, [friendId]: reconciled };
-        });
-        fetchConversationsApi().then((res) => {
-          if (res.ok && res.data) setConversations(res.data.conversations);
-        });
+        if (friendId) {
+          setDmConversations((prev) => {
+            const list = prev[friendId] || [];
+            const reconciled = list.map((m) =>
+              m.id === clientMessageId || m.clientMessageId === clientMessageId
+                ? { ...mapped, status: 'sent' as const }
+                : m
+            );
+            if (!reconciled.some((m) => m.id === message.id)) {
+              reconciled.push({ ...mapped, status: 'sent' as const });
+            }
+            return { ...prev, [friendId]: reconciled };
+          });
+          fetchConversationsApi().then((res) => {
+            if (res.ok && res.data) setConversations(res.data.conversations);
+          });
+        }
       }
     });
 
     const unsubNew = wsService.on('message:new', (e) => {
       const { message } = e;
       if (message) {
-        const friendId = message.senderId === currentUser.id ? message.recipientId : message.senderId;
+        const friendId =
+          (message.senderId === currentUser.id ? message.recipientId : message.senderId) ||
+          getPeerUserIdFromConversationKey(message.conversationId, currentUser.id);
         const mapped = mapDirectMessageItem(message);
-        setDmConversations((prev) => {
-          const list = prev[friendId] || [];
-          if (list.some((m) => m.id === message.id)) return prev;
-          return { ...prev, [friendId]: [...list, mapped] };
-        });
+        if (friendId) {
+          setDmConversations((prev) => {
+            const list = prev[friendId] || [];
+            if (list.some((m) => m.id === message.id)) return prev;
+            return { ...prev, [friendId]: [...list, mapped] };
+          });
 
-        // Automatically emit delivery ACK if message belongs to active DM
-        const conversationId = conversationKeyFor(friendId, currentUser.id);
-        if (message.sequenceId) {
-          wsService.sendDeliveryAck(conversationId, message.sequenceId);
+          // Automatically emit delivery ACK if message has sequenceId
+          const conversationId = message.conversationId || conversationKeyFor(friendId, currentUser.id);
+          if (message.sequenceId) {
+            wsService.sendDeliveryAck(conversationId, message.sequenceId);
+          }
+
+          fetchConversationsApi().then((res) => {
+            if (res.ok && res.data) setConversations(res.data.conversations);
+          });
         }
-
-        fetchConversationsApi().then((res) => {
-          if (res.ok && res.data) setConversations(res.data.conversations);
-        });
       }
     });
 
     const unsubDelivery = wsService.on('message:delivery', (e) => {
       const { conversationId, throughSequenceId } = e;
       if (conversationId && throughSequenceId) {
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('[DM DEBUG] delivered (client)', { conversationId, throughSequenceId });
+        }
         setDeliveredThroughSequenceId((prev) => ({ ...prev, [conversationId]: throughSequenceId }));
+        const peerId = getPeerUserIdFromConversationKey(conversationId, currentUser.id);
         setDmConversations((prev) => {
           const next: Record<string, DirectMessage[]> = {};
           for (const [friendId, msgs] of Object.entries(prev)) {
             const list = (msgs ?? []) as DirectMessage[];
-            next[friendId] = list.map((m) =>
-              m.senderId === currentUser.id && (m.sequenceId ?? 0) <= throughSequenceId && m.status !== 'read'
-                ? { ...m, status: 'delivered' as const }
-                : m
-            );
+            if (!peerId || friendId === peerId) {
+              next[friendId] = list.map((m) =>
+                m.senderId === currentUser.id && (m.sequenceId ?? 0) <= throughSequenceId && m.status !== 'read'
+                  ? { ...m, status: 'delivered' as const }
+                  : m
+              );
+            } else {
+              next[friendId] = list;
+            }
           }
           return next;
         });
@@ -1868,16 +1947,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const unsubRead = wsService.on('messages:read', (e) => {
       const { conversationId, throughSequenceId } = e;
       if (conversationId && throughSequenceId) {
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('[DM DEBUG] read (client)', { conversationId, throughSequenceId });
+        }
         setReadThroughSequenceId((prev) => ({ ...prev, [conversationId]: throughSequenceId }));
+        const peerId = getPeerUserIdFromConversationKey(conversationId, currentUser.id);
         setDmConversations((prev) => {
           const next: Record<string, DirectMessage[]> = {};
           for (const [friendId, msgs] of Object.entries(prev)) {
             const list = (msgs ?? []) as DirectMessage[];
-            next[friendId] = list.map((m) =>
-              m.senderId === currentUser.id && (m.sequenceId ?? 0) <= throughSequenceId
-                ? { ...m, status: 'read' as const }
-                : m
-            );
+            if (!peerId || friendId === peerId) {
+              next[friendId] = list.map((m) =>
+                m.senderId === currentUser.id && (m.sequenceId ?? 0) <= throughSequenceId
+                  ? { ...m, status: 'read' as const }
+                  : m
+              );
+            } else {
+              next[friendId] = list;
+            }
           }
           return next;
         });

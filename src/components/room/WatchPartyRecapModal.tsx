@@ -1,5 +1,5 @@
 import React from 'react';
-import { Trophy, Film, Users, Sparkles, X, Heart, Smile, ThumbsUp } from 'lucide-react';
+import { Trophy, Film, Users, Sparkles, X } from 'lucide-react';
 
 export interface RecapData {
   roomName: string;

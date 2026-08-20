@@ -178,6 +178,7 @@ export interface MessageReactionGroup {
 export interface DirectMessage {
   id: string;
   senderId: string;
+  recipientId?: string;
   text: string;
   timestamp: string;
   /** Server ISO timestamp — the info dialog formats from this, not the
