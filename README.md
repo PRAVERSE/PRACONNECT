@@ -103,4 +103,5 @@ Full reference in [.env.example](.env.example): ports, `APP_URL`, `DATABASE_PATH
 | `npm run start` | Production server (validates env, serves `dist/` + API) |
 | `npm test` | All server/client test suites |
 | `npm run lint` | Type-check both tsconfigs |
-| `npm run clean` | Remove `dist/` (POSIX only) |
+| `npm run clean` | Remove `dist/` (POSIX only) |#   P R A C O N N E C T .  
+ 
