@@ -2,7 +2,7 @@
 // All authentication endpoints mounted under /api/auth
 
 import { Hono } from 'hono';
-import { db, bootstrapAdminRole } from '../db/async';
+import { db, bootstrapAdminRole } from '../db/index';
 import {
   hashPassword,
   verifyPassword,

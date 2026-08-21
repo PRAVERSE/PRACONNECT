@@ -7,7 +7,7 @@ import { createApp } from './app';
 import { RealtimeDO } from './realtime/durableObject';
 import { setMediaStorage, BackblazeB2MediaStorage } from './storage/mediaStorage';
 import { getSessionUser, SESSION_COOKIE_NAME } from './auth/session';
-import { setD1Database } from './db/d1-adapter';
+import { setD1Database } from './db/index';
 
 // Export the Durable Object class for Cloudflare runtime binding
 export { RealtimeDO };

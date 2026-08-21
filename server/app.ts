@@ -19,7 +19,7 @@ import { adminMedia } from './routes/adminMedia';
 import { pushRoutes } from './routes/push';
 import { calling } from './routes/calling';
 import { requireAuth } from './middleware/auth';
-import { db } from './db/async';
+import { db } from './db/index';
 import { isApiPath, resolveStaticFile, serveStaticFile } from './static';
 import { isStaticServingEnabled, resolveDistDir } from './productionEnv';
 

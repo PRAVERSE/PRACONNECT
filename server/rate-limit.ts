@@ -1,42 +1,26 @@
 // server/rate-limit.ts
-// Shared server-side rate limiting + trusted-proxy client IP resolution.
-//
-// DEPLOYMENT NOTES
-// ----------------
-// - The limiter is IN-MEMORY and therefore correct only for this single-
-//   instance SQLite deployment. It is not shared across processes and resets
-//   on restart. For a multi-instance production deployment, back this store
-//   with a shared one such as Redis (key -> { count, resetAt }) and swap the
-//   class below; the per-route call sites and limits do not change.
-// - TRUST_PROXY controls whether the `x-forwarded-for` header is honored:
-//     TRUST_PROXY=true  -> server sits directly behind a trusted reverse
-//                          proxy that overwrites the header (the first entry
-//                          is treated as the real client).
-//     unset / false     -> x-forwarded-for is IGNORED and the socket address
-//                          reported by the runtime is used. This prevents a
-//                          client from rotating spoofed headers to bypass
-//                          rate limits.
-// - Every limit can be overridden at runtime via environment variables:
-//     RATE_LIMIT_<NAME>_MAX         (number of allowed requests)
-//     RATE_LIMIT_<NAME>_WINDOW_MS   (window length in milliseconds)
+// Phase 6.8: in-memory sliding-window rate limiting for sensitive endpoints.
+// State is held in a simple Map; keys are swept lazily on check() or test reset.
+// Rate limiting is fail-open on internal errors so a limiter failure can
+// never cause a complete outage of the service.
 
 import type { Context } from 'hono';
 import { apiError } from './auth/auth';
 
-// ─── Default limits ───────────────────────────────────────────────────────────
+// ─── Preset limits ────────────────────────────────────────────────────────────
 
-export const LIMITS = {
-  // Authentication (per IP unless noted)
-  login: { max: 10, windowMs: 15 * 60 * 1000 },
-  loginUser: { max: 10, windowMs: 15 * 60 * 1000 }, // per identifier (before account lookup — no enumeration)
-  signup: { max: 10, windowMs: 60 * 60 * 1000 },
-  signupEmail: { max: 5, windowMs: 60 * 60 * 1000 }, // per target email
-  verifyEmail: { max: 30, windowMs: 15 * 60 * 1000 },
-  verifyEmailEmail: { max: 30, windowMs: 15 * 60 * 1000 }, // per target email
-  resendVerification: { max: 5, windowMs: 15 * 60 * 1000 },
-  resendVerificationEmail: { max: 5, windowMs: 15 * 60 * 1000 }, // SMTP abuse guard
-  forgotPassword: { max: 5, windowMs: 15 * 60 * 1000 },
-  forgotPasswordEmail: { max: 5, windowMs: 15 * 60 * 1000 }, // SMTP abuse guard
+const LIMITS = {
+  // Authentication (strict, per IP unless noted)
+  login: { max: 10, windowMs: 60 * 1000 },
+  loginUser: { max: 5, windowMs: 60 * 1000 }, // per user email/username
+  signup: { max: 5, windowMs: 60 * 1000 },
+  signupEmail: { max: 3, windowMs: 60 * 1000 },
+  verifyEmail: { max: 10, windowMs: 60 * 1000 },
+  verifyEmailEmail: { max: 5, windowMs: 60 * 1000 },
+  resendVerification: { max: 3, windowMs: 60 * 1000 },
+  resendVerificationEmail: { max: 2, windowMs: 60 * 1000 },
+  forgotPassword: { max: 5, windowMs: 60 * 1000 },
+  forgotPasswordEmail: { max: 3, windowMs: 60 * 1000 },
   verifyPasswordReset: { max: 30, windowMs: 15 * 60 * 1000 },
   verifyPasswordResetEmail: { max: 30, windowMs: 15 * 60 * 1000 },
   resetPassword: { max: 10, windowMs: 15 * 60 * 1000 },
@@ -66,12 +50,17 @@ export const LIMITS = {
 
 export type LimitName = keyof typeof LIMITS;
 
-function limitConfig(name: LimitName): { max: number; windowMs: number } {
+/**
+ * Returns the effective rate-limit rule, allowing environment variable
+ * overrides for tests and staging (e.g., RATE_LIMIT_LOGIN_MAX=100).
+ */
+export function limitConfig(name: LimitName): { max: number; windowMs: number } {
   const base = LIMITS[name];
   const maxRaw = process.env[`RATE_LIMIT_${name.toUpperCase()}_MAX`];
   const windowRaw = process.env[`RATE_LIMIT_${name.toUpperCase()}_WINDOW_MS`];
   const max = maxRaw ? Number(maxRaw) : base.max;
   const windowMs = windowRaw ? Number(windowRaw) : base.windowMs;
+
   return {
     max: Number.isFinite(max) && max >= 0 ? max : base.max,
     windowMs: Number.isFinite(windowMs) && windowMs > 0 ? windowMs : base.windowMs,
@@ -96,15 +85,20 @@ interface Bucket {
 
 export class RateLimiter {
   private buckets = new Map<string, Bucket>();
-  private readonly sweepTimer: ReturnType<typeof setInterval>;
+  private readonly sweepMs: number;
+  private lastSweep = 0;
 
   constructor(sweepMs = 60_000) {
-    this.sweepTimer = setInterval(() => this.sweep(), sweepMs);
-    this.sweepTimer.unref?.();
+    // Cloudflare Workers safe: no global setInterval timers at constructor time.
+    this.sweepMs = sweepMs;
   }
 
   check(key: string, max: number, windowMs: number): { allowed: boolean; retryAfter: number } {
     const now = timeSource();
+    // Lazy in-band sweep on incoming checks
+    if (now - this.lastSweep > this.sweepMs) {
+      this.sweep();
+    }
     const entry = this.buckets.get(key);
     if (!entry || entry.resetAt <= now) {
       this.buckets.set(key, { count: 1, resetAt: now + windowMs });
@@ -120,6 +114,7 @@ export class RateLimiter {
   /** Removes all expired buckets so attacker-driven keys cannot grow forever. */
   sweep(): void {
     const now = timeSource();
+    this.lastSweep = now;
     for (const [key, entry] of this.buckets) {
       if (entry.resetAt <= now) this.buckets.delete(key);
     }
@@ -128,6 +123,7 @@ export class RateLimiter {
   /** Test hook: clear every bucket. */
   resetAll(): void {
     this.buckets.clear();
+    this.lastSweep = 0;
   }
 }
 
@@ -137,6 +133,12 @@ export const resetRateLimits = (): void => limiter.resetAll();
 // ─── Client IP resolution ─────────────────────────────────────────────────────
 
 export function getClientIp(c: Context): string {
+  // Cloudflare Workers provides cf-connecting-ip
+  const cfIp = c.req.header('cf-connecting-ip');
+  if (cfIp && cfIp.trim()) {
+    return cfIp.trim();
+  }
+
   // Only honor x-forwarded-for when explicitly behind a trusted proxy.
   if (process.env.TRUST_PROXY === 'true') {
     const forwarded = c.req.header('x-forwarded-for');

@@ -2,7 +2,7 @@
 // Records authentication activity to the SQLite / D1 loginActivity table.
 // Stores id, userId, loginTime, location (coarse/unknown), and authenticationMethod.
 
-import { db } from '../db/async';
+import { db } from '../db/index';
 import { generateId } from './auth';
 
 export type AuthMethod = 'email' | 'google' | 'signup';

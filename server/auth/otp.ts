@@ -2,7 +2,7 @@
 // OTP generation, hashing, storage, and verification.
 // OTPs are NEVER stored as plaintext. Only a SHA-256 hash is persisted.
 
-import { db } from '../db/async';
+import { db } from '../db/index';
 import { generateId } from './auth';
 
 export type OtpPurpose = 'email_verification' | 'password_reset';

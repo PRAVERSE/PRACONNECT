@@ -5,7 +5,7 @@
 
 import type { Context } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
-import { db } from '../db/async';
+import { db } from '../db/index';
 import { generateId } from './auth';
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';

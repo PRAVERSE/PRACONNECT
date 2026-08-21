@@ -6,7 +6,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { requireAuth } from '../middleware/auth';
-import { db } from '../db/async';
+import { db } from '../db/index';
 import { getUserRoomStats } from '../rooms/history';
 import { validateName, validateUsername, sanitizeUser, apiError } from '../auth/auth';
 import { nowIso } from '../rooms/time';

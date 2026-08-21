@@ -19,7 +19,6 @@
       "migrations_dir": "migrations"
     }
   ],
-
   "durable_objects": {
     "bindings": [
       {
@@ -36,18 +35,7 @@
       ]
     }
   ],
-
-  // Alias: replace all Node.js DB module references with the D1 adapter in the Worker bundle.
-  // This ensures better-sqlite3 (a native Node.js addon) is NEVER imported,
-  // initialized, or bundled into the Cloudflare Worker.
-  "alias": {
-    "./server/db/async": "./server/db/d1-adapter",
-    "./server/db/index": "./server/db/d1-adapter",
-    "better-sqlite3": "./server/shims/better-sqlite3.js"
-  },
-
   "vars": {
     "NODE_ENV": "production"
   }
 }
-
