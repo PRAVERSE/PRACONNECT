@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "praconnect",
+  "account_id": "1737db0da2434882972c08137ab3f80b",
   "main": "server/worker.ts",
   "compatibility_date": "2025-02-14",
   "compatibility_flags": [
