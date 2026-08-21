@@ -19,7 +19,7 @@ import { adminMedia } from './routes/adminMedia';
 import { pushRoutes } from './routes/push';
 import { calling } from './routes/calling';
 import { requireAuth } from './middleware/auth';
-import { db } from './db/index';
+import { db } from './db/async';
 import { isApiPath, resolveStaticFile, serveStaticFile } from './static';
 import { isStaticServingEnabled, resolveDistDir } from './productionEnv';
 
@@ -79,9 +79,9 @@ export function createApp(options: CreateAppOptions = {}): Hono {
   // Cheap, secret-free endpoints for load balancer / proxy health checks.
   app.get('/health', (c) => c.json({ ok: true }));
   // /ready verifies the minimum dependency required to accept traffic: the DB.
-  app.get('/ready', (c) => {
+  app.get('/ready', async (c) => {
     try {
-      db.prepare('SELECT 1 AS ok').get();
+      await db.prepare('SELECT 1 AS ok').get();
       return c.json({ ok: true });
     } catch {
       return c.json({ ok: false }, 503);

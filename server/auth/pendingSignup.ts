@@ -2,7 +2,7 @@
 // Handles temporary unverified signup records in the pendingSignups table.
 // A PraConnect account is ONLY created in the users table after successful OTP verification.
 
-import { db, bootstrapAdminRole } from '../db/index';
+import { db, bootstrapAdminRole } from '../db/async';
 import { generateId } from './auth';
 
 const OTP_EXPIRY_MS = 10 * 60 * 1000; // 10 minutes
@@ -72,9 +72,9 @@ export async function createPendingSignup(
   const id = generateId();
 
   // Remove any previous pending signup for this email or username
-  db.prepare('DELETE FROM pendingSignups WHERE email = ? OR username = ?').run(email, username);
+  await db.prepare('DELETE FROM pendingSignups WHERE email = ? OR username = ?').run(email, username);
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO pendingSignups (id, name, username, email, passwordHash, otpHash, expiresAt, attempts, createdAt, updatedAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
   `).run(id, name, username, email, passwordHash, otpHash, expiresAt, now, now);
@@ -85,30 +85,26 @@ export async function createPendingSignup(
 /**
  * Looks up a pending signup by email.
  */
-export function getPendingSignupByEmail(email: string): PendingSignupRow | null {
+export async function getPendingSignupByEmail(email: string): Promise<PendingSignupRow | null> {
   return (
-    (db.prepare('SELECT * FROM pendingSignups WHERE email = ?').get(email) as
-      | PendingSignupRow
-      | undefined) ?? null
+    (await db.prepare('SELECT * FROM pendingSignups WHERE email = ?').get<PendingSignupRow>(email)) ?? null
   );
 }
 
 /**
  * Looks up a pending signup by username.
  */
-export function getPendingSignupByUsername(username: string): PendingSignupRow | null {
+export async function getPendingSignupByUsername(username: string): Promise<PendingSignupRow | null> {
   return (
-    (db.prepare('SELECT * FROM pendingSignups WHERE username = ?').get(username) as
-      | PendingSignupRow
-      | undefined) ?? null
+    (await db.prepare('SELECT * FROM pendingSignups WHERE username = ?').get<PendingSignupRow>(username)) ?? null
   );
 }
 
 /**
  * Deletes a pending signup record (e.g. if email dispatch failed or cleanup).
  */
-export function deletePendingSignup(email: string): void {
-  db.prepare('DELETE FROM pendingSignups WHERE email = ?').run(email);
+export async function deletePendingSignup(email: string): Promise<void> {
+  await db.prepare('DELETE FROM pendingSignups WHERE email = ?').run(email);
 }
 
 /**
@@ -118,7 +114,7 @@ export function deletePendingSignup(email: string): void {
 export async function resendPendingSignupOtp(
   email: string
 ): Promise<{ otp: string; name: string } | null> {
-  const pending = getPendingSignupByEmail(email);
+  const pending = await getPendingSignupByEmail(email);
   if (!pending) return null;
 
   const rawOtp = generateOtp();
@@ -126,7 +122,7 @@ export async function resendPendingSignupOtp(
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + OTP_EXPIRY_MS).toISOString();
 
-  db.prepare(`
+  await db.prepare(`
     UPDATE pendingSignups
     SET otpHash = ?, expiresAt = ?, attempts = 0, updatedAt = ?
     WHERE id = ?
@@ -151,44 +147,39 @@ export async function verifyPendingSignupOtp(
   submittedOtp: string
 ): Promise<VerifyPendingSignupResult> {
   const now = new Date().toISOString();
-  const pending = getPendingSignupByEmail(email);
+  const pending = await getPendingSignupByEmail(email);
 
   if (!pending) return { ok: false, error: 'NOT_FOUND' };
   if (pending.expiresAt < now) return { ok: false, error: 'EXPIRED' };
   if (pending.attempts >= MAX_OTP_ATTEMPTS) return { ok: false, error: 'MAX_ATTEMPTS' };
 
   // Increment attempts counter
-  db.prepare('UPDATE pendingSignups SET attempts = attempts + 1 WHERE id = ?').run(pending.id);
+  await db.prepare('UPDATE pendingSignups SET attempts = attempts + 1 WHERE id = ?').run(pending.id);
 
   const submittedHash = await sha256Hex(submittedOtp);
   if (submittedHash !== pending.otpHash) {
     return { ok: false, error: 'INVALID' };
   }
 
-  // Atomic activation transaction
+  // Activate user (D1 doesn't support interactive transactions, so sequential writes)
   const userId = generateId();
-  const createAndActivate = db.transaction(() => {
-    // Insert into permanent users table with emailVerified = 1
-    db.prepare(`
-      INSERT INTO users (id, name, username, email, passwordHash, avatarUrl, emailVerified, googleProviderId, createdAt, updatedAt)
-      VALUES (?, ?, ?, ?, ?, NULL, 1, NULL, ?, ?)
-    `).run(userId, pending.name, pending.username, pending.email, pending.passwordHash, now, now);
 
-    // Remove pending signup record
-    db.prepare('DELETE FROM pendingSignups WHERE id = ?').run(pending.id);
+  // Insert into permanent users table with emailVerified = 1
+  await db.prepare(`
+    INSERT INTO users (id, name, username, email, passwordHash, avatarUrl, emailVerified, googleProviderId, createdAt, updatedAt)
+    VALUES (?, ?, ?, ?, ?, NULL, 1, NULL, ?, ?)
+  `).run(userId, pending.name, pending.username, pending.email, pending.passwordHash, now, now);
 
-    return (
-      (db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as UserRow | undefined) ?? null
-    );
-  });
+  // Remove pending signup record
+  await db.prepare('DELETE FROM pendingSignups WHERE id = ?').run(pending.id);
 
-  const createdUser = createAndActivate();
+  const createdUser = await db.prepare('SELECT * FROM users WHERE id = ?').get<UserRow>(userId);
   if (!createdUser) {
     return { ok: false, error: 'INVALID' };
   }
 
-  bootstrapAdminRole();
-  const finalUser = (db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as UserRow | undefined) ?? createdUser;
+  await bootstrapAdminRole();
+  const finalUser = (await db.prepare('SELECT * FROM users WHERE id = ?').get<UserRow>(userId)) ?? createdUser;
 
   return { ok: true, user: finalUser };
 }

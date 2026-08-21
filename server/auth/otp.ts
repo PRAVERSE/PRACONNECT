@@ -2,7 +2,7 @@
 // OTP generation, hashing, storage, and verification.
 // OTPs are NEVER stored as plaintext. Only a SHA-256 hash is persisted.
 
-import { db } from '../db/index';
+import { db } from '../db/async';
 import { generateId } from './auth';
 
 export type OtpPurpose = 'email_verification' | 'password_reset';
@@ -54,12 +54,12 @@ export async function createOtp(
   const expiresAt = new Date(Date.now() + EXPIRY_MS[purpose]).toISOString();
 
   // Remove any existing un-consumed OTPs for this email+purpose
-  db.prepare(`
+  await db.prepare(`
     DELETE FROM emailOtps
     WHERE email = ? AND purpose = ? AND consumedAt IS NULL
   `).run(email, purpose);
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO emailOtps (id, userId, email, purpose, otpHash, expiresAt, attempts, consumedAt, createdAt)
     VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?)
   `).run(generateId(), userId, email, purpose, otpHash, expiresAt, now);
@@ -85,29 +85,29 @@ export async function verifyOtp(
 ): Promise<VerifyOtpResult> {
   const now = new Date().toISOString();
 
-  const row = db
-    .prepare<[string, string], { id: string; userId: string; otpHash: string; expiresAt: string; attempts: number }>(`
+  const row = await db
+    .prepare(`
       SELECT id, userId, otpHash, expiresAt, attempts
       FROM emailOtps
       WHERE email = ? AND purpose = ? AND consumedAt IS NULL
       ORDER BY createdAt DESC
       LIMIT 1
     `)
-    .get(email, purpose);
+    .get<{ id: string; userId: string; otpHash: string; expiresAt: string; attempts: number }>(email, purpose);
 
   if (!row) return { ok: false, error: 'NOT_FOUND' };
   if (row.expiresAt < now) return { ok: false, error: 'EXPIRED' };
   if (row.attempts >= MAX_ATTEMPTS) return { ok: false, error: 'MAX_ATTEMPTS' };
 
   // Increment attempts before checking hash (timing-safe fail-fast)
-  db.prepare(`UPDATE emailOtps SET attempts = attempts + 1 WHERE id = ?`).run(row.id);
+  await db.prepare(`UPDATE emailOtps SET attempts = attempts + 1 WHERE id = ?`).run(row.id);
 
   const submittedHash = await sha256Hex(submittedOtp);
 
   if (submittedHash !== row.otpHash) return { ok: false, error: 'INVALID' };
 
   // Consume the OTP
-  db.prepare(`UPDATE emailOtps SET consumedAt = ? WHERE id = ?`).run(now, row.id);
+  await db.prepare(`UPDATE emailOtps SET consumedAt = ? WHERE id = ?`).run(now, row.id);
 
   return { ok: true, userId: row.userId };
 }

@@ -1,11 +1,11 @@
 // server/auth/session.ts
-// Server-side session management using SQLite.
+// Server-side session management using SQLite / Cloudflare D1.
 // Sessions are identified by a random token stored as a SHA-256 hash in the DB.
 // The browser only ever receives the raw token via an HttpOnly cookie.
 
 import type { Context } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
-import { db } from '../db/index';
+import { db } from '../db/async';
 import { generateId } from './auth';
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
@@ -80,12 +80,14 @@ interface JoinedSessionRow {
 }
 
 // ─── Pre-compiled statements ──────────────────────────────────────────────────
+// These are lazy statement objects — db.prepare() stores the SQL but performs
+// no I/O. All I/O happens asynchronously in .get()/.run()/.all().
 const insertSessionStmt = db.prepare(`
   INSERT INTO sessions (id, userId, tokenHash, expiresAt, createdAt, lastUsedAt)
   VALUES (?, ?, ?, ?, ?, ?)
 `);
 
-const getSessionUserStmt = db.prepare<[string, string], JoinedSessionRow>(`
+const getSessionUserStmt = db.prepare(`
   SELECT s.id AS s_id, s.userId AS s_userId, s.tokenHash AS s_tokenHash,
          s.expiresAt AS s_expiresAt, s.createdAt AS s_createdAt, s.lastUsedAt AS s_lastUsedAt,
          u.id AS u_id, u.name AS u_name, u.username AS u_username, u.email AS u_email,
@@ -109,7 +111,7 @@ export async function createSession(userId: string): Promise<string> {
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
 
-  insertSessionStmt.run(generateId(), userId, tokenHash, expiresAt, now, now);
+  await insertSessionStmt.run(generateId(), userId, tokenHash, expiresAt, now, now);
 
   return token;
 }
@@ -122,14 +124,14 @@ export async function getSessionUser(
   const nowMs = Date.now();
   const now = new Date(nowMs).toISOString();
 
-  const row = getSessionUserStmt.get(tokenHash, now);
+  const row = await getSessionUserStmt.get<JoinedSessionRow>(tokenHash, now);
   if (!row) return null;
 
   // Throttle touching lastUsedAt to avoid constant disk writes on read requests
   const lastUsedMs = Date.parse(row.s_lastUsedAt);
   if (isNaN(lastUsedMs) || nowMs - lastUsedMs > 60_000) {
     try {
-      touchSessionStmt.run(now, row.s_id);
+      await touchSessionStmt.run(now, row.s_id);
     } catch {
       // Ignore transient errors
     }
@@ -160,12 +162,12 @@ export async function getSessionUser(
 /** Delete a specific session (logout). */
 export async function deleteSession(token: string): Promise<void> {
   const tokenHash = await sha256Hex(token);
-  deleteSessionStmt.run(tokenHash);
+  await deleteSessionStmt.run(tokenHash);
 }
 
 /** Delete ALL sessions for a user (e.g., after password reset). */
-export function deleteAllUserSessions(userId: string): void {
-  deleteAllUserSessionsStmt.run(userId);
+export async function deleteAllUserSessions(userId: string): Promise<void> {
+  await deleteAllUserSessionsStmt.run(userId);
 }
 
 // ─── Cookie helpers ──────────────────────────────────────────────────────────

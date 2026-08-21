@@ -1,0 +1,53 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "praconnect",
+  "main": "server/worker.ts",
+  "compatibility_date": "2025-02-14",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "praconnect-db",
+      "database_id": "5730865b-9d03-4a1e-8627-ba7cc7570ea6",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "REALTIME_DO",
+        "class_name": "RealtimeDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "RealtimeDO"
+      ]
+    }
+  ],
+
+  // Alias: replace all Node.js DB module references with the D1 adapter in the Worker bundle.
+  // This ensures better-sqlite3 (a native Node.js addon) is NEVER imported,
+  // initialized, or bundled into the Cloudflare Worker.
+  "alias": {
+    "./server/db/async": "./server/db/d1-adapter",
+    "./server/db/index": "./server/db/d1-adapter",
+    "better-sqlite3": "./server/shims/better-sqlite3.js"
+  },
+
+  "vars": {
+    "NODE_ENV": "production"
+  }
+}
+

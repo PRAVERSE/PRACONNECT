@@ -2,7 +2,7 @@
 // All authentication endpoints mounted under /api/auth
 
 import { Hono } from 'hono';
-import { db, bootstrapAdminRole } from '../db/index';
+import { db, bootstrapAdminRole } from '../db/async';
 import {
   hashPassword,
   verifyPassword,
@@ -60,12 +60,12 @@ interface UserRow {
   updatedAt: string;
 }
 
-function findUserByEmail(email: string): UserRow | null {
-  return (db.prepare('SELECT * FROM users WHERE email = ?').get(email) as UserRow | undefined) ?? null;
+async function findUserByEmail(email: string): Promise<UserRow | null> {
+  return (await db.prepare('SELECT * FROM users WHERE email = ?').get<UserRow>(email)) ?? null;
 }
 
-function findUserById(id: string): UserRow | null {
-  return (db.prepare('SELECT * FROM users WHERE id = ?').get(id) as UserRow | undefined) ?? null;
+async function findUserById(id: string): Promise<UserRow | null> {
+  return (await db.prepare('SELECT * FROM users WHERE id = ?').get<UserRow>(id)) ?? null;
 }
 
 import {
@@ -107,10 +107,10 @@ auth.post('/signup', async (c) => {
   if (emailLimit) return emailLimit;
 
   // Check uniqueness against verified users in the permanent users table
-  const existingEmail = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  const existingEmail = await db.prepare('SELECT id FROM users WHERE email = ?').get(email);
   if (existingEmail) return c.json(apiError('EMAIL_TAKEN', 'An account with this email already exists.'), 409);
 
-  const existingUsername = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+  const existingUsername = await db.prepare('SELECT id FROM users WHERE username = ?').get(username);
   if (existingUsername) return c.json(apiError('USERNAME_TAKEN', 'This username is already taken.'), 409);
 
   const passwordHash = await hashPassword(password);
@@ -122,7 +122,7 @@ auth.post('/signup', async (c) => {
     await sendEmailVerificationOtp(email, name.trim(), otp);
   } catch (err) {
     // Roll back pending signup on delivery failure
-    deletePendingSignup(email);
+    await deletePendingSignup(email);
     return c.json(apiError('EMAIL_DELIVERY_FAILED', "We couldn't send the verification email. Please try again."), 503);
   }
 
@@ -172,7 +172,7 @@ auth.post('/verify-email', async (c) => {
   // Create session
   const token = await createSession(user.id);
   setSessionCookie(c, token);
-  recordLoginActivity(user.id, 'signup', getCoarseLocation(c));
+  await recordLoginActivity(user.id, 'signup', getCoarseLocation(c));
 
   return c.json({ authenticated: true, user: sanitizeUser(user as unknown as Record<string, unknown>) });
 });
@@ -229,9 +229,9 @@ auth.post('/login', async (c) => {
   if (userLimit) return userLimit;
 
   // Find by email or username
-  const user = (db.prepare(`
+  const user = (await db.prepare(`
     SELECT * FROM users WHERE email = ? OR username = ?
-  `).get(normalizedIdentifier, normalizedIdentifier) as UserRow | undefined) ?? null;
+  `).get<UserRow>(normalizedIdentifier, normalizedIdentifier)) ?? null;
 
   // Use a generic error to prevent account enumeration
   const INVALID_CREDS = apiError('INVALID_CREDENTIALS', 'Invalid email/username or password.');
@@ -245,13 +245,27 @@ auth.post('/login', async (c) => {
   const valid = await verifyPassword(user.passwordHash, password);
   if (!valid) return c.json(INVALID_CREDS, 401);
 
+  // Seamlessly upgrade legacy Argon2 hashes to PBKDF2 upon successful verification
+  if (user.passwordHash.startsWith('$argon2')) {
+    try {
+      const upgradedHash = await hashPassword(password);
+      await db.prepare('UPDATE users SET passwordHash = ?, updatedAt = ? WHERE id = ?').run(
+        upgradedHash,
+        new Date().toISOString(),
+        user.id
+      );
+    } catch {
+      // Ignore background rehash error
+    }
+  }
+
   if (!user.emailVerified) {
     return c.json(apiError('EMAIL_NOT_VERIFIED', 'Please verify your email before logging in.'), 403);
   }
 
   // Bootstrap BEFORE loading freshUser so the session carries the promoted role.
-  bootstrapAdminRole();
-  const freshUser = findUserById(user.id) ?? user;
+  await bootstrapAdminRole();
+  const freshUser = (await findUserById(user.id)) ?? user;
 
   // Dev diagnostic — never logs password/token/session data.
   if (process.env.NODE_ENV !== 'production') {
@@ -260,7 +274,7 @@ auth.post('/login', async (c) => {
 
   const token = await createSession(freshUser.id);
   setSessionCookie(c, token);
-  recordLoginActivity(freshUser.id, 'email', getCoarseLocation(c));
+  await recordLoginActivity(freshUser.id, 'email', getCoarseLocation(c));
 
   return c.json({ authenticated: true, user: sanitizeUser(freshUser as unknown as Record<string, unknown>) });
 });
@@ -305,7 +319,7 @@ auth.post('/logout', async (c) => {
 
 auth.post('/logout-all', requireAuth, async (c) => {
   const userId = c.get('userId');
-  deleteAllUserSessions(userId);
+  await deleteAllUserSessions(userId);
   clearSessionCookie(c);
   return c.json({ message: 'Logged out of all devices.' });
 });
@@ -367,37 +381,37 @@ auth.get('/google/callback', async (c) => {
   const now = new Date().toISOString();
 
   // Check if we already have a user with this Google provider ID
-  let user: UserRow | null = (db.prepare(
+  let user: UserRow | null = (await db.prepare(
     'SELECT * FROM users WHERE googleProviderId = ?'
-  ).get(googleUser.sub) as UserRow | undefined) ?? null;
+  ).get<UserRow>(googleUser.sub)) ?? null;
 
   if (!user) {
     // Check if there's already a password-based account with this email
-    const emailUser = findUserByEmail(email);
+    const emailUser = await findUserByEmail(email);
 
     if (emailUser) {
       // Safe account linking: link Google to the existing account
       // We only do this because Google has verified the email (email_verified = true above)
-      db.prepare(`
+      await db.prepare(`
         UPDATE users SET googleProviderId = ?, avatarUrl = COALESCE(avatarUrl, ?), updatedAt = ? WHERE id = ?
       `).run(googleUser.sub, googleUser.picture ?? null, now, emailUser.id);
-      user = findUserById(emailUser.id);
+      user = await findUserById(emailUser.id);
     } else {
       // Create a new user
       const baseUsername = deriveUsernameFromGoogle(googleUser.name, email);
       // Ensure uniqueness
       let username = baseUsername;
       let suffix = 1;
-      while (db.prepare('SELECT id FROM users WHERE username = ?').get(username)) {
+      while (await db.prepare('SELECT id FROM users WHERE username = ?').get(username)) {
         username = `${baseUsername}${suffix++}`;
       }
 
       const userId = generateId();
-      db.prepare(`
+      await db.prepare(`
         INSERT INTO users (id, name, username, email, passwordHash, avatarUrl, emailVerified, googleProviderId, createdAt, updatedAt)
         VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?)
       `).run(userId, googleUser.name, username, email, googleUser.picture ?? null, googleUser.sub, now, now);
-      user = findUserById(userId);
+      user = await findUserById(userId);
     }
   }
 
@@ -405,12 +419,12 @@ auth.get('/google/callback', async (c) => {
     return c.redirect(`${appUrl}/auth?error=server_error`, 302);
   }
 
-  bootstrapAdminRole();
-  user = findUserById(user.id) ?? user;
+  await bootstrapAdminRole();
+  user = (await findUserById(user.id)) ?? user;
 
   const token = await createSession(user.id);
   setSessionCookie(c, token);
-  recordLoginActivity(user.id, 'google', getCoarseLocation(c));
+  await recordLoginActivity(user.id, 'google', getCoarseLocation(c));
 
   return c.redirect(`${appUrl}/`, 302);
 });
@@ -441,7 +455,7 @@ auth.post('/forgot-password', async (c) => {
   const emailLimit = rateLimit(c, `forgot:email:${email}`, 'forgotPasswordEmail');
   if (emailLimit) return emailLimit;
 
-  const user = findUserByEmail(email);
+  const user = await findUserByEmail(email);
 
   if (user && user.emailVerified) {
     const otp = await createOtp(user.id, email, 'password_reset');
@@ -501,7 +515,7 @@ auth.post('/verify-password-reset', async (c) => {
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15 min
 
-  db.prepare(`
+  await db.prepare(`
     INSERT INTO passwordResetTokens (id, userId, tokenHash, expiresAt, usedAt, createdAt)
     VALUES (?, ?, ?, ?, NULL, ?)
   `).run(generateId(), result.userId!, tokenHash, expiresAt, now);
@@ -539,9 +553,9 @@ auth.post('/reset-password', async (c) => {
 
   const now = new Date().toISOString();
 
-  const row = (db.prepare(`
+  const row = (await db.prepare(`
     SELECT id, userId, expiresAt, usedAt FROM passwordResetTokens WHERE tokenHash = ?
-  `).get(tokenHash) as { id: string; userId: string; expiresAt: string; usedAt: string | null } | undefined) ?? null;
+  `).get<{ id: string; userId: string; expiresAt: string; usedAt: string | null }>(tokenHash)) ?? null;
 
   if (!row) return c.json(apiError('INVALID_RESET_TOKEN', 'Invalid or expired reset token.'), 400);
   if (row.usedAt) return c.json(apiError('RESET_TOKEN_USED', 'This reset token has already been used.'), 400);
@@ -550,11 +564,11 @@ auth.post('/reset-password', async (c) => {
   const passwordHash = await hashPassword(newPassword);
 
   // Mark token as used
-  db.prepare('UPDATE passwordResetTokens SET usedAt = ? WHERE id = ?').run(now, row.id);
+  await db.prepare('UPDATE passwordResetTokens SET usedAt = ? WHERE id = ?').run(now, row.id);
 
   // Update password and invalidate all sessions (force re-login)
-  db.prepare('UPDATE users SET passwordHash = ?, updatedAt = ? WHERE id = ?').run(passwordHash, now, row.userId);
-  deleteAllUserSessions(row.userId);
+  await db.prepare('UPDATE users SET passwordHash = ?, updatedAt = ? WHERE id = ?').run(passwordHash, now, row.userId);
+  await deleteAllUserSessions(row.userId);
 
   return c.json({ message: 'Password reset successfully. Please log in with your new password.' });
 });

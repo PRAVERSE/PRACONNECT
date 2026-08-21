@@ -6,7 +6,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { requireAuth } from '../middleware/auth';
-import { db } from '../db/index';
+import { db } from '../db/async';
 import { getUserRoomStats } from '../rooms/history';
 import { validateName, validateUsername, sanitizeUser, apiError } from '../auth/auth';
 import { nowIso } from '../rooms/time';
@@ -19,9 +19,9 @@ const RESTRICTED_USERNAMES = new Set([
 const profile = new Hono();
 profile.use('*', requireAuth);
 
-profile.get('/', (c: Context) => {
+profile.get('/', async (c: Context) => {
   const userId = c.get('userId');
-  const row = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as Record<string, unknown> | undefined;
+  const row = await db.prepare('SELECT * FROM users WHERE id = ?').get<Record<string, unknown>>(userId);
   if (!row) return c.json(apiError('USER_NOT_FOUND', 'User not found.'), 404);
   const safeUser = sanitizeUser(row);
   return c.json({
@@ -43,7 +43,7 @@ profile.patch('/', async (c: Context) => {
     return c.json(apiError('BAD_REQUEST', 'Invalid JSON body.'), 400);
   }
 
-  const existingRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as Record<string, unknown> | undefined;
+  const existingRow = await db.prepare('SELECT * FROM users WHERE id = ?').get<Record<string, unknown>>(userId);
   if (!existingRow) return c.json(apiError('USER_NOT_FOUND', 'User not found.'), 404);
 
   let newName = existingRow.name as string;
@@ -67,7 +67,7 @@ profile.patch('/', async (c: Context) => {
       return c.json(apiError('VALIDATION_ERROR', 'This username is reserved and cannot be used.'), 400);
     }
 
-    const duplicate = db
+    const duplicate = await db
       .prepare('SELECT id FROM users WHERE lower(username) = lower(?) AND id != ?')
       .get(trimmedUsername, userId);
     if (duplicate) {
@@ -90,11 +90,12 @@ profile.patch('/', async (c: Context) => {
   }
 
   const now = nowIso();
-  db.prepare(
+  await db.prepare(
     'UPDATE users SET name = ?, username = ?, avatarUrl = ?, bio = ?, updatedAt = ? WHERE id = ?'
   ).run(newName, newUsername, newAvatarUrl, newBio, now, userId);
 
-  const updatedRow = db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as Record<string, unknown>;
+  const updatedRow = await db.prepare('SELECT * FROM users WHERE id = ?').get<Record<string, unknown>>(userId);
+  if (!updatedRow) return c.json(apiError('USER_NOT_FOUND', 'User not found after update.'), 404);
   const safeUser = sanitizeUser(updatedRow);
 
   return c.json({
@@ -110,9 +111,9 @@ profile.patch('/', async (c: Context) => {
   });
 });
 
-profile.get('/stats', (c: Context) => {
+profile.get('/stats', async (c: Context) => {
   const userId = c.get('userId');
-  const stats = getUserRoomStats(userId);
+  const stats = await getUserRoomStats(userId);
 
   // Attach the host display name for each recent entry (join users for the
   // room history rows) — cheap, and only ever for the requester's own rooms.
@@ -120,9 +121,9 @@ profile.get('/stats', (c: Context) => {
   const names = new Map<string, { name: string }>();
   if (hostIds.length > 0) {
     const placeholders = hostIds.map(() => '?').join(',');
-    const rows = db
+    const rows = await db
       .prepare(`SELECT id, name FROM users WHERE id IN (${placeholders})`)
-      .all(...hostIds) as { id: string; name: string }[];
+      .all<{ id: string; name: string }>(...hostIds);
     for (const r of rows) names.set(r.id, { name: r.name });
   }
 

@@ -1,24 +1,117 @@
-// server/auth/auth.ts
-// Core auth helpers: password hashing (Argon2id), input validation, user sanitization.
-// Uses @node-rs/argon2 for Argon2id (pre-built binaries, works on Windows/Node/Bun).
+// ─── Password (Web Crypto PBKDF2-SHA512) ────────────────────────────────────
+// Native Web Crypto implementation that runs universally on Cloudflare Workers,
+// Node.js 18+, Bun, and browsers without native binary compilation.
 
-import { hash as argon2Hash, verify as argon2Verify } from '@node-rs/argon2';
+const PBKDF2_ITERATIONS = 100_000;
+const SALT_BYTES = 16;
+const HASH_BYTES = 64; // 512 bits
 
-// ─── Password ────────────────────────────────────────────────────────────────
-
-const ARGON2_OPTIONS = {
-  memoryCost: 65536, // 64 MB
-  timeCost: 3,
-  parallelism: 4,
-};
-
-export async function hashPassword(password: string): Promise<string> {
-  return argon2Hash(password, ARGON2_OPTIONS);
+function bufferToHex(buf: ArrayBuffer | Uint8Array): string {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
-export async function verifyPassword(hash: string, password: string): Promise<boolean> {
+function hexToBuffer(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
+export async function hashPassword(password: string): Promise<string> {
+  const salt = new Uint8Array(SALT_BYTES);
+  crypto.getRandomValues(salt);
+  const passwordBuffer = new TextEncoder().encode(password);
+
+  const key = await crypto.subtle.importKey(
+    'raw',
+    passwordBuffer,
+    { name: 'PBKDF2' },
+    false,
+    ['deriveBits']
+  );
+
+  const derivedBits = await crypto.subtle.deriveBits(
+    {
+      name: 'PBKDF2',
+      salt,
+      iterations: PBKDF2_ITERATIONS,
+      hash: 'SHA-512',
+    },
+    key,
+    HASH_BYTES * 8
+  );
+
+  const saltHex = bufferToHex(salt);
+  const hashHex = bufferToHex(derivedBits);
+  return `pbkdf2:sha512:${PBKDF2_ITERATIONS}:${saltHex}:${hashHex}`;
+}
+
+export async function verifyPassword(storedHash: string, password: string): Promise<boolean> {
   try {
-    return await argon2Verify(hash, password);
+    if (!storedHash || !password) return false;
+
+    // 1. Standard PBKDF2 format
+    if (storedHash.startsWith('pbkdf2:sha512:')) {
+      const parts = storedHash.split(':');
+      if (parts.length !== 5) return false;
+      const iterations = parseInt(parts[2], 10);
+      const saltHex = parts[3];
+      const expectedHashHex = parts[4];
+
+      const salt = hexToBuffer(saltHex);
+      const passwordBuffer = new TextEncoder().encode(password);
+
+      const key = await crypto.subtle.importKey(
+        'raw',
+        passwordBuffer,
+        { name: 'PBKDF2' },
+        false,
+        ['deriveBits']
+      );
+
+      const derivedBits = await crypto.subtle.deriveBits(
+        {
+          name: 'PBKDF2',
+          salt: salt as any,
+          iterations,
+          hash: 'SHA-512',
+        },
+        key,
+        expectedHashHex.length * 4
+      );
+
+      const derivedHashHex = bufferToHex(derivedBits);
+      return constantTimeEqual(derivedHashHex, expectedHashHex);
+    }
+
+    // 2. Legacy argon2 fallback (if running in Node.js environment)
+    if (storedHash.startsWith('$argon2')) {
+      try {
+        if (typeof process !== 'undefined' && process.versions?.node) {
+          const { createRequire } = await import('node:module');
+          const require = createRequire(import.meta.url);
+          const argon = require('@node-rs/argon2');
+          return await argon.verify(storedHash, password);
+        }
+      } catch {
+        return false;
+      }
+    }
+
+    return false;
   } catch {
     return false;
   }
